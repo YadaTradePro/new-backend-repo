@@ -1,0 +1,12 @@
+Flask
+Flask-SQLAlchemy
+Flask-JWT-Extended
+Flask-Bcrypt
+Flask-RESTX
+requests
+pandas
+jdatetime
+pyjwt
+flask-cors
+scikit-learn
+joblib
