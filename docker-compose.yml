@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  # API Service
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api   # مرحله نهایی بیلد
+    command: gunicorn --workers 2 --worker-class gevent --bind 0.0.0.0:5000 --timeout 0 "main:create_app()"
+    ports:
+      - "5000:5000"
+    volumes:
+      - .:/app
+    depends_on:
+      #- scheduler
+      - tgju_proxy
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 2G   # رم برای API سبک نگه داشته میشه
+
+  # Scheduler Service
+  #scheduler:
+    #build:
+      #context: .
+      #dockerfile: Dockerfile
+      #target: scheduler
+    #command: python scheduler.py
+    #volumes:
+     #- .:/app
+    #restart: always
+    #deploy:
+      #resources:
+        #limits:
+          #memory: 2G   # چون دیتاگیری سنگینه، رم بیشتری بدیم
+
+  # TGJU Proxy Service
+  tgju_proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: tgju-proxy
+    command: python services/tgju.py
+    volumes:
+      - .:/app
+    ports:
+      - "5001:5001"
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M  # سبک نگه داشتن پروکسی

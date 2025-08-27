@@ -1,0 +1,18 @@
+# Dockerfile.tgju
+# استفاده از یک ایمیج پایتون سبک
+FROM python:3.10-slim
+
+# تنظیم دایرکتوری کاری داخل کانتینر
+WORKDIR /app
+
+# کپی کردن فایل‌های مورد نیاز
+COPY requirements.txt .
+
+# مسیر فایل را به نام صحیح "tgju.py" تغییر دهید
+COPY services/tgju.py . 
+
+# نصب وابستگی‌ها
+RUN pip install --no-cache-dir -r requirements.txt
+
+# در معرض قرار دادن پورت 5001
+EXPOSE 5001

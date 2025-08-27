@@ -1,0 +1,13 @@
+services:
+  api:
+    volumes:
+      - .:/app
+    command: gunicorn --workers 2 --bind 0.0.0.0:5000 --reload "main:create_app()"
+
+  #scheduler:
+    #volumes:
+      #- .:/app
+
+  tgju_proxy:
+    volumes:
+      - .:/app

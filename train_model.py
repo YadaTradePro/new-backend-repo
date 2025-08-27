@@ -13,6 +13,7 @@ from sklearn.metrics import classification_report, accuracy_score
 from sklearn.preprocessing import StandardScaler 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from config import Config
 
 # --- تنظیمات لاگ‌نویسی ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,7 +41,7 @@ except ImportError as e:
     sys.exit(1)
 
 # --- تنظیمات دیتابیس ---
-DATABASE_URL = "sqlite:///E:\\BourseAnalysisFlask\\app.db" # مسیر دیتابیس شما
+DATABASE_URL = f"sqlite:///{os.path.join(PROJECT_ROOT, 'app.db')}"
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 
@@ -53,7 +54,7 @@ def _perform_feature_engineering(df_symbol_hist, symbol_id_for_logging="N/A"):
     # اطمینان از مرتب بودن داده‌ها بر اساس تاریخ و ایجاد کپی صریح
     df_processed = df_symbol_hist.sort_values(by='gregorian_date').set_index('gregorian_date').copy()
 
-    initial_rows = len(df_processed) # *** اضافه شدن این خط برای رفع NameError ***
+    initial_rows = len(df_processed)
 
     # --- محاسبه شاخص‌های تکنیکال ---
     df_processed.loc[:, 'rsi'] = calculate_rsi(df_processed['close'])
@@ -78,7 +79,7 @@ def _perform_feature_engineering(df_symbol_hist, symbol_id_for_logging="N/A"):
     close_shifted = df_processed['close'].shift(1)
     volume_numeric = pd.to_numeric(df_processed['volume'], errors='coerce').fillna(0)
     df_processed.loc[:, 'obv'] = (np.where(df_processed['close'] > close_shifted, volume_numeric,
-                                    np.where(df_processed['close'] < close_shifted, -volume_numeric, 0))).cumsum()
+                                         np.where(df_processed['close'] < close_shifted, -volume_numeric, 0))).cumsum()
     
     # ویژگی‌های لگ (Lagged Features) برای تغییرات قیمت و حجم
     df_processed.loc[:, 'price_change_1d'] = df_processed['close'].pct_change()
@@ -134,32 +135,38 @@ def _perform_feature_engineering(df_symbol_hist, symbol_id_for_logging="N/A"):
 
 # --- تابع اصلی ---
 def train_model():
-    logger.info("اتصال به دیتابیس...")
-    session = Session()
+    logger.info("در حال اتصال به دیتابیس و بارگذاری داده‌ها به صورت دسته‌ای (chunked)...")
+    
+    CHUNK_SIZE = 10000
+    all_chunks_df = []
+
     try:
-        historical_data_records = session.query(HistoricalData).order_by(
-            HistoricalData.symbol_id, HistoricalData.date
-        ).all()
-        
-        if not historical_data_records:
+        query = "SELECT * FROM stock_data ORDER BY symbol_id, date"
+        for chunk_df in pd.read_sql_query(query, engine, chunksize=CHUNK_SIZE):
+            logger.info(f"دسته جدید با {len(chunk_df)} ردیف بارگذاری شد.")
+            all_chunks_df.append(chunk_df)
+
+        if not all_chunks_df:
             logger.error("داده تاریخی در دیتابیس یافت نشد. لطفاً ابتدا داده‌ها را جمع‌آوری کنید.")
             return
 
-        logger.info(f"تعداد کل نقاط داده تاریخی پس از واکشی اولیه: {len(historical_data_records)}")
+        logger.info(f"تمام دسته‌ها با موفقیت بارگذاری شدند. در حال ادغام و پیش‌پردازش...")
+        df_hist = pd.concat(all_chunks_df, ignore_index=True)
+        
+        logger.info(f"تعداد کل نقاط داده تاریخی پس از واکشی: {len(df_hist)}")
 
-        df_hist = pd.DataFrame([r.__dict__ for r in historical_data_records])
         df_hist['gregorian_date'] = pd.to_datetime(df_hist['date'])
         
         df_hist.drop(columns=['_sa_instance_state'], errors='ignore', inplace=True)
         numeric_cols = ['open', 'high', 'low', 'close', 'final', 'yesterday_price', 'volume', 'value', 'num_trades',
-                        'plc', 'plp', 'pcc', 'pcp', 'mv',
-                        'buy_count_i', 'buy_count_n', 'sell_count_i', 'sell_count_n',
-                        'buy_i_volume', 'buy_n_volume', 'sell_i_volume', 'sell_n_volume',
-                        'zd1', 'qd1', 'pd1', 'zo1', 'qo1', 'po1',
-                        'zd2', 'qd2', 'pd2', 'zo2', 'qo2', 'po2',
-                        'zd3', 'qd3', 'pd3', 'zo3', 'qo3', 'po3',
-                        'zd4', 'qd4', 'pd4', 'zo4', 'qo4', 'po4',
-                        'zd5', 'qd5', 'pd5', 'zo5', 'qo5', 'po5']
+                         'plc', 'plp', 'pcc', 'pcp', 'mv',
+                         'buy_count_i', 'buy_count_n', 'sell_count_i', 'sell_count_n',
+                         'buy_i_volume', 'buy_n_volume', 'sell_i_volume', 'sell_n_volume',
+                         'zd1', 'qd1', 'pd1', 'zo1', 'qo1', 'po1',
+                         'zd2', 'qd2', 'pd2', 'zo2', 'qo2', 'po2',
+                         'zd3', 'qd3', 'pd3', 'zo3', 'qo3', 'po3',
+                         'zd4', 'qd4', 'pd4', 'zo4', 'qo4', 'po4',
+                         'zd5', 'qd5', 'pd5', 'zo5', 'qo5', 'po5']
         for col in numeric_cols:
             if col in df_hist.columns:
                 df_hist[col] = pd.to_numeric(df_hist[col], errors='coerce')
@@ -284,8 +291,8 @@ def train_model():
 
                 X_train_fold = X.loc[X.index <= train_end_date].copy()
                 y_train_fold = y.loc[y.index <= train_end_date].copy()
-                X_test_fold = X.loc[(X.index >= test_start_date) & (X.index <= test_end_date)].copy() # *** تصحیح این خط ***
-                y_test_fold = y.loc[(y.index >= test_start_date) & (y.index <= test_end_date)].copy() # *** تصحیح این خط ***
+                X_test_fold = X.loc[(X.index >= test_start_date) & (X.index <= test_end_date)].copy()
+                y_test_fold = y.loc[(y.index >= test_start_date) & (y.index <= test_end_date)].copy()
 
                 X_train_fold.fillna(0, inplace=True) 
                 y_train_fold = y_train_fold.loc[X_train_fold.index] 
@@ -363,7 +370,8 @@ def train_model():
     except Exception as e:
         logger.error(f"خطای کلی در فرآیند آموزش مدل: {e}", exc_info=True)
     finally:
-        session.close()
+        if 'session' in locals() and session:
+            session.close()
 
 if __name__ == "__main__":
     train_model()
