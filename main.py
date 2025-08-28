@@ -97,7 +97,8 @@ def create_app(test_config=None):
     )
 
     with app.app_context():
-        db.create_all() 
+        # Remove db.create_all() and let Alembic handle migrations
+        # db.create_all() 
         try:
             import pytse_client as tse_check
             current_app.logger.info("ماژول pytse-client با موفقیت وارد شد و در دسترس است.")

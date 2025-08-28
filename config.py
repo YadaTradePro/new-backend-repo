@@ -9,10 +9,26 @@ class Config:
 
     # تنظیمات پایگاه داده
     # از SQLite برای سادگی در توسعه استفاده می‌کنیم
-    SQLALCHEMY_DATABASE_URI = os.environ.get(
-        'DATABASE_URL') or 'sqlite:///' + os.path.join(
+    database_url = os.environ.get('DATABASE_URL')
+    if database_url and database_url.startswith('sqlite:'):
+        # اضافه کردن پارامترهای Unicode برای SQLite
+        database_url += '?charset=utf8mb4'
+    elif not database_url:
+        database_url = 'sqlite:///' + os.path.join(
             os.path.abspath(os.path.dirname(__file__)), 'app.db')
+        database_url += '?charset=utf8mb4'
+    
+    SQLALCHEMY_DATABASE_URI = database_url
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    
+    # تنظیمات اضافی برای Unicode
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        'echo': False,
+        'pool_pre_ping': True,
+        'connect_args': {
+            'check_same_thread': False  # برای SQLite
+        } if database_url and 'sqlite' in database_url else {}
+    }
 
     # JWT_SECRET_KEY برای امضا و تایید توکن‌های JWT استفاده می‌شود.
     # این را با یک کلید تصادفی و قوی متفاوت از SECRET_KEY جایگزین کنید.
