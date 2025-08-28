@@ -22,3 +22,4 @@ click
 python-dotenv
 pytse-client
 gunicorn
+psycopg2-binary

@@ -17,6 +17,8 @@ import click
 import subprocess
 import time
 
+from config import Config
+
 # --- وارد کردن سرویس ML
 from services.ml_prediction_service import generate_and_save_predictions_for_watchlist
 
@@ -28,6 +30,8 @@ def create_app(test_config=None):
     تابع اصلی برای ایجاد و پیکربندی برنامه Flask.
     """
     app = Flask(__name__)
+    app.config.from_object(Config) # این خط برای پیکربندی از فایل config است
+
     
     # پیکربندی لاگینگ
     for handler in logging.root.handlers[:]:

@@ -78,7 +78,7 @@ def calculate_rsi(series, window=14):
     if not isinstance(series, pd.Series):
         logger.error("ورودی برای RSI باید یک pandas Series باشد.")
         raise TypeError("Input for RSI must be a pandas Series.")
-    
+
     # اطمینان از نوع عددی و مدیریت NaNها
     series = pd.to_numeric(series, errors='coerce')
     # اگر بعد از تبدیل، همه مقادیر NaN شدند، یک سری با NaN برمی‌گردانیم.
@@ -99,14 +99,14 @@ def calculate_rsi(series, window=14):
     avg_loss = loss.ewm(span=window, adjust=False).mean()
 
     # جلوگیری از تقسیم بر صفر با جایگزینی 0 با NaN در avg_loss قبل از تقسیم
-    rs = avg_gain / avg_loss.replace(0, np.nan) 
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     # مدیریت مقادیر نامحدود که ممکن است از تقسیم بر صفر ناشی شوند، سپس NaNها را با 0 پر می‌کنیم.
     rs = rs.replace([np.inf, -np.inf], np.nan).fillna(0)
 
     rsi = 100 - (100 / (1 + rs))
     # اطمینان از عدم وجود inf/NaN در خروجی نهایی، با 0 یا مقدار مناسب دیگر پر می‌کنیم.
     final_rsi = rsi.replace([np.inf, -np.inf], np.nan).fillna(0)
-    
+
     # بازگرداندن سری با ایندکس اصلی
     return final_rsi.reindex(series.index)
 
@@ -118,7 +118,7 @@ def calculate_macd(series, short_window=12, long_window=26, signal_window=9):
     if not isinstance(series, pd.Series):
         logger.error("ورودی برای MACD باید یک pandas Series باشد.")
         raise TypeError("Input for MACD must be a pandas Series.")
-    
+
     series = pd.to_numeric(series, errors='coerce')
     if series.isnull().all():
         return (pd.Series([np.nan] * len(series), index=series.index),
@@ -137,7 +137,7 @@ def calculate_macd(series, short_window=12, long_window=26, signal_window=9):
     macd = exp1 - exp2
     macd_signal = macd.ewm(span=signal_window, adjust=False).mean()
     macd_hist = macd - macd_signal
-    
+
     # بازگرداندن سری‌ها با ایندکس اصلی
     return (macd.reindex(series.index),
             macd_signal.reindex(series.index),
@@ -151,7 +151,7 @@ def calculate_sma(series, window):
     if not isinstance(series, pd.Series):
         logger.error("ورودی برای SMA باید یک pandas Series باشد.")
         raise TypeError("Input for SMA must be a pandas Series.")
-    
+
     series = pd.to_numeric(series, errors='coerce')
     if series.isnull().all():
         return pd.Series([np.nan] * len(series), index=series.index)
@@ -172,7 +172,7 @@ def calculate_bollinger_bands(series, window=20, num_std_dev=2):
     if not isinstance(series, pd.Series):
         logger.error("ورودی برای باندهای بولینگر باید یک pandas Series باشد.")
         raise TypeError("Input for Bollinger Bands must be a pandas Series.")
-    
+
     series = pd.to_numeric(series, errors='coerce')
     if series.isnull().all():
         return (pd.Series([np.nan] * len(series), index=series.index),
@@ -188,10 +188,10 @@ def calculate_bollinger_bands(series, window=20, num_std_dev=2):
 
     ma = series_cleaned.rolling(window=window).mean()
     std = series_cleaned.rolling(window=window).std()
-    
+
     upper_band = ma + (std * num_std_dev)
     lower_band = ma - (std * num_std_dev)
-    
+
     # بازگرداندن سری‌ها با ایندکس اصلی
     return (ma.reindex(series.index),
             upper_band.reindex(series.index),
@@ -205,7 +205,7 @@ def calculate_volume_ma(series, window=20):
     if not isinstance(series, pd.Series):
         logger.error("ورودی برای میانگین متحرک حجم باید یک pandas Series باشد.")
         raise TypeError("Input for Volume MA must be a pandas Series.")
-    
+
     series = pd.to_numeric(series, errors='coerce')
     if series.isnull().all():
         return pd.Series([np.nan] * len(series), index=series.index)
@@ -232,7 +232,7 @@ def calculate_atr(high, low, close, window=14):
     if not (isinstance(high, pd.Series) and isinstance(low, pd.Series) and isinstance(close, pd.Series)):
         logger.error("ورودی‌های ATR باید pandas Series باشند.")
         raise TypeError("Inputs for ATR must be pandas Series.")
-    
+
     # اطمینان از نوع عددی و مدیریت NaNها با پر کردن 0 در صورت لزوم برای محاسبات موقت
     # استفاده از ffill() برای پر کردن NaNها از مقادیر قبلی، سپس fillna(0) برای ابتدای سری.
     # این تغییر برای رفع FutureWarning اعمال شده است.
@@ -247,13 +247,13 @@ def calculate_atr(high, low, close, window=14):
     tr1 = high_cleaned - low_cleaned
     tr2 = abs(high_cleaned - close_cleaned.shift(1)) # استفاده از shift(1) برای قیمت بسته شدن روز قبل
     tr3 = abs(low_cleaned - close_cleaned.shift(1))
-    
+
     # انتخاب حداکثر از سه مقدار TR و پر کردن هر NaN با 0 (برای اولین ردیف shift)
     true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1).fillna(0)
-    
+
     # محاسبه ATR با استفاده از میانگین متحرک نمایی (EMA) از TR
     atr = true_range.ewm(span=window, adjust=False).mean()
-    
+
     # بازگرداندن سری ATR با ایندکس اصلی
     return atr.reindex(high.index)
 
@@ -290,13 +290,13 @@ def get_symbol_id(input_param):
         ).first()
         if symbol_data:
             return symbol_data.symbol_id # بازگرداندن symbol_id واقعی (نام کوتاه فارسی)
-        
+
         # اگر با symbol_name یافت نشد، تلاش با ISIN (اگر ورودی شبیه ISIN باشد)
         if isinstance(input_param, str) and input_param.startswith('IRO1'): # پیشوند رایج ISIN برای سهام ایران
             symbol_data = session.query(ComprehensiveSymbolData).filter_by(isin=input_param).first()
             if symbol_data:
                 return symbol_data.symbol_id
-        
+
         # اگر هنوز یافت نشد، تلاش با company_name
         symbol_data = session.query(ComprehensiveSymbolData).filter(
             func.lower(ComprehensiveSymbolData.company_name) == func.lower(input_param)
@@ -320,11 +320,11 @@ def calculate_smart_money_flow(df):
     """
     محاسبه معیارهای جریان پول هوشمند از داده‌های تاریخی.
     فرض می‌کند df شامل ستون‌های 'buy_i_volume', 'sell_i_volume', 'buy_count_i', 'sell_count_i', 'value' است.
-    
+
     DataFrameای حاوی معیارهای محاسبه شده را بازمی‌گرداند.
     """
     logger.debug("در حال محاسبه جریان پول هوشمند.")
-    
+
     # ستون‌های مورد نیاز برای محاسبه (بر اساس مدل HistoricalData شما)
     required_cols = [
         'buy_i_volume', 'sell_i_volume', 'buy_count_i',
@@ -402,7 +402,7 @@ def check_candlestick_patterns(today_candle_data, yesterday_candle_data, close_p
     high_y = yesterday_candle_data['high']
     low_y = yesterday_candle_data['low']
     close_y = yesterday_candle_data['close']
-    
+
     # بررسی ساده برای روند نزولی (برای الگوهایی مانند Hammer در کف)
     is_in_downtrend = False
     if isinstance(close_prices_series, np.ndarray) and len(close_prices_series) >= 10:
@@ -411,7 +411,7 @@ def check_candlestick_patterns(today_candle_data, yesterday_candle_data, close_p
             # بررسی اینکه آیا قیمت بسته شدن فعلی نزدیک به کمترین قیمت 10 روز اخیر است و روند کلی نزولی بوده.
             if close_t <= np.min(recent_closes) * 1.02 and recent_closes[0] > close_t:
                 is_in_downtrend = True
-    
+
     logger.debug(f"بررسی شمعی: امروز: O={open_t:.0f}, H={high_t:.0f}, L={low_t:.0f}, C={close_t:.0f}. دیروز: O={open_y:.0f}, H={high_y:.0f}, L={low_y:.0f}, C={close_y:.0f}. در روند نزولی: {is_in_downtrend}")
 
     # --- الگوی Hammer ---
@@ -448,17 +448,17 @@ def check_tsetmc_filters(symbol_id, jdate_str):
     """
     تابع Placeholder برای بررسی نتایج فیلترهای TSETMC.
     نیاز به کوئری گرفتن از مدل TSETMCFilterResult دارد.
-    
+
     Args:
         symbol_id (str): ID نماد.
         jdate_str (str): رشته تاریخ جلالی (YYYY-MM-DD).
-        
+
     Returns:
         tuple: (لیست نام فیلترهای راضی شده، لیست دلایل)
     """
     satisfied_filters = []
     reasons = []
-    
+
     # مثال: کوئری گرفتن از مدل TSETMCFilterResult برای فیلترهای این نماد و تاریخ
     # from models import TSETMCFilterResult # در صورت نیاز به جلوگیری از وابستگی چرخشی، در داخل تابع ایمپورت کنید
     # filters_found = TSETMCFilterResult.query.filter_by(symbol_id=symbol_id, jdate=jdate_str).all()
@@ -473,20 +473,20 @@ def check_financial_ratios(symbol_id):
     """
     تابع Placeholder برای بررسی نسبت‌های مالی.
     نیاز به کوئری گرفتن از مدل FinancialRatiosData دارد.
-    
+
     Args:
         symbol_id (str): ID نماد.
-        
+
     Returns:
         tuple: (لیست معیارهای نسبت راضی شده، لیست دلایل)
     """
     satisfied_ratios = []
     reasons = []
-    
+
     # مثال: کوئری گرفتن از مدل FinancialRatiosData برای نسبت‌های مرتبط
     # from models import FinancialRatiosData # در صورت نیاز به جلوگیری از وابستگی چرخشی، در داخل تابع ایمپورت کنید
     # latest_ratios = FinancialRatiosData.query.filter_by(symbol_id=symbol_id)\
-    #                                         .order_by(FinancialRatiosData.fiscal_year.desc()).all()
+    #                                  .order_by(FinancialRatiosData.fiscal_year.desc()).all()
     # if latest_ratios:
     #     for ratio in latest_ratios:
     #         if ratio.ratio_name == 'DebtToEquity' and ratio.ratio_value < 0.5:

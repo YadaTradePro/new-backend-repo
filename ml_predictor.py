@@ -7,34 +7,35 @@ import joblib
 import os
 import sys
 from datetime import datetime, timedelta
-import logging 
-from sklearn.preprocessing import StandardScaler 
+import logging
+from sklearn.preprocessing import StandardScaler
 
-logger = logging.getLogger(__name__) 
+# ایمپورت کلاس Config از فایل config.py در پوشه 'backend'
+# فرض می کنیم این فایل در 'services' یا 'backend' است
+from config import Config
 
-# --- تنظیمات مسیردهی پروژه ---
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root_dir = current_script_dir 
+logger = logging.getLogger(__name__)
 
-services_path = os.path.join(project_root_dir, 'services')
-if services_path not in sys.path:
-    sys.path.insert(0, services_path)
-
-# ایمپورت توابع کمکی از services/utils.py
+# --- ایمپورت توابع کمکی ---
 try:
-    from utils import calculate_rsi, calculate_macd, calculate_sma, calculate_volume_ma, calculate_atr
+    # این ایمپورت به ساختار 'backend/services/utils.py' اشاره می‌کند
+    from services.utils import calculate_rsi, calculate_macd, calculate_sma, calculate_volume_ma, calculate_atr
 except ImportError as e:
-    logger.error(f"خطا: توابع کمکی از services/utils.py ایمپورت نشدند. {e}")
-    logger.error("لطفاً مطمئن شوید services/utils.py وجود دارد و شامل این توابع است.")
+    logger.error(f"خطا: توابع کمکی از utils.py ایمپورت نشدند. {e}")
+    logger.error("لطفا مطمئن شوید utils.py وجود دارد و شامل این توابع است.")
     sys.exit(1)
 
-# --- بارگذاری مدل آموزش‌دیده ---
+# --- تابع برای پیدا کردن فایل‌های مدل ---
 def find_latest_model_files(model_dir):
     """
     آخرین فایل‌های مدل، ویژگی‌ها، نگاشت کلاس و Scaler را بر اساس timestamp پیدا می‌کند.
     """
-    model_files = {}
     timestamps = []
+
+    # اطمینان از وجود مسیر قبل از لیست کردن محتویات آن
+    if not os.path.exists(model_dir):
+        logger.error(f"خطا: پوشه مدل‌ها در مسیر {model_dir} یافت نشد.")
+        return None, None, None, None
 
     for f in os.listdir(model_dir):
         if f.startswith('trained_ml_model_') and f.endswith('.pkl'):
@@ -43,9 +44,10 @@ def find_latest_model_files(model_dir):
                 timestamps.append(datetime.strptime(ts_str, "%Y%m%d_%H%M%S"))
             except ValueError:
                 continue
-    
+
     if not timestamps:
-        return None, None, None, None 
+        logger.warning(f"هیچ فایل مدل آموزش‌دیده در {model_dir} یافت نشد.")
+        return None, None, None, None
 
     latest_timestamp = max(timestamps)
     latest_ts_str = latest_timestamp.strftime("%Y%m%d_%H%M%S")
@@ -53,16 +55,19 @@ def find_latest_model_files(model_dir):
     model_path = os.path.join(model_dir, f'trained_ml_model_{latest_ts_str}.pkl')
     feature_names_path = os.path.join(model_dir, f'feature_names_{latest_ts_str}.pkl')
     class_labels_map_path = os.path.join(model_dir, f'class_labels_map_{latest_ts_str}.pkl')
-    scaler_path = os.path.join(model_dir, f'scaler_{latest_ts_str}.pkl') 
+    scaler_path = os.path.join(model_dir, f'scaler_{latest_ts_str}.pkl')
 
     if os.path.exists(model_path) and os.path.exists(feature_names_path) and \
-       os.path.exists(class_labels_map_path) and os.path.exists(scaler_path): 
+       os.path.exists(class_labels_map_path) and os.path.exists(scaler_path):
         return model_path, feature_names_path, class_labels_map_path, scaler_path
     else:
         logger.warning(f"فایل‌های مدل کامل (شامل Scaler) برای آخرین timestamp {latest_ts_str} یافت نشدند.")
         return None, None, None, None
 
-MODEL_DIR = os.path.join(project_root_dir, 'models')
+# --- استفاده از مسیر تعریف‌شده در Config ---
+MODEL_DIR = Config.MODEL_DIR
+
+# بارگذاری فایل‌های مدل
 LATEST_MODEL_PATH, LATEST_FEATURE_NAMES_PATH, LATEST_CLASS_LABELS_MAP_PATH, LATEST_SCALER_PATH = find_latest_model_files(MODEL_DIR)
 
 if not (LATEST_MODEL_PATH and LATEST_FEATURE_NAMES_PATH and LATEST_CLASS_LABELS_MAP_PATH and LATEST_SCALER_PATH):
@@ -73,10 +78,10 @@ try:
     _model = joblib.load(LATEST_MODEL_PATH)
     _feature_names = joblib.load(LATEST_FEATURE_NAMES_PATH)
     _class_labels_map = joblib.load(LATEST_CLASS_LABELS_MAP_PATH)
-    _scaler = joblib.load(LATEST_SCALER_PATH) 
+    _scaler = joblib.load(LATEST_SCALER_PATH)
     logger.info("مدل ML، نام ویژگی‌ها، نگاشت کلاس و Scaler با موفقیت بارگذاری شدند.")
 except Exception as e:
-    logger.error(f"خطا در بارگذاری مدل ML یا فایل‌های مرتبط: {e}")
+    logger.error(f"خطا در بارگذاری مدل ML یا فایل‌های مرتبط: {e}", exc_info=True)
     raise RuntimeError(f"خطا در بارگذاری مدل ML: {e}")
 
 # --- تابع مهندسی ویژگی برای داده‌های جدید (باید با train_model.py یکسان باشد) ---
@@ -105,14 +110,14 @@ def _perform_feature_engineering_for_prediction(df_symbol_hist, symbol_id_for_lo
     df_processed.loc[:, 'highest_high_stoch'] = df_processed['high'].rolling(window=window_stoch).max()
     denominator_stoch = df_processed['highest_high_stoch'] - df_processed['lowest_low_stoch']
     df_processed.loc[:, '%K'] = ((df_processed['close'] - df_processed['lowest_low_stoch']) / denominator_stoch.replace(0, np.nan)) * 100
-    df_processed.loc[:, '%D'] = df_processed['%K'].rolling(window=3).mean() 
+    df_processed.loc[:, '%D'] = df_processed['%K'].rolling(window=3).mean()
 
     # On-Balance Volume (OBV)
     close_shifted = df_processed['close'].shift(1)
     volume_numeric = pd.to_numeric(df_processed['volume'], errors='coerce').fillna(0)
     df_processed.loc[:, 'obv'] = (np.where(df_processed['close'] > close_shifted, volume_numeric,
-                                    np.where(df_processed['close'] < close_shifted, -volume_numeric, 0))).cumsum()
-    
+                                         np.where(df_processed['close'] < close_shifted, -volume_numeric, 0))).cumsum()
+
     # ویژگی‌های لگ (Lagged Features) برای تغییرات قیمت و حجم
     df_processed.loc[:, 'price_change_1d'] = df_processed['close'].pct_change()
     df_processed.loc[:, 'volume_change_1d'] = df_processed['volume'].pct_change()
@@ -129,11 +134,11 @@ def _perform_feature_engineering_for_prediction(df_symbol_hist, symbol_id_for_lo
 
     denominator_buy_power = (sell_i_vol * sell_count_i)
     df_processed.loc[:, 'individual_buy_power_ratio'] = (buy_i_vol * buy_count_i) / denominator_buy_power.replace(0, np.nan)
-    
+
     # --- مدیریت مقادیر گمشده و نامحدود (NaN/Inf) ---
-    df_processed.replace([np.inf, -np.inf], np.nan, inplace=True) 
-    df_processed = df_processed.ffill().bfill() 
-    df_processed.fillna(0, inplace=True) 
+    df_processed.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_processed = df_processed.ffill().bfill()
+    df_processed.fillna(0, inplace=True)
 
     # انتخاب ویژگی‌های نهایی برای مدل (باید با _feature_names از مدل آموزش‌دیده مطابقت داشته باشد)
     # اطمینان از اینکه فقط ستون‌های موجود در _feature_names انتخاب می‌شوند و ترتیب آن‌ها صحیح است.
@@ -157,27 +162,27 @@ def predict_trend_for_symbol(historical_data_df, symbol_id_for_logging="N/A"):
     """
     پیش‌بینی روند برای یک نماد بر اساس داده‌های تاریخی آن.
     """
-    if historical_data_df.empty or len(historical_data_df) < 60: 
+    if historical_data_df.empty or len(historical_data_df) < 60:
         logger.warning(f"داده تاریخی کافی برای نماد {symbol_id_for_logging} برای پیش‌بینی وجود ندارد (حداقل 60 روز نیاز است).")
         return None, None
 
     try:
         features_for_prediction = _perform_feature_engineering_for_prediction(historical_data_df.copy(), symbol_id_for_logging)
-        
+
         if features_for_prediction.empty:
             logger.warning(f"برای نماد {symbol_id_for_logging}: پس از مهندسی ویژگی و پاکسازی، هیچ داده معتبری برای پیش‌بینی باقی نماند.")
             return None, None
-        
+
         latest_features = features_for_prediction.iloc[[-1]]
 
         # --- اعمال Scaler ---
         latest_features_scaled = _scaler.transform(latest_features)
-        
+
         probabilities = _model.predict_proba(latest_features_scaled)[0]
-        
+
         predicted_class_idx = np.argmax(probabilities)
         predicted_probability = probabilities[predicted_class_idx]
-        
+
         predicted_trend_label = _model.classes_[predicted_class_idx]
 
         return predicted_trend_label, predicted_probability
@@ -190,10 +195,10 @@ def predict_trend_for_symbol(historical_data_df, symbol_id_for_logging="N/A"):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logger.info("تست ماژول ml_predictor.py")
-    
+
     # برای تست، از یک دیتابیس موقت یا داده‌های ساختگی استفاده کنید.
     # این بخش نیاز دارد که مدل قبلاً توسط train_model.py آموزش داده شده باشد.
-    
+
     # مثال با داده‌های ساختگی: (این بخش را از train_model.py کپی کنید تا ویژگی‌ها یکسان باشند)
     sample_data = {
         'gregorian_date': pd.to_datetime(pd.date_range(end=datetime.now(), periods=200, freq='D')),

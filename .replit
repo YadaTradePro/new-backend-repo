@@ -3,7 +3,7 @@ modules = ["python-3.11"]
 
 [nix]
 channel = "stable-24_05"
-packages = ["glibcLocales", "pietrasanta-traceroute"]
+packages = ["cargo", "glibcLocales", "libiconv", "pietrasanta-traceroute", "rustc"]
 
 [unitTest]
 language = "python3"

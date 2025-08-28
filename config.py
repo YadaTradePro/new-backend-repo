@@ -32,3 +32,17 @@ class Config:
 
    # کلید API MetalsDev برای دریافت قیمت کالاها
     METALS_DEV_API_KEY = os.environ.get('METALS_DEV_API_KEY', 'USXIBBPXNPFOPKR6BQ5N671R6BQ5N')
+
+
+# --- تنظیمات پایگاه داده ---
+    SQLALCHEMY_DATABASE_URI = os.environ.get(
+        'DATABASE_URL') or 'sqlite:///' + os.path.join(
+            os.path.abspath(os.path.dirname(__file__)), 'app.db')
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+
+# --- تنظیمات مسیردهی پروژه (جدید) ---
+# این مسیر به پوشه 'backend' اشاره می کند
+    PROJECT_ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend")
+
+# این مسیر به پوشه 'models' در داخل 'backend' اشاره می کند
+    MODEL_DIR = os.path.join(PROJECT_ROOT_DIR, 'models')

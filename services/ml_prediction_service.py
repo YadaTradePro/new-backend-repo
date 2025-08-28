@@ -13,6 +13,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- تنظیمات مسیردهی پروژه ---
+# این مسیر، ریشه پروژه را به sys.path اضافه می‌کند تا ایمپورت‌های نسبی از ماژول‌های
+# مانند `extensions` و `models` به درستی کار کنند.
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root_dir = os.path.abspath(os.path.join(current_script_dir, '..'))
 
@@ -23,7 +25,7 @@ try:
     from extensions import db
     from models import MLPrediction, ComprehensiveSymbolData, HistoricalData
     from ml_predictor import predict_trend_for_symbol, LATEST_MODEL_PATH
-    from utils import convert_gregorian_to_jalali
+    from services.utils import convert_gregorian_to_jalali
 except ImportError as e:
     logger.error(f"خطا در ایمپورت ماژول‌ها در ml_prediction_service.py: {e}")
     sys.exit(1)
@@ -38,7 +40,7 @@ def get_ml_predictions_for_symbol(symbol_id: str) -> dict | None:
         prediction = MLPrediction.query.filter_by(symbol_id=symbol_id)\
                                        .order_by(MLPrediction.prediction_date.desc())\
                                        .first()
-        
+
         if prediction:
             logger.info(f"Found ML prediction for {symbol_id} on {prediction.jprediction_date} with trend: {prediction.predicted_trend}")
             return prediction.to_dict()
@@ -56,7 +58,7 @@ def get_all_ml_predictions() -> list[dict]:
     logger.info("Fetching all ML predictions.")
     try:
         predictions = MLPrediction.query.order_by(MLPrediction.prediction_date.desc()).all()
-        
+
         result = [p.to_dict() for p in predictions]
         logger.info(f"Retrieved {len(result)} ML predictions.")
         return result
@@ -70,7 +72,7 @@ def generate_and_save_predictions_for_watchlist(prediction_date_greg=None, predi
     """
     if prediction_date_greg is None:
         prediction_date_greg = date.today()
-    
+
     jprediction_date = convert_gregorian_to_jalali(prediction_date_greg)
     if jprediction_date is None:
         logger.error(f"خطا در تبدیل تاریخ میلادی {prediction_date_greg} به جلالی. نمی‌توان پیش‌بینی را ادامه داد.")
@@ -99,8 +101,8 @@ def generate_and_save_predictions_for_watchlist(prediction_date_greg=None, predi
             logger.info(f"پیش‌بینی برای نماد {symbol_name} ({symbol_id}) در تاریخ {jprediction_date} از قبل وجود دارد. پرش.")
             continue
 
-        start_date_for_hist = prediction_date_greg - timedelta(days=200) 
-        
+        start_date_for_hist = prediction_date_greg - timedelta(days=200)
+
         try:
             historical_data_records = db.session.query(HistoricalData).filter(
                 HistoricalData.symbol_id == symbol_id,
@@ -121,6 +123,7 @@ def generate_and_save_predictions_for_watchlist(prediction_date_greg=None, predi
                 logger.warning(f"پیش‌بینی برای نماد {symbol_name} ({symbol_id}) انجام نشد (داده ناکافی یا خطا در ml_predictor).")
                 continue
 
+            # توجه: مسیر مدل باید در ml_predictor.py به 'backend/models' تغییر یابد.
             model_version_str = os.path.basename(LATEST_MODEL_PATH).replace('trained_ml_model_', '').replace('.pkl', '')
 
             new_prediction = MLPrediction(
@@ -142,7 +145,7 @@ def generate_and_save_predictions_for_watchlist(prediction_date_greg=None, predi
             db.session.rollback()
             logger.error(f"خطا در پردازش نماد {symbol_name} ({symbol_id}): {e}", exc_info=True)
             continue
-    
+
     try:
         db.session.commit()
         logger.info(f"فرآیند تولید پیش‌بینی‌های ML کامل شد. {processed_count} پیش‌بینی جدید ذخیره شد.")
@@ -159,7 +162,7 @@ def update_ml_prediction_outcomes():
     دوره پیش‌بینی برای هر پیش‌بینی 'فعال' به پایان رسیده است یا خیر.
     """
     logger.info("در حال شروع به‌روزرسانی نتایج پیش‌بینی‌های ML گذشته...")
-    
+
     today_greg = date.today()
     updated_count = 0
 
@@ -195,15 +198,9 @@ def update_ml_prediction_outcomes():
                 continue
 
             actual_price_at_period_end = actual_data_record.close # استفاده از قیمت بسته شدن
-            
+
             # 3. تعیین روند واقعی (Uptrend, Downtrend, Sideways)
             # برای این کار، به قیمت بسته شدن در تاریخ شروع پیش‌بینی نیز نیاز داریم.
-            # فرض می‌کنیم قیمت شروع پیش‌بینی همان قیمت بسته شدن در prediction_start_date است.
-            # اگر این قیمت در MLPrediction ذخیره نشده، باید آن را از HistoricalData واکشی کنیم.
-            # برای سادگی، فرض می‌کنیم prediction.predicted_price_at_period_end به عنوان قیمت شروع پیش‌بینی عمل می‌کند
-            # یا باید آن را از HistoricalData واکشی کنیم.
-            
-            # واکشی قیمت شروع پیش‌بینی از HistoricalData
             start_price_record = db.session.query(HistoricalData).filter_by(
                 symbol_id=symbol_id,
                 date=prediction_start_date
@@ -222,15 +219,6 @@ def update_ml_prediction_outcomes():
                 percentage_change = ((actual_price_at_period_end - start_price) / start_price) * 100
 
             # تعیین روند واقعی بر اساس آستانه‌هایی مشابه آنچه در train_model.py استفاده شد.
-            # این آستانه‌ها باید با آستانه‌هایی که مدل بر اساس آن‌ها آموزش دیده، مطابقت داشته باشند.
-            # برای این مثال، از آستانه‌های پیش‌فرض استفاده می‌کنیم.
-            # در آینده، می‌توانید این آستانه‌ها را از یک فایل تنظیمات یا از مدل بارگذاری کنید.
-            
-            # این آستانه‌ها را باید با آستانه‌های کوانتایل از train_model.py مطابقت دهید.
-            # مثلاً:
-            # DOWNTREND_THRESHOLD = -1.34 # از لاگ train_model.py شما
-            # UPTREND_THRESHOLD = 1.74   # از لاگ train_model.py شما
-            # برای این مثال، از مقادیر ثابت استفاده می‌کنیم.
             DOWNTREND_THRESHOLD = -1.0 # مثلاً -1%
             UPTREND_THRESHOLD = 1.0    # مثلاً +1%
 
@@ -247,7 +235,7 @@ def update_ml_prediction_outcomes():
             prediction.actual_trend_outcome = actual_trend_outcome
             prediction.is_prediction_accurate = is_prediction_accurate
             prediction.updated_at = datetime.now() # به‌روزرسانی timestamp
-            
+
             db.session.add(prediction) # اضافه کردن به سشن برای commit
             updated_count += 1
             logger.info(f"پیش‌بینی برای {symbol_name} ({symbol_id}) در تاریخ {prediction.jprediction_date} ارزیابی شد. روند پیش‌بینی شده: {predicted_trend}, روند واقعی: {actual_trend_outcome}, دقت: {is_prediction_accurate}")
