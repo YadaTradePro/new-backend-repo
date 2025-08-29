@@ -66,6 +66,7 @@ def create_app(test_config=None):
         "http://localhost:3000",    # CRITICAL FIX: Add the Next.js development server URL
         "http://127.0.0.1:3000",      # CRITICAL FIX: Add the localhost loopback address
         "http://10.15.40.104:3000",
+        "https://a8528c36-3864-4fde-aa02-b6c4d38572dd-00-3k36a6456ztnu.sisko.replit.dev", # CRITICAL FIX: Add the new Replit frontend URL
     ]
     CORS(app, resources={r"/*": {"origins": cors_origins}}, supports_credentials=True)
 
@@ -200,7 +201,7 @@ def start_tgju_proxy_service():
     try:
         # Popen فرآیند را در پس‌زمینه اجرا می‌کند و بلافاصله برمی‌گردد
         tgju_proxy_process = subprocess.Popen(
-            [sys.executable, 'services/tgju_proxy_service.py'],
+            [sys.executable, 'services/tgju.py'],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
@@ -208,7 +209,7 @@ def start_tgju_proxy_service():
         time.sleep(2)
         logger.info("سرور پراکسی TGJU با موفقیت راه‌اندازی شد.")
     except FileNotFoundError:
-        logger.error("خطا: فایل services/tgju_proxy_service.py پیدا نشد. لطفاً مطمئن شوید مسیر صحیح است.")
+        logger.error("خطا: فایل services/tgju.py پیدا نشد. لطفاً مطمئن شوید مسیر صحیح است.")
     except Exception as e:
         logger.error(f"خطا در راه‌اندازی سرور پراکسی TGJU: {e}", exc_info=True)
 

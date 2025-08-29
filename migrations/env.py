@@ -1,127 +1,60 @@
-
-# -*- coding: utf-8 -*-
-import logging
+import os
 import sys
-from logging.config import fileConfig
-
 from flask import current_app
-
+from sqlalchemy import create_engine
 from alembic import context
+from sqlalchemy.orm import configure_mappers
 
-# this is the Alembic Config object, which provides
-# access to the values within the .ini file in use.
+# این خط تضمین می کند که Alembic پوشه backend را به sys.path اضافه کند
+# تا بتواند به مدل ها و برنامه Flask دسترسی پیدا کند.
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+# این شیء پیکربندی Alembic است که دسترسی به مقادیر
+# موجود در فایل .ini مورد استفاده را فراهم می کند.
 config = context.config
 
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
-
-logger = logging.getLogger('alembic.env')
-
-def get_engine():
-    try:
-        # this works with Flask-SQLAlchemy<3 and Alchemical
-        return current_app.extensions['migrate'].db.get_engine()
-    except (TypeError, AttributeError):
-        # this works with Flask-SQLAlchemy>=3
-        return current_app.extensions['migrate'].db.engine
-
-def get_engine_url():
-    try:
-        return get_engine().url.render_as_string(hide_password=False).replace(
-            '%', '%%')
-    except AttributeError:
-        return str(get_engine().url).replace('%', '%%')
-
-# add your model's MetaData object here
-# for 'autogenerate' support
-config.set_main_option('sqlalchemy.url', get_engine_url())
-
-# Import all models to ensure they are registered with SQLAlchemy
-def import_models():
-    """Import all models to ensure they are registered with SQLAlchemy metadata"""
-    try:
-        # Import the main models module which should import all model classes
-        import models  # This imports all models from models.py
-        logger.info("Successfully imported all models")
-    except ImportError as e:
-        logger.error(f"Failed to import models: {e}")
-        raise
-
-# Ensure models are imported before getting metadata
-import_models()
-
-# Get metadata from the current app's db instance
+# اینجا، metadata مدل شما برای پشتیبانی از 'autogenerate' اضافه می شود.
+# این خط تضمین می کند که Alembic از همان MetaData که Flask-Migrate استفاده می کند، بهره ببرد.
+# این شامل تمام مدل هایی است که در زمان راه اندازی برنامه Flask بارگذاری شده اند.
 target_metadata = current_app.extensions['migrate'].db.metadata
 
-# other values from the config, defined by the needs of env.py,
-# can be acquired:
-# my_important_option = config.get_main_option("my_important_option")
-# ... etc.
+# اطمینان حاصل می کند که تمام مدل ها بارگذاری شده اند تا autogenerate بتواند آنها را ببیند.
+configure_mappers()
 
-def run_migrations_offline():
-    """Run migrations in 'offline' mode.
-
-    This configures the context with just a URL
-    and not an Engine, though an Engine is acceptable
-    here as well.  By skipping the Engine creation
-    we don't even need a DBAPI to be available.
-
-    Calls to context.execute() here emit the given string to the
-    script output.
-
-    """
-    url = config.get_main_option("sqlalchemy.url")
+def run_migrations_offline() -> None:
+    """مهاجرت ها را در حالت 'offline' اجرا می کند."""
+    url = current_app.config.get("SQLALCHEMY_DATABASE_URI")
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        # Add Unicode support
-        render_as_batch=True,
-        compare_type=True,
-        compare_server_default=True,
     )
-
     with context.begin_transaction():
         context.run_migrations()
 
-def run_migrations_online():
-    """Run migrations in 'online' mode.
+def run_migrations_online() -> None:
+    """مهاجرت ها را در حالت 'online' اجرا می کند."""
+    url = current_app.config.get("SQLALCHEMY_DATABASE_URI")
+    if not url:
+        raise ValueError("SQLALCHEMY_DATABASE_URI not found in Flask app config.")
 
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
-
-    """
-
-    # this callback is used to prevent an auto-migration from being generated
-    # when there are no changes to the schema
-    # reference: http://alembic.zzzcomputing.com/en/latest/cookbook.html
-    def process_revision_directives(context, revision, directives):
-        if getattr(config.cmd_opts, 'autogenerate', False):
-            script = directives[0]
-            if script.upgrade_ops.is_empty():
-                directives[:] = []
-                logger.info('No changes in schema detected.')
-
-    conf_args = current_app.extensions['migrate'].configure_args
-    if conf_args.get("process_revision_directives") is None:
-        conf_args["process_revision_directives"] = process_revision_directives
-
-    connectable = get_engine()
+    # اضافه کردن connect_args برای اطمینان از کدگذاری UTF-8
+    connectable = create_engine(
+        url,
+        connect_args={"client_encoding": "utf8"}
+    )
 
     with connectable.connect() as connection:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            # Add Unicode and batch support
-            render_as_batch=True,
             compare_type=True,
-            compare_server_default=True,
-            **conf_args
+            # این تابع را اضافه کردیم تا Alembic کامنت های ستون ها را نادیده بگیرد.
+            include_object=lambda object, name, type_, reflected, compare_to: (
+                object.comment is None if type_ == "column" else True
+            )
         )
-
         with context.begin_transaction():
             context.run_migrations()
 

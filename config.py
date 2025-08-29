@@ -7,6 +7,8 @@ class Config:
     SECRET_KEY = os.environ.get(
         'SECRET_KEY') or 'dev_secret_key_change_in_production_12345'
 
+    os.environ.pop("DATABASE_URL", None)  # Ignore Replit's PostgresSQL database URL
+    
     # تنظیمات پایگاه داده
     # از SQLite برای سادگی در توسعه استفاده می‌کنیم
     database_url = os.environ.get('DATABASE_URL')

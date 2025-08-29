@@ -1,10 +1,13 @@
-# routes/market_data.py
+# -*- coding: utf-8 -*-
 import requests
 import jdatetime
 import logging
+import socket
+from urllib.parse import urlparse
 from flask import current_app, jsonify
 from flask_restx import Namespace, Resource, fields
 from flask_jwt_extended import jwt_required
+from requests.exceptions import ConnectionError, Timeout
 
 # وارد کردن سرویس‌های داده جدید
 from services.iran_market_data import fetch_iran_market_indices
@@ -46,6 +49,49 @@ market_overview_model = market_overview_ns.model('MarketOverview', {
     'global_commodities': fields.Nested(global_commodities_model, description='Prices of global commodities.')
 })
 
+# --- منطق اصلی ---
+
+def is_port_open(host, port, timeout=1):
+    """
+    بررسی می‌کند که آیا پورت TCP روی هاست مشخص باز است یا نه.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        sock.close()
+        return True
+    except (socket.timeout, socket.error):
+        return False
+
+def get_tgju_url():
+    """
+    بررسی اولویت‌های URL برای پراکسی TGJU و بازگرداندن آدرس معتبر.
+    """
+    # اولویت‌ها به ترتیب: Docker, localhost
+    proxy_urls = [
+        "http://tgju_proxy:5001/api/price",
+        "http://localhost:5001/api/price"
+    ]
+
+    # بررسی هر URL به ترتیب اولویت
+    for url in proxy_urls:
+        parsed_url = urlparse(url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+
+        # ابتدا با یک بررسی سریع سوکت چک می‌کنیم که پورت باز است یا نه
+        if host and port and is_port_open(host, port, timeout=0.5):
+            logger.info(f"پورت {host}:{port} باز است. تلاش برای اتصال به پراکسی...")
+            return url
+        else:
+            logger.warning(f"پورت {host}:{port} بسته یا غیرقابل دسترس است.")
+
+    # اگر هیچ پراکسی کار نکرد، از آدرس fallback استفاده کن
+    fallback_url = current_app.config.get("TGJU_FALLBACK_URL", "https://call5.tgju.org")
+    logger.warning(f"تمام تلاش‌ها برای اتصال به پراکسی ناموفق بود. استفاده از URL فال‌بک: {fallback_url}")
+    return fallback_url
+
 # --- منطق Endpoint ---
 @market_overview_ns.route('/')
 class MarketOverviewResource(Resource):
@@ -66,52 +112,43 @@ class MarketOverviewResource(Resource):
             "global_commodities": {}
         }
 
-        # تنظیم timeout و URLها از config (با fallback به مقدار پیش‌فرض)
         timeout = current_app.config.get("TGJU_TIMEOUT", 8)
-        tgju_proxy_base = current_app.config.get("TGJU_PROXY_URL", "http://tgju_proxy:5001/api/price")
-        tgju_fallback_base = current_app.config.get("TGJU_FALLBACK_URL", "https://call5.tgju.org")
 
-        tgju_gold_url = f"{tgju_proxy_base}/gold"
-        tgju_currency_url = f"{tgju_proxy_base}/currency"
+        # دریافت URL مناسب با منطق اولویت‌بندی
+        tgju_base_url = get_tgju_url()
 
-        # 1. دریافت داده‌های TGJU از سرور پراکسی محلی
+        # 1. دریافت داده‌های TGJU
         tgju_data = {"gold_prices": [], "currency_prices": []}
 
-        # Gold prices
-        try:
-            gold_response = requests.get(tgju_gold_url, timeout=timeout)
-            gold_response.raise_for_status()
-            tgju_data["gold_prices"] = gold_response.json()
-        except Exception as e:
-            logger.warning(f"عدم موفقیت در دریافت Gold از پراکسی، تلاش با fallback: {e}")
+        # اگر URL یک پراکسی است، درخواست را به آن ارسال کن
+        if "tgju.org" not in tgju_base_url:
             try:
-                fallback_url = f"{tgju_fallback_base}/ajax.json"
-                fallback_resp = requests.get(fallback_url, timeout=timeout)
-                fallback_resp.raise_for_status()
-                raw = fallback_resp.json()
-                # استخراج طلای 18 عیار از fallback
-                gold_items = [i for i in raw.get("last", []) if "gold" in i.get("name", "")]
-                tgju_data["gold_prices"] = gold_items
-            except Exception as ee:
-                logger.error(f"خطا در دریافت Gold حتی با fallback: {ee}", exc_info=True)
+                gold_response = requests.get(f"{tgju_base_url}/gold", timeout=timeout)
+                gold_response.raise_for_status()
+                tgju_data["gold_prices"] = gold_response.json()
+                logger.info("داده‌های طلا از پراکسی با موفقیت دریافت شد.")
+            except Exception as e:
+                logger.error(f"خطا در دریافت Gold از پراکسی: {e}", exc_info=True)
 
-        # Currency prices
-        try:
-            currency_response = requests.get(tgju_currency_url, timeout=timeout)
-            currency_response.raise_for_status()
-            tgju_data["currency_prices"] = currency_response.json()
-        except Exception as e:
-            logger.warning(f"عدم موفقیت در دریافت Currency از پراکسی، تلاش با fallback: {e}")
             try:
-                fallback_url = f"{tgju_fallback_base}/ajax.json"
-                fallback_resp = requests.get(fallback_url, timeout=timeout)
+                currency_response = requests.get(f"{tgju_base_url}/currency", timeout=timeout)
+                currency_response.raise_for_status()
+                tgju_data["currency_prices"] = currency_response.json()
+                logger.info("داده‌های ارز از پراکسی با موفقیت دریافت شد.")
+            except Exception as e:
+                logger.error(f"خطا در دریافت Currency از پراکسی: {e}", exc_info=True)
+
+        # اگر از URL فال‌بک استفاده می‌شود، داده‌ها را مستقیماً از آن دریافت کن
+        else:
+            try:
+                fallback_resp = requests.get(f"{tgju_base_url}/ajax.json", timeout=timeout)
                 fallback_resp.raise_for_status()
-                raw = fallback_resp.json()
-                # استخراج ارزها از fallback
-                currency_items = [i for i in raw.get("last", []) if "usd" in i.get("name", "").lower() or "eur" in i.get("name", "").lower()]
-                tgju_data["currency_prices"] = currency_items
-            except Exception as ee:
-                logger.error(f"خطا در دریافت Currency حتی با fallback: {ee}", exc_info=True)
+                raw_data = fallback_resp.json()
+                tgju_data["gold_prices"] = [i for i in raw_data.get("last", []) if "gold" in i.get("name", "")]
+                tgju_data["currency_prices"] = [i for i in raw_data.get("last", []) if "usd" in i.get("name", "").lower() or "eur" in i.get("name", "").lower()]
+                logger.info("داده‌های TGJU از فال‌بک خارجی با موفقیت دریافت شد.")
+            except Exception as e:
+                logger.error(f"خطا در دریافت داده از فال‌بک: {e}", exc_info=True)
 
         overview_data["tgju_data"] = tgju_data
 
