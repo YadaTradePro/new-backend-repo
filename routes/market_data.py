@@ -22,7 +22,7 @@ market_overview_ns = Namespace('market-overview', description='Market overview d
 # مدل داده برای TGJU
 tgju_data_model = market_overview_ns.model('TGJUData', {
     'gold_prices': fields.Raw(description='List of gold prices from TGJU.'),
-    'currency_prices': fields.Raw(description='List of currency prices from TGJU.')
+    'coin_prices': fields.Raw(description='List of coin prices from TGJU.') # تغییر از currency به coin
 })
 
 # مدل داده برای شاخص‌های بورس ایران
@@ -106,7 +106,7 @@ class MarketOverviewResource(Resource):
             "date": jdatetime.date.today().strftime("%Y/%m/%d"),
             "tgju_data": {
                 "gold_prices": [],
-                "currency_prices": []
+                "coin_prices": [] # تغییر از currency به coin
             },
             "iran_market_indices": {},
             "global_commodities": {}
@@ -118,7 +118,7 @@ class MarketOverviewResource(Resource):
         tgju_base_url = get_tgju_url()
 
         # 1. دریافت داده‌های TGJU
-        tgju_data = {"gold_prices": [], "currency_prices": []}
+        tgju_data = {"gold_prices": [], "coin_prices": []} # تغییر از currency به coin
 
         # اگر URL یک پراکسی است، درخواست را به آن ارسال کن
         if "tgju.org" not in tgju_base_url:
@@ -131,12 +131,12 @@ class MarketOverviewResource(Resource):
                 logger.error(f"خطا در دریافت Gold از پراکسی: {e}", exc_info=True)
 
             try:
-                currency_response = requests.get(f"{tgju_base_url}/currency", timeout=timeout)
-                currency_response.raise_for_status()
-                tgju_data["currency_prices"] = currency_response.json()
-                logger.info("داده‌های ارز از پراکسی با موفقیت دریافت شد.")
+                coin_response = requests.get(f"{tgju_base_url}/coin", timeout=timeout) # تغییر از /currency به /coin
+                coin_response.raise_for_status()
+                tgju_data["coin_prices"] = coin_response.json() # تغییر از currency_prices به coin_prices
+                logger.info("داده‌های سکه از پراکسی با موفقیت دریافت شد.")
             except Exception as e:
-                logger.error(f"خطا در دریافت Currency از پراکسی: {e}", exc_info=True)
+                logger.error(f"خطا در دریافت Coin از پراکسی: {e}", exc_info=True)
 
         # اگر از URL فال‌بک استفاده می‌شود، داده‌ها را مستقیماً از آن دریافت کن
         else:
@@ -145,7 +145,7 @@ class MarketOverviewResource(Resource):
                 fallback_resp.raise_for_status()
                 raw_data = fallback_resp.json()
                 tgju_data["gold_prices"] = [i for i in raw_data.get("last", []) if "gold" in i.get("name", "")]
-                tgju_data["currency_prices"] = [i for i in raw_data.get("last", []) if "usd" in i.get("name", "").lower() or "eur" in i.get("name", "").lower()]
+                tgju_data["coin_prices"] = [i for i in raw_data.get("last", []) if "coin" in i.get("name", "").lower() or "bahar" in i.get("name", "").lower()] # تغییر از currency به coin و افزودن 'bahar'
                 logger.info("داده‌های TGJU از فال‌بک خارجی با موفقیت دریافت شد.")
             except Exception as e:
                 logger.error(f"خطا در دریافت داده از فال‌بک: {e}", exc_info=True)

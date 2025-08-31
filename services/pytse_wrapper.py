@@ -168,7 +168,8 @@ def download_financial_indexes_safe(symbols, timeout=10, max_retries=3, backoff=
     Adds a consistent error handling and logging layer.
     """
     try:
-        return tse.download_financial_indexes(symbols, timeout=timeout, retries=max_retries, backoff_factor=backoff)
+        # آرگومان‌های retries و backoff_factor را حذف کنید
+        return tse.download_financial_indexes(symbols, timeout=timeout)
     except Exception as e:
         logger.error(f"Error downloading financial indexes for symbols {symbols}: {e}")
         return {}

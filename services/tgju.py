@@ -1,4 +1,3 @@
-# tgju.py
 import requests
 from bs4 import BeautifulSoup
 import logging
@@ -16,7 +15,7 @@ logger = logging.getLogger(__name__)
 # یک دیکشنری برای ذخیره آخرین داده‌های موفق
 cached_data = {
     'gold': None,
-    'currency': None
+    'coin': None
 }
 # یک قفل برای جلوگیری از تداخل در دسترسی به کش از تردها
 cache_lock = threading.Lock()
@@ -28,7 +27,7 @@ headers = {
 # --- تابع‌های اسکرپینگ بهینه‌شده ---
 def scrape_tgju_gold():
     """
-    اسکرپ کردن داده‌های طلا و سکه از tgju.org و به‌روزرسانی کش.
+    اسکرپ کردن داده‌های طلا و به‌روزرسانی کش.
     """
     gold_url = "https://www.tgju.org/gold-chart"
     try:
@@ -47,13 +46,13 @@ def scrape_tgju_gold():
             for item in rows:
                 item_title_element = item.find('th')
                 cells = item.find_all('td')
-                
+
                 if not item_title_element or len(cells) < 4:
                     continue
-                
+
                 item_title = item_title_element.text.strip()
                 item_key = cells[-1].find('a').get('href').split('/')[-1]
-                
+
                 price = cells[0].text.strip()
                 change_percent = cells[1].text.strip()
                 change_value = cells[2].text.strip()
@@ -70,7 +69,7 @@ def scrape_tgju_gold():
                     }
                 )
             g_out.append({'title': title, 'prices': prices})
-        
+
         with cache_lock:
             cached_data['gold'] = g_out
         logger.info("داده‌های طلا با موفقیت اسکرپ و کش شدند.")
@@ -80,55 +79,70 @@ def scrape_tgju_gold():
     except Exception as e:
         logger.error(f"An unexpected error occurred during gold data scraping: {e}")
 
-
-def scrape_tgju_currency():
+# --- تابع جدید برای اسکرپ کردن داده‌های سکه ---
+def scrape_tgju_coin():
     """
-    اسکرپ کردن داده‌های ارزها از tgju.org و به‌روزرسانی کش.
+    اسکرپ کردن داده‌های سکه‌ها از tgju.org و به‌روزرسانی کش.
     """
-    currency_url = "https://www.tgju.org/currency"
+    coin_url = "https://www.tgju.org/coin-chart"
     try:
-        c_r = requests.get(currency_url, headers=headers, timeout=10)
+        c_r = requests.get(coin_url, headers=headers, timeout=10)
         c_r.raise_for_status()
         c_soup = BeautifulSoup(c_r.content, 'html.parser')
-        c_tables = c_soup.find_all('table', class_='market-table')
+
         c_out = []
-        for table in c_tables:
-            body = table.find('tbody')
-            if not body:
-                continue
-            rows = body.find_all('tr')
-            for row in rows:
-                title_element = row.find('th')
-                cells = row.find_all('td')
-                
-                if not title_element or len(cells) < 4:
-                    continue
-                
-                title = title_element.text.strip()
-                key = cells[-1].find('a').get('href').split('/')[-1]
+        coin_table = None
 
-                price = cells[0].text.strip()
-                change_percent = cells[1].text.strip()
-                change_value = cells[2].text.strip()
-                last_update = cells[3].text.strip()
+        # ✅ رویکرد جدید: پیدا کردن تمام جداول و بررسی عنوان هر کدام
+        all_tables = c_soup.find_all('table')
+        for table in all_tables:
+            header = table.find('th')
+            if header and "قیمت سکه" in header.text:
+                coin_table = table
+                break
 
-                c_out.append({
-                    'title': title,
-                    'price': price,
-                    'change_percent': change_percent,
-                    'change_value': change_value,
-                    'last_update': last_update,
-                    'key': key
-                })
-        
+        if coin_table:
+            body = coin_table.find('tbody')
+            if body:
+                rows = body.find_all('tr')
+
+                for row in rows:
+                    title_element = row.find('th')
+                    cells = row.find_all('td')
+
+                    if not title_element or len(cells) < 4:
+                        continue
+
+                    title = title_element.text.strip()
+                    key_element = cells[-1].find('a')
+                    key = key_element.get('href').split('/')[-1] if key_element else 'N/A'
+
+                    price = cells[0].text.strip()
+                    change_percent = cells[1].text.strip()
+                    change_value = cells[2].text.strip()
+                    last_update = cells[3].text.strip()
+
+                    c_out.append({
+                        'title': title,
+                        'price': price,
+                        'change_percent': change_percent,
+                        'change_value': change_value,
+                        'last_update': last_update,
+                        'key': key
+                    })
+            else:
+                logger.warning("Could not find tbody element within the coin table.")
+        else:
+            logger.error("Could not find the 'قیمت سکه' table on the page.")
+
         with cache_lock:
-            cached_data['currency'] = c_out
-        logger.info("داده‌های ارز با موفقیت اسکرپ و کش شدند.")
+            cached_data['coin'] = c_out
+        logger.info("داده‌های سکه با موفقیت اسکرپ و کش شدند.")
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching currency data, returning cached data. Error: {e}")
+        logger.error(f"Error fetching coin data, returning cached data. Error: {e}")
     except Exception as e:
-        logger.error(f"An unexpected error occurred during currency data scraping: {e}")
+        logger.error(f"An unexpected error occurred during coin data scraping: {e}")
 
 
 def scrape_data_periodically():
@@ -137,15 +151,13 @@ def scrape_data_periodically():
     """
     # اولین اسکرپینگ بلافاصله انجام می‌شود
     scrape_tgju_gold()
-    scrape_tgju_currency()
-    
+    scrape_tgju_coin()
+
     while True:
-        # در صورت موفقیت‌آمیز بودن، ۵ دقیقه صبر می‌کند.
-        # در صورت شکست، می‌تواند با یک زمان کوتاه‌تر دوباره تلاش کند.
         logger.info("در حال انتظار برای آپدیت بعدی...")
-        time.sleep(3600) # 300 ثانیه = 60 دقیقه
+        time.sleep(300) # 300 ثانیه = 5 دقیقه
         scrape_tgju_gold()
-        scrape_tgju_currency()
+        scrape_tgju_coin()
 
 # --- راه‌اندازی سرور Flask ---
 app = Flask(__name__)
@@ -158,7 +170,7 @@ def get_price(of):
     """
     with cache_lock:
         data = cached_data.get(of)
-    
+
     if data:
         return jsonify(data), 200
     else:
@@ -181,4 +193,3 @@ if __name__ == '__main__':
     # استفاده از use_reloader=False ضروری است تا ترد اسکرپینگ دوبار اجرا نشود.
     # debug=True فقط برای توسعه است، برای پروداکشن باید False باشد.
     app.run(host="0.0.0.0", port=5001, debug=True, use_reloader=False)
-

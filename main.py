@@ -66,6 +66,8 @@ def create_app(test_config=None):
         "http://localhost:3000",    # CRITICAL FIX: Add the Next.js development server URL
         "http://127.0.0.1:3000",      # CRITICAL FIX: Add the localhost loopback address
         "http://10.15.40.104:3000",
+        "https://a8528c36-3864-4fde-aa02-b6c4d38572dd-00-3k36a6456ztnu.sisko.replit.dev:3001", # CRITICAL FIX: Add the new Replit frontend URL
+
         "https://a8528c36-3864-4fde-aa02-b6c4d38572dd-00-3k36a6456ztnu.sisko.replit.dev", # CRITICAL FIX: Add the new Replit frontend URL
     ]
     CORS(app, resources={r"/*": {"origins": cors_origins}}, supports_credentials=True)
