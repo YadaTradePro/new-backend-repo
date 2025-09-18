@@ -48,6 +48,13 @@ def run_potential_buy_queue_analysis_and_save():
     """
     current_app.logger.info("Starting Potential Buy Queues analysis and saving results with enhanced logic.")
 
+    def get_numeric_value(data_row, key, default=0):
+        """
+        Safely gets a numeric value from a pandas Series, handling both missing keys and None/NaN values.
+        """
+        value = data_row.get(key, default)
+        return value if pd.notna(value) else default
+
     symbols = ComprehensiveSymbolData.query.all()
     
     # Separate lists for general symbols and funds
@@ -56,7 +63,7 @@ def run_potential_buy_queue_analysis_and_save():
 
     # Define fund keywords
     fund_keywords = ["صندوق", "سرمایه گذاری", "اعتبار", "آتیه", "یکتا", "بورس", "دارایی", "گیلان", "اختصاصی", 
-                     "تدبیر", "دماوند", "سپهر", "سودمند", "کامیاب", "آشنا", "ماهور"] 
+                      "تدبیر", "دماوند", "سپهر", "سودمند", "کامیاب", "آشنا", "ماهور"] 
     
     # Keywords/patterns for pre-emptive rights (حق تقدم)
     preemptive_rights_patterns = ["ح", "حق"] # Common prefixes for pre-emptive rights symbols
@@ -122,8 +129,6 @@ def run_potential_buy_queue_analysis_and_save():
         tech_df = tech_df.sort_values(by='greg_date', ascending=True).reset_index(drop=True)
 
         # Merge historical and technical data using a LEFT merge to keep all historical data
-        # Columns unique to hist_df (like open, high, low, close) will NOT get suffixes.
-        # Columns common to both (like symbol_id, created_at, updated_at) WILL get suffixes.
         merged_df = pd.merge(hist_df, tech_df, on='jdate', how='left', suffixes=('_hist', '_tech'))
         
         current_app.logger.debug(f"[{symbol_name}] merged_df shape after merge (left join): {merged_df.shape}")
@@ -145,8 +150,8 @@ def run_potential_buy_queue_analysis_and_save():
             current_app.logger.debug(f"[{symbol_name}] Skipping: Invalid current price ({close_price}).")
             continue
 
-        buy_queue_volume = latest_data.get('qd1', 0) 
-        buy_queue_count = latest_data.get('zd1', 0) 
+        buy_queue_volume = get_numeric_value(latest_data, 'qd1')
+        buy_queue_count = get_numeric_value(latest_data, 'zd1') 
 
         # --- ENHANCED ANALYSIS LOGIC ---
         reasons = []
@@ -160,10 +165,12 @@ def run_potential_buy_queue_analysis_and_save():
 
         # 2. Strong Real Buyer Power
         real_buy_power_ratio = 0.0
-        if 'buy_count_i' in latest_data and 'sell_count_i' in latest_data and \
-           (latest_data.get('buy_count_i', 0) > 0) and (latest_data.get('sell_count_i', 0) > 0): 
-            avg_buy_vol_per_trade = (latest_data.get('buy_i_volume', 0) or 0) / (latest_data.get('buy_count_i', 1) or 1)
-            avg_sell_vol_per_trade = (latest_data.get('sell_i_volume', 0) or 0) / (latest_data.get('sell_count_i', 1) or 1)
+        buy_count_i = get_numeric_value(latest_data, 'buy_count_i')
+        sell_count_i = get_numeric_value(latest_data, 'sell_count_i')
+        
+        if buy_count_i > 0 and sell_count_i > 0: 
+            avg_buy_vol_per_trade = get_numeric_value(latest_data, 'buy_i_volume') / buy_count_i
+            avg_sell_vol_per_trade = get_numeric_value(latest_data, 'sell_i_volume') / sell_count_i
             if avg_sell_vol_per_trade > 0:
                 real_buy_power_ratio = avg_buy_vol_per_trade / avg_sell_vol_per_trade
         
@@ -173,47 +180,54 @@ def run_potential_buy_queue_analysis_and_save():
             current_app.logger.debug(f"[{symbol_name}]: Strong Real Buyer Power ({real_buy_power_ratio:.2f}).")
 
         # 3. Price Action: Closing near High
-        if latest_data.get('high', 0) > 0 and (latest_data.get('high', 0) - close_price) / latest_data.get('high', 1) < 0.01: 
+        high_price = get_numeric_value(latest_data, 'high')
+        if high_price > 0 and (high_price - close_price) / high_price < 0.01: 
             reasons.append("قیمت پایانی نزدیک به سقف روزانه")
             probability_percent += 15
             current_app.logger.debug(f"[{symbol_name}]: Closing Near High.")
 
         # 4. Volume Spike (compared to average)
-        if 'Volume_MA_20_tech' in latest_data and pd.notna(latest_data.get('Volume_MA_20_tech')) and latest_data.get('Volume_MA_20_tech', 0) > 0:
-            if latest_data.get('volume', 0) > (2.5 * latest_data.get('Volume_MA_20_tech', 0)): 
+        volume_today = get_numeric_value(latest_data, 'volume')
+        volume_ma_20 = get_numeric_value(latest_data, 'Volume_MA_20_tech')
+        if volume_ma_20 > 0:
+            if volume_today > (2.5 * volume_ma_20): 
                 reasons.append("افزایش حجم معاملات (حجم مشکوک)")
                 probability_percent += 15
                 current_app.logger.debug(f"[{symbol_name}]: Volume Spike.")
 
         # 5. RSI Bullish Signal (Rising from Oversold or Strong Momentum)
-        if 'RSI_tech' in latest_data and pd.notna(latest_data.get('RSI_tech')):
-            if latest_data.get('RSI_tech', 0) < 35: # Close to oversold
-                reasons.append("RSI نزدیک به محدوده اشباع فروش")
-                probability_percent += 5
-                current_app.logger.debug(f"[{symbol_name}]: RSI near oversold.")
-            
-            # Check if RSI is rising (requires at least 2 data points)
-            if len(merged_df) >= 2 and 'RSI_tech' in merged_df.columns:
-                prev_rsi = merged_df.iloc[-2].get('RSI_tech')
-                if pd.notna(prev_rsi) and latest_data.get('RSI_tech', 0) > prev_rsi and latest_data.get('RSI_tech', 0) < 70: # RSI rising, not overbought
-                    reasons.append("RSI در حال صعود")
-                    probability_percent += 10
-                    current_app.logger.debug(f"[{symbol_name}]: RSI rising.")
+        rsi_today = get_numeric_value(latest_data, 'RSI_tech')
+        if rsi_today < 35: # Close to oversold
+            reasons.append("RSI نزدیک به محدوده اشباع فروش")
+            probability_percent += 5
+            current_app.logger.debug(f"[{symbol_name}]: RSI near oversold.")
+        
+        # Check if RSI is rising (requires at least 2 data points)
+        if len(merged_df) >= 2 and 'RSI_tech' in merged_df.columns:
+            prev_rsi = get_numeric_value(merged_df.iloc[-2], 'RSI_tech')
+            if rsi_today > prev_rsi and rsi_today < 70: # RSI rising, not overbought
+                reasons.append("RSI در حال صعود")
+                probability_percent += 10
+                current_app.logger.debug(f"[{symbol_name}]: RSI rising.")
 
         # 6. MACD Bullish Crossover
-        if 'MACD_tech' in latest_data and 'MACD_Signal_tech' in latest_data and \
-           pd.notna(latest_data.get('MACD_tech')) and pd.notna(latest_data.get('MACD_Signal_tech')) and len(merged_df) >= 2:
-            if latest_data.get('MACD_tech', 0) > latest_data.get('MACD_Signal_tech', 0) and \
-               merged_df.iloc[-2].get('MACD_tech', 0) <= merged_df.iloc[-2].get('MACD_Signal_tech', 0):
+        macd_today = get_numeric_value(latest_data, 'MACD_tech')
+        macd_signal_today = get_numeric_value(latest_data, 'MACD_Signal_tech')
+        if macd_today != 0 and macd_signal_today != 0 and len(merged_df) >= 2:
+            prev_macd = get_numeric_value(merged_df.iloc[-2], 'MACD_tech')
+            prev_macd_signal = get_numeric_value(merged_df.iloc[-2], 'MACD_Signal_tech')
+            if macd_today > macd_signal_today and prev_macd <= prev_macd_signal:
                 reasons.append("تقاطع صعودی MACD")
                 probability_percent += 20
                 current_app.logger.debug(f"[{symbol_name}]: MACD Bullish Crossover.")
 
         # 7. SMA Cross (e.g., SMA_20 crossing above SMA_50)
-        if 'SMA_20_tech' in latest_data and 'SMA_50_tech' in latest_data and \
-           pd.notna(latest_data.get('SMA_20_tech')) and pd.notna(latest_data.get('SMA_50_tech')) and len(merged_df) >= 2:
-            if latest_data.get('SMA_20_tech', 0) > latest_data.get('SMA_50_tech', 0) and \
-               merged_df.iloc[-2].get('SMA_20_tech', 0) <= merged_df.iloc[-2].get('SMA_50_tech', 0):
+        sma20_today = get_numeric_value(latest_data, 'SMA_20_tech')
+        sma50_today = get_numeric_value(latest_data, 'SMA_50_tech')
+        if sma20_today != 0 and sma50_today != 0 and len(merged_df) >= 2:
+            prev_sma20 = get_numeric_value(merged_df.iloc[-2], 'SMA_20_tech')
+            prev_sma50 = get_numeric_value(merged_df.iloc[-2], 'SMA_50_tech')
+            if sma20_today > sma50_today and prev_sma20 <= prev_sma50:
                 reasons.append("تقاطع صعودی میانگین متحرک (SMA20/SMA50)")
                 probability_percent += 15
                 current_app.logger.debug(f"[{symbol_name}]: SMA Cross.")
@@ -221,20 +235,30 @@ def run_potential_buy_queue_analysis_and_save():
         # 8. Candlestick Patterns (e.g., Bullish Engulfing, Hammer)
         required_candle_cols = ['open', 'high', 'low', 'close'] 
         if all(col in merged_df.columns for col in required_candle_cols) and len(merged_df) >= 3:
-            # Extract today's and yesterday's candle data as dictionaries
-            today_candle_data = merged_df.iloc[-1][required_candle_cols].to_dict()
-            yesterday_candle_data = merged_df.iloc[-2][required_candle_cols].to_dict()
+            # Correcting the issue by passing a new dictionary with the expected keys
+            today_candle_data_for_fn = {
+                'open_price': get_numeric_value(merged_df.iloc[-1], 'open'),
+                'high_price': get_numeric_value(merged_df.iloc[-1], 'high'),
+                'low_price': get_numeric_value(merged_df.iloc[-1], 'low'),
+                'close_price': get_numeric_value(merged_df.iloc[-1], 'close')
+            }
+            yesterday_candle_data_for_fn = {
+                'open_price': get_numeric_value(merged_df.iloc[-2], 'open'),
+                'high_price': get_numeric_value(merged_df.iloc[-2], 'high'),
+                'low_price': get_numeric_value(merged_df.iloc[-2], 'low'),
+                'close_price': get_numeric_value(merged_df.iloc[-2], 'close')
+            }
             
             # Check for NaNs in the relevant columns for the last 2 rows
-            if (pd.Series(today_candle_data).isnull().values.any() or 
-                pd.Series(yesterday_candle_data).isnull().values.any()):
-                current_app.logger.debug(f"[{symbol_name}] Skipping candlestick pattern check: Today's or yesterday's candle data contains NaN values for price columns. Today: {today_candle_data}, Yesterday: {yesterday_candle_data}")
+            if (pd.Series(today_candle_data_for_fn).isnull().values.any() or 
+                pd.Series(yesterday_candle_data_for_fn).isnull().values.any()):
+                current_app.logger.debug(f"[{symbol_name}] Skipping candlestick pattern check: Today's or yesterday's candle data contains NaN values for price columns. Today: {today_candle_data_for_fn}, Yesterday: {yesterday_candle_data_for_fn}")
             else:
-                # Pass the full 'close' column as a numpy array for close_prices_series
+                # Pass the corrected dictionaries and the full merged_df to the function
                 bullish_patterns = check_candlestick_patterns(
-                    today_candle_data, 
-                    yesterday_candle_data, 
-                    merged_df['close'].values # Pass the full series for trend detection
+                    today_candle_data_for_fn, 
+                    yesterday_candle_data_for_fn, 
+                    merged_df 
                 )
                 if bullish_patterns:
                     reasons.append(f"الگوی کندل استیک صعودی: {', '.join(bullish_patterns)}")
@@ -250,7 +274,7 @@ def run_potential_buy_queue_analysis_and_save():
         smart_money_df = calculate_smart_money_flow(hist_df)
         if not smart_money_df.empty and 'individual_net_flow' in smart_money_df.columns:
             latest_net_flow = smart_money_df.iloc[-1]['individual_net_flow']
-            if pd.notna(latest_net_flow) and latest_net_flow > 0 and latest_net_flow > (latest_data.get('value', 0) * 0.03): 
+            if pd.notna(latest_net_flow) and latest_net_flow > 0 and latest_net_flow > (get_numeric_value(latest_data, 'value') * 0.03): 
                 reasons.append("ورود پول هوشمند (حقیقی)")
                 probability_percent += 18
                 current_app.logger.debug(f"[{symbol_name}]: Smart Money Inflow.")
@@ -268,7 +292,7 @@ def run_potential_buy_queue_analysis_and_save():
                 'reason': ", ".join(reasons), 
                 'jdate': today_jdate_str, 
                 'current_price': close_price, 
-                'volume_change_percent': (latest_data.get('volume', 0) / latest_data.get('Volume_MA_20_tech', 1) - 1) * 100 if 'Volume_MA_20_tech' in latest_data and latest_data.get('Volume_MA_20_tech', 0) > 0 else 0.0,
+                'volume_change_percent': (volume_today / volume_ma_20 - 1) * 100 if volume_ma_20 > 0 else 0.0,
                 'real_buyer_power_ratio': real_buy_power_ratio, # FIX: Corrected variable name
                 'matched_filters': json.dumps(reasons), 
                 'group_type': 'fund' if is_fund else 'general',

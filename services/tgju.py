@@ -155,7 +155,7 @@ def scrape_data_periodically():
 
     while True:
         logger.info("در حال انتظار برای آپدیت بعدی...")
-        time.sleep(300) # 300 ثانیه = 5 دقیقه
+        time.sleep(3600) # 3600 ثانیه = 60 دقیقه
         scrape_tgju_gold()
         scrape_tgju_coin()
 

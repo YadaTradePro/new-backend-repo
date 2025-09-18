@@ -12,19 +12,43 @@ import sys
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- تنظیمات مسیردهی پروژه ---
-# این مسیر، ریشه پروژه را به sys.path اضافه می‌کند تا ایمپورت‌های نسبی از ماژول‌های
-# مانند `extensions` و `models` به درستی کار کنند.
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root_dir = os.path.abspath(os.path.join(current_script_dir, '..'))
 
-if project_root_dir not in sys.path:
-    sys.path.insert(0, project_root_dir)
+# --- تنظیمات مسیردهی هوشمند ---
+current_script_dir = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(current_script_dir, '..'))  # یک سطح بالاتر = ریشه پروژه
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# تشخیص خودکار محیط: Docker یا Local
+MODELS_DIR = '/app/models' if os.path.exists('/app') else os.path.join(PROJECT_ROOT, "models")
+
+# ایجاد پوشه اگر وجود ندارد
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+print("✅ محیط تشخیص داده شد:")
+print("📁 مسیر پروژه:", PROJECT_ROOT)
+print("🤖 مسیر مدل‌ها:", MODELS_DIR)
+print("🏠 محیط:", "Docker" if os.path.exists('/app') else "Local Machine")
+
+# --- مسیرهای دیگر پروژه ---
+SERVICES_PATH = os.path.join(PROJECT_ROOT, 'services')
+DATA_PATH = os.path.join(PROJECT_ROOT, 'data')
+
+if SERVICES_PATH not in sys.path:
+    sys.path.insert(0, SERVICES_PATH)
+
+# تعریف مسیرهای خاص فایل‌های مدل
+LATEST_MODEL_PATH = os.path.join(MODELS_DIR, 'latest_model.joblib')
+LATEST_SCALER_PATH = os.path.join(MODELS_DIR, 'latest_scaler.joblib')
+LATEST_FEATURE_NAMES_PATH = os.path.join(MODELS_DIR, 'latest_feature_names.joblib')
+LATEST_CLASS_LABELS_PATH = os.path.join(MODELS_DIR, 'latest_class_labels.joblib')
+
 
 try:
     from extensions import db
     from models import MLPrediction, ComprehensiveSymbolData, HistoricalData
-    from ml_predictor import predict_trend_for_symbol, LATEST_MODEL_PATH
+    from ml_predictor import predict_trend_for_symbol
     from services.utils import convert_gregorian_to_jalali
 except ImportError as e:
     logger.error(f"خطا در ایمپورت ماژول‌ها در ml_prediction_service.py: {e}")
@@ -123,8 +147,8 @@ def generate_and_save_predictions_for_watchlist(prediction_date_greg=None, predi
                 logger.warning(f"پیش‌بینی برای نماد {symbol_name} ({symbol_id}) انجام نشد (داده ناکافی یا خطا در ml_predictor).")
                 continue
 
-            # توجه: مسیر مدل باید در ml_predictor.py به 'backend/models' تغییر یابد.
-            model_version_str = os.path.basename(LATEST_MODEL_PATH).replace('trained_ml_model_', '').replace('.pkl', '')
+
+            model_version_str = "latest"
 
             new_prediction = MLPrediction(
                 symbol_id=symbol_id,

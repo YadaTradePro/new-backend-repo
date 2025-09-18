@@ -1,1781 +1,2812 @@
+# -*- coding: utf-8 -*-
 # services/data_fetch_and_process.py
+# نسخه بازنویسی شده با توابع نسخه 10 جولای
+
 from extensions import db
 from models import HistoricalData, ComprehensiveSymbolData, TechnicalIndicatorData, FundamentalData
 from flask import current_app
-#import pytse_client as tse
-import pandas as pd
-from datetime import datetime, date, timedelta # Import date here too
+from sqlalchemy import func, distinct, text
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy import or_ # مطمئن شوید این خط import شده باشد
+from datetime import datetime, date, timedelta
 import jdatetime
-from sqlalchemy import func
+import pandas as pd
+import ta
 import numpy as np
-#import requests
-from bs4 import BeautifulSoup # Import BeautifulSoup
-import lxml # lxml is the parser for BeautifulSoup
-
-#ماژول‌های pytse_client و requests را حذف کرده و توابع مورد نیاز از ماژول pytse_wrapper را ایمپورت کنید.
-from services.pytse_wrapper import (
-    http_get, 
-    Ticker, 
-    download, 
-    safe_download_batch, 
-    all_tickers, 
-    download_financial_indexes_safe
-)
-
-# Import utility functions - ensure calculate_atr is present in your utils.py
-from services.utils import convert_gregorian_to_jalali, normalize_value, calculate_rsi, calculate_macd, calculate_sma, calculate_bollinger_bands, calculate_volume_ma, calculate_atr, calculate_smart_money_flow # Added calculate_smart_money_flow here
-
-# تنظیمات لاگینگ برای این ماژول
+import requests
+from bs4 import BeautifulSoup
+import lxml
+import time
+import gc
+import psutil
 import logging
+import re
+from typing import Dict, List, Optional, Tuple, Any, Union
+import concurrent.futures
+import pytse_client
+import traceback
+
+
+
+
+# تنظیمات لاگینگ
 logger = logging.getLogger(__name__)
 
-# Global mapping for market types from pytse_client.flow (or TSETMC's flow code)
+# ایجاد sessionmaker برای مدیریت connection pooling
+def get_session_local():
+    """ایجاد session local با application context"""
+    try:
+        from flask import current_app
+        with current_app.app_context():
+            return sessionmaker(bind=db.engine)()
+    except RuntimeError:
+        # اگر خارج از application context هستیم
+        return sessionmaker(bind=db.get_engine())()
+
+# Global mapping for market types
 MARKET_TYPE_MAP = {
-    0: 'عمومی',
-    1: 'بورس',
-    2: 'فرابورس',
-    3: 'مشتقه',
-    4: 'پایه فرابورس',
-    5: 'پایه فرابورس (منتشر نمی شود)',
-    6: 'بورس انرژی',
-    7: 'بورس کالا'
+    '1': 'بورس',
+    '2': 'فرابورس',
+    '3': 'بورس کالا',
+    '4': 'بورس انرژی',
+    '5': 'صندوق سرمایه گذاری',
+    '6': 'اوراق با درآمد ثابت',
+    '7': 'مشتقه',
+    '8': 'عمومی',
+    '9': 'پایه فرابورس',
+    '10': 'اوراق تامین مالی',
+    '11': 'اوراق با درآمد ثابت'
 }
 
-# Mapping for market types extracted from HTML or Ticker.group_name to our standard names
-# This helps standardize names if HTML parsing or group_name returns variations
 HTML_MARKET_TYPE_MAP = {
-    'بورس': 'بورس',
-    'فرابورس': 'فرابورس',
-    'بازار اول (بورس)': 'بورس',
-    'بازار دوم (بورس)': 'بورس',
-    'بازار پایه فرابورس': 'پایه فرابورس',
-    'بازار مشتقه': 'مشتقه',
-    'بازار بورس کالا': 'بورس کالا',
-    'بورس انرژی': 'بورس انرژی',
-    'صندوق سرمایه گذاری': 'صندوق سرمایه گذاری', # Common for funds
-    'صندوق': 'صندوق سرمایه گذاری', # Shorter version
-    'اوراق بهادار با درآمد ثابت': 'اوراق با درآمد ثابت', # Bonds, etc.
-    'اوراق تامین مالی': 'اوراق تامین مالی',
-    'حق تقدم': 'حق تقدم',
-    'صندوق قابل معامله': 'صندوق سرمایه گذاری', # ETF
-    'صندوق های قابل معامله': 'صندوق سرمایه گذاری', # Plural
-    'صندوقهای سرمایه گذاری': 'صندوق سرمایه گذاری',
-    'صندوق سرمایه گذاری مشترک': 'صندوق سرمایه گذاری',
-    'صندوق سرمایه گذاری قابل معامله': 'صندوق سرمایه گذاری',
-    'صندوق سرمایه گذاری در سهام': 'صندوق سرمایه گذاری',
-    'صندوق سرمایه گذاری مختلط': 'صندوق سرمایه گذاری',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت': 'صندوق سرمایه گذاری',
-    'صندوق سرمایه گذاری طلا': 'صندوق سرمایه گذاری',
-    'اوراق اجاره': 'اوراق با درآمد ثابت',
-    'صکوک': 'اوراق با درآمد ثابت',
-    'گواهی سپرده کالایی': 'بورس کالا', # Example for commodity exchange
-    'حراج': 'عمومی', # Example for general/auction
-    'سهام': 'بورس', # Default for stocks
-    'صکوک اجاره': 'اوراق با درآمد ثابت',
-    'اوراق مشارکت': 'اوراق با درآمد ثابت',
-    'اختیار معامله': 'مشتقه',
-    'آتی': 'مشتقه',
-    'بورس کالا و انرژی': 'بورس کالا', # Broader term
     'بورس اوراق بهادار تهران': 'بورس',
     'فرابورس ایران': 'فرابورس',
-    'بازار پایه': 'پایه فرابورس',
-    'بازار ابزارهای نوین مالی': 'فرابورس', # Often contains funds
-    'گواهی سپرده': 'اوراق با درآمد ثابت',
-    'صندوق‌های سرمایه‌گذاری قابل معامله': 'صندوق سرمایه گذاری', # Another variation for ETFs
-    'صندوق‌های سرمایه‌گذاری': 'صندوق سرمایه گذاری', # Generic funds
-    'صندوق‌های سرمایه‌گذاری در سهام': 'صندوق سرمایه گذاری',
-    'صندوق‌های سرمایه‌گذاری مختلط': 'صندوق سرمایه گذاری',
-    'صندوق‌های سرمایه‌گذاری با درآمد ثابت': 'صندوق سرمایه گذاری',
-    'صندوق‌های سرمایه‌گذاری کالایی': 'صندوق سرمایه گذاری',
-    'بازار ابزارهای مالی نوین': 'فرابورس', # Another variation
-    'صندوق سرمایه گذاری در اوراق بهادار': 'صندوق سرمایه گذاری', # Generic for securities funds
-    'صندوق سرمایه گذاری در صندوق': 'صندوق سرمایه گذاری', # Fund of funds
-    'صندوق سرمایه گذاری جسورانه': 'صندوق سرمایه گذاری', # Venture Capital Fund
-    'صندوق سرمایه گذاری زمین و ساختمان': 'صندوق سرمایه گذاری', # Real Estate Fund
-    'صندوق سرمایه گذاری اختصاصی بازارگردانی': 'صندوق سرمایه گذاری', # Market Making Fund
-    'صندوق سرمایه گذاری پروژه': 'صندوق سرمایه گذاری', # Project Fund
-    'صندوق سرمایه گذاری در بورس کالا': 'صندوق سرمایه گذاری', # Commodity Exchange Fund
-    'صندوق سرمایه گذاری در طلا': 'صندوق سرمایه گذاری', # Gold Fund
-    'صندوق: سهامي اهرمي': 'صندوق سرمایه گذاری', # NEW: User requested
-    'نوع صندوق: سهامي': 'صندوق سرمایه گذاری', # NEW: User requested
-    'صندوق سهامي': 'صندوق سرمایه گذاری', # NEW: General stock fund
-    'صندوق اهرمي': 'صندوق سرمایه گذاری', # NEW: Leveraged fund
-    'صندوق با درآمد ثابت': 'صندوق سرمایه گذاری', # NEW: Fixed income fund
-    'صندوق مختلط': 'صندوق سرمایه گذاری', # NEW: Mixed fund
-    'صندوق بازارگردانی': 'صندوق سرمایه گذاری', # NEW: Market making fund
-    'صندوق پروژه': 'صندوق سرمایه گذاری', # NEW: Project fund
-    'صندوق طلا': 'صندوق سرمایه گذاری', # NEW: Gold fund
-    'صندوق کالایی': 'صندوق سرمایه گذاری', # NEW: Commodity fund
-    'صندوق جسورانه': 'صندوق سرمایه گذاری', # NEW: Venture fund
-    'صندوق زمین و ساختمان': 'صندوق سرمایه گذاری', # NEW: Real estate fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت': 'صندوق سرمایه گذاری', # NEW: Fixed income securities fund
-    'صندوق سرمایه گذاری در اوراق بهادار رهنی': 'صندوق سرمایه گذاری', # NEW: Mortgage-backed securities fund
-    'صندوق سرمایه گذاری در اوراق بهادار مبتنی بر کالا': 'صندوق سرمایه گذاری', # NEW: Commodity-backed securities fund
-    'صندوق سرمایه گذاری در صندوق‌های سرمایه گذاری': 'صندوق سرمایه گذاری', # NEW: Fund of funds
-    'صندوق سرمایه گذاری در صندوق‌های سرمایه گذاری قابل معامله': 'صندوق سرمایه گذاری', # NEW: Fund of ETFs
-    'صندوق سرمایه گذاری در سهام و حق تقدم سهام': 'صندوق سرمایه گذاری', # NEW: Stock and rights fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و سهام': 'صندوق سرمایه گذاری', # NEW: Fixed income and stock fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و مختلط': 'صندوق سرمایه گذاری', # NEW: Fixed income and mixed fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و طلا': 'صندوق سرمایه گذاری', # NEW: Fixed income and gold fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و کالا': 'صندوق سرمایه گذاری', # NEW: Fixed income and commodity fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و جسورانه': 'صندوق سرمایه گذاری', # NEW: Fixed income and venture fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و زمین و ساختمان': 'صندوق سرمایه گذاری', # NEW: Fixed income and real estate fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بازارگردانی': 'صندوق سرمایه گذاری', # NEW: Fixed income and market making fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و پروژه': 'صندوق سرمایه گذاری', # NEW: Fixed income and project fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بورس کالا': 'صندوق سرمایه گذاری', # NEW: Fixed income and commodity exchange fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و طلا': 'صندوق سرمایه گذاری', # NEW: Fixed income and gold fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و حق تقدم': 'صندوق سرمایه گذاری', # NEW: Fixed income and rights fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و اختیار معامله': 'صندوق سرمایه گذاری', # NEW: Fixed income and options fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و آتی': 'صندوق سرمایه گذاری', # NEW: Fixed income and futures fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صکوک': 'صندوق سرمایه گذاری', # NEW: Fixed income and sukuk fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و گواهی سپرده': 'صندوق سرمایه گذاری', # NEW: Fixed income and deposit certificate fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و اوراق مشارکت': 'صندوق سرمایه گذاری', # NEW: Fixed income and participation paper fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و اوراق اجاره': 'صندوق سرمایه گذاری', # NEW: Fixed income and lease paper fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و اوراق تامین مالی': 'صندوق سرمایه گذاری', # NEW: Fixed income and financing paper fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بازار ابزارهای نوین مالی': 'صندوق سرمایه گذاری', # NEW: Fixed income and new financial instruments market fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بازار ابزارهای مالی نوین': 'صندوق سرمایه گذاری', # NEW: Fixed income and new financial instruments market fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بورس کالا و انرژی': 'صندوق سرمایه گذاری', # NEW: Fixed income and commodity and energy exchange fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بورس اوراق بهادار تهران': 'صندوق سرمایه گذاری', # NEW: Fixed income and Tehran Stock Exchange fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و فرابورس ایران': 'صندوق سرمایه گذاری', # NEW: Fixed income and Iran Fara Bourse fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بازار پایه': 'صندوق سرمایه گذاری', # NEW: Fixed income and base market fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و عمومی': 'صندوق سرمایه گذاری', # NEW: Fixed income and general fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و نامشخص': 'صندوق سرمایه گذاری', # NEW: Fixed income and unknown fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و سهام اهرمي': 'صندوق سرمایه گذاری', # NEW: Fixed income and leveraged stock fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و نوع صندوق: سهامي': 'صندوق سرمایه گذاری', # NEW: Fixed income and stock fund type
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سهامي': 'صندوق سرمایه گذاری', # NEW: Fixed income and stock fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق اهرمي': 'صندوق سرمایه گذاری', # NEW: Fixed income and leveraged fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق با درآمد ثابت': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق مختلط': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and mixed fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق بازارگردانی': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and market making fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق پروژه': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and project fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق طلا': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and gold fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق کالایی': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and commodity fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق جسورانه': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and venture fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق زمین و ساختمان': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and real estate fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری در اوراق بهادار': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and securities fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری در صندوق': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and fund of funds
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری جسورانه': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and venture fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری زمین و ساختمان': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and real estate fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری اختصاصی بازارگردانی': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and market making fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری پروژه': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and project fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری در بورس کالا': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and commodity exchange fund
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و طلا': 'صندوق سرمایه گذاری', # NEW: Fixed income and fixed income and gold fund
+    'بورس کالای ایران': 'بورس کالا',
+    'بورس انرژی ایران': 'بورس انرژی',
+    'صندوق سرمایه‌گذاری': 'صندوق سرمایه گذاری',
+    'بازار پایه فرابورس': 'پایه فرابورس',
+    'اوراق با درآمد ثابت': 'اوراق با درآمد ثابت',
+    'اوراق تامین مالی': 'اوراق تامین مالی'
 }
 
+# ⚠️ اصلاح: الگوی فیلتر دقیق‌تر و تخصصی‌تر برای پسوندهای نامناسب
+# این الگو به جای بررسی کلمات در متن، به انتهای نام نماد نگاه می‌کند.
+BAD_SUFFIXES = ('ح', 'ض', 'ص', 'و')
 
-def _extract_market_type_from_loader_html(html_content):
+def filter_symbols(symbols: List[Dict], exclude_list: List[str] = None) -> List[Dict]:
     """
-    Extracts the market type string from the HTML content of a Loader.aspx page.
-    Prioritizes specific IDs/classes, then more generic text searches.
+    نمادها را بر اساس معیارهای حرفه‌ای فیلتر می‌کند.
+    این تابع دو روش اصلی را ترکیب می‌کند:
+    1. فیلتر کردن بر اساس نوع بازار (Market Type).
+    2. فیلتر کردن بر اساس پسوندهای رایج برای حق تقدم و ابزارهای مشابه.
     """
-    soup = BeautifulSoup(html_content, 'lxml')
     
-    # --- Priority 1: Specific IDs/Classes (most reliable if they exist) ---
-    market_span_id = soup.find('span', id='MainContent_lblMarketName')
-    if market_span_id and market_span_id.text.strip():
-        market_type_str = market_span_id.text.strip()
-        logger.debug(f"HTML Parser: Found market type from span ID 'MainContent_lblMarketName': '{market_type_str}'")
-        return HTML_MARKET_TYPE_MAP.get(market_type_str, market_type_str)
+    if not symbols:
+        return []
 
-    # Try to find a td with class 'lbl' and text 'بازار:' and then its sibling 'td' with class 'value'
-    market_label_td = soup.find('td', class_='lbl', string='بازار:')
-    if market_label_td:
-        market_value_td = market_label_td.find_next_sibling('td', class_='value')
-        if market_value_td and market_value_td.text.strip():
-            market_type_str = market_value_td.text.strip()
-            logger.debug(f"HTML Parser: Found market type from 'بازار:' label and sibling 'value' td: '{market_type_str}'")
-            return HTML_MARKET_TYPE_MAP.get(market_type_str, market_type_str)
-
-    # --- Priority 2: Search for common market type indicators within the entire page text ---
-    # This is a broader search, might catch text within various tags or even plain text.
-    # Order matters here: more specific terms first.
-    common_market_indicators_ordered = [
-    'صندوق سرمایه گذاری',
-    'صندوق قابل معامله',
-    'صندوق های قابل معامله',
-    'صندوقهای سرمایه گذاری',
+    filtered_symbols = []
+    
+    # تعریف انواع بازاری که می‌خواهید حفظ کنید
+    good_markets = [
+    'بورس',
+    'فرابورس',
     'بورس کالا',
     'بورس انرژی',
-    'فرابورس',
-    'بورس اوراق بهادار',
+    'صندوق سرمایه گذاری',
     'اوراق با درآمد ثابت',
-    'اختیار معامله',
-    'صکوک',
-    'گواهی سپرده',
-    'حق تقدم',
-    'بازار پایه',
-    'مشتقه',
-    'سهام',
-    'اوراق بهادار',
-    'اوراق تامین مالی',
-    'اوراق مشارکت',
-    'گواهی سپرده کالایی',
-    'صندوق سرمایه گذاری مشترک',
-    'صندوق سرمایه گذاری قابل معامله',
-    'صندوق سرمایه گذاری در سهام',
-    'صندوق سرمایه گذاری مختلط',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت',
-    'صندوق سرمایه گذاری طلا',
-    'اوراق اجاره',
-    'بورس کالا و انرژی',
-    'بورس اوراق بهادار تهران',
-    'فرابورس ایران',
-    'بازار ابزارهای نوین مالی',
-    'بازار ابزارهای مالی نوین',
-    'صندوق سرمایه گذاری در اوراق بهادار',
-    'صندوق سرمایه گذاری در صندوق',
-    'صندوق سرمایه گذاری جسورانه',
-    'صندوق سرمایه گذاری زمین و ساختمان',
-    'صندوق سرمایه گذاری اختصاصی بازارگردانی',
-    'صندوق سرمایه گذاری پروژه',
-    'صندوق سرمایه گذاری در بورس کالا',
-    'صندوق سرمایه گذاری در طلا',
-    'صندوق سهامي اهرمي',
-    'نوع صندوق: سهامي',
-    'صندوق سهامي',
-    'صندوق اهرمي',
-    'صندوق با درآمد ثابت',
-    'صندوق مختلط',
-    'صندوق بازارگردانی',
-    'صندوق پروژه',
-    'صندوق طلا',
-    'صندوق کالایی',
-    'صندوق جسورانه',
-    'صندوق زمین و ساختمان',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت',
-    'صندوق سرمایه گذاری در اوراق بهادار رهنی',
-    'صندوق سرمایه گذاری در اوراق بهادار مبتنی بر کالا',
-    'صندوق سرمایه گذاری در صندوق‌های سرمایه گذاری',
-    'صندوق سرمایه گذاری در صندوق‌های سرمایه گذاری قابل معامله',
-    'صندوق سرمایه گذاری در سهام و حق تقدم سهام',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و سهام',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و مختلط',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و طلا',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و کالا',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و جسورانه',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و زمین و ساختمان',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بازارگردانی',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و پروژه',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بورس کالا',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و طلا',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و حق تقدم',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و اختیار معامله',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و آتی',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صکوک',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و گواهی سپرده',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و اوراق مشارکت',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و اوراق اجاره',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و اوراق تامین مالی',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بازار ابزارهای نوین مالی',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بازار ابزارهای مالی نوین',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بورس کالا و انرژی',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بورس اوراق بهادار تهران',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و فرابورس ایران',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و بازار پایه',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و عمومی',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و نامشخص',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و سهام اهرمي',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و نوع صندوق: سهامي',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سهامي',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق اهرمي',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق با درآمد ثابت',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق مختلط',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق بازارگردانی',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق پروژه',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق طلا',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق کالایی',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق جسورانه',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق زمین و ساختمان',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری در اوراق بهادار',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری در صندوق',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری جسورانه',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری زمین و ساختمان',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری اختصاصی بازارگردانی',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری پروژه',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری در بورس کالا',
-    'صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و صندوق سرمایه گذاری در اوراق بهادار با درآمد ثابت و طلا',
-]
+    'پایه فرابورس',
+    'اوراق تامین مالی'
+    ]
     
-    # A simplified version of a broad search that looks for any of the common market type strings
-    # in the text content of the HTML body.
-    body_text = soup.get_text()
-    for indicator in common_market_indicators_ordered:
-        if indicator in body_text:
-            market_type_str = indicator.strip()
-            logger.debug(f"HTML Parser: Found market type from broad text search: '{market_type_str}'")
-            return HTML_MARKET_TYPE_MAP.get(market_type_str, market_type_str)
-
-    logger.warning("HTML Parser: Could not determine market type from HTML content.")
-    return 'نامشخص' # Return a default 'unspecified' market type if nothing is found
-
-
-def _fetch_page_content(symbol_id):
-    """
-    Fetches the HTML content for a given symbol_id from TSETMC.
-    Uses a standard user-agent to mimic a browser.
-    """
-    url = f'http://www.tsetmc.com/Loader.aspx?ParTree=111311&i={symbol_id}'
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    }
-    try:
-        response = http_get(url, headers=headers, timeout=10)
-        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
-        # TSETMC content is typically in utf-8, but we can verify
-        content = response.content.decode('utf-8')
-        return content
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching page for symbol ID {symbol_id}: {e}")
-        return None
-
-
-def get_market_type_for_symbol(symbol_id, symbol_name):
-    """
-    Determines the market type for a given symbol by first trying pytse_client,
-    then falling back to HTML scraping if pytse_client doesn't provide it.
-    """
-    try:
-        # Step 1: Try to get market type from pytse_client
-        ticker = Ticker(symbol_name)
-        if hasattr(ticker, 'flow') and isinstance(ticker.flow, int):
-            market_type = MARKET_TYPE_MAP.get(ticker.flow, 'نامشخص')
-            logger.debug(f"pytse_client: Determined market type for {symbol_name} (ID: {symbol_id}) as '{market_type}' from flow code {ticker.flow}.")
-            return market_type
+    for symbol in symbols:
+        symbol_name = symbol.get('symbol_name')
+        market_type_code = symbol.get('market_type_code')
+        market_type_name = MARKET_TYPE_MAP.get(market_type_code)
         
-        # Fallback to HTML scraping if pytse_client doesn't have the flow code or it's not useful
-        logger.info(f"pytse_client: No usable flow code for {symbol_name} (ID: {symbol_id}). Falling back to HTML scraping.")
-        html_content = _fetch_page_content(symbol_id)
-        if html_content:
-            return _extract_market_type_from_loader_html(html_content)
+        # گام ۱: بررسی بر اساس نوع بازار
+        is_good_market = market_type_name in good_markets
+        
+        # گام ۲: بررسی بر اساس پسوندهای نام
+        # از endswith() به جای regex استفاده می‌کنیم که دقیق‌تر و خواناتر است.
+        is_bad_suffix = symbol_name.endswith(BAD_SUFFIXES)
+
+        # بررسی نهایی: اگر در لیست بازارهای خوب است و پسوند نام بدی ندارد، آن را اضافه کن.
+        if is_good_market and not is_bad_suffix:
+            filtered_symbols.append(symbol)
+        
+        # می‌توانید برای اشکال‌زدایی، نمادهای فیلترشده را لاگ کنید
         else:
-            logger.warning(f"Could not fetch HTML content for {symbol_name} (ID: {symbol_id}). Market type cannot be determined.")
-            return 'نامشخص'
-    except Exception as e:
-        logger.error(f"Error in get_market_type_for_symbol for {symbol_name} (ID: {symbol_id}): {e}")
-        return 'نامشخص'
-
-
-def populate_all_symbols_initial():
-    """
-    Populates the ComprehensiveSymbolData table with all unique symbols from TSETMC.
-    This function should be run as a one-time initial population.
-    It fetches all tickers and then determines their market type.
-    It returns the number of symbols added and a message.
-    """
-    try:
-        current_app.logger.info("Starting initial population of all symbols.")
-        tickers = all_tickers()
-        if not tickers:
-            return 0, "No tickers found from pytse_client."
-
-        added_count = 0
-        total_symbols = len(tickers)
-        for i, (symbol_name, ticker_obj) in enumerate(tickers.items()):
-            symbol_id = ticker_obj.get_tse_id()
-            if not symbol_id:
-                current_app.logger.warning(f"Skipping symbol '{symbol_name}' as it has no TSE ID.")
-                continue
-
-            # Check if symbol already exists
-            existing_symbol = ComprehensiveSymbolData.query.filter_by(symbol_id=symbol_id).first()
-            if not existing_symbol:
-                # Determine market type for the new symbol
-                market_type = get_market_type_for_symbol(symbol_id, symbol_name)
-                
-                new_symbol = ComprehensiveSymbolData(
-                    symbol_id=symbol_id,
-                    symbol_name=symbol_name,
-                    market_type=market_type,
-                    is_active=True
-                )
-                db.session.add(new_symbol)
-                added_count += 1
-                if added_count % 100 == 0:
-                    current_app.logger.info(f"Processed {added_count}/{total_symbols} symbols. Committing so far...")
-                    db.session.commit()
+            if not is_good_market:
+                logger.debug(f"ℹ️ نماد {symbol_name} به دلیل نوع بازار ({market_type_name}) فیلتر شد.")
+            if is_bad_suffix:
+                logger.debug(f"ℹ️ نماد {symbol_name} به دلیل پسوند نام ({symbol_name[-1]}) فیلتر شد.")
             
-            # Log progress
-            if (i + 1) % 50 == 0:
-                current_app.logger.info(f"Progress: {i+1}/{total_symbols} symbols checked.")
+    return filtered_symbols
 
-        db.session.commit()
-        final_message = f"Initial symbol population finished. {added_count} new symbols added to the database."
-        current_app.logger.info(final_message)
-        return added_count, final_message
-    except Exception as e:
-        db.session.rollback()
-        error_message = f"An error occurred during initial symbol population: {e}"
-        current_app.logger.error(error_message)
-        return 0, error_message
+# ----------------------------
+# Global defaults and constants
+# ----------------------------
+# Network
+DEFAULT_REQUESTS_TIMEOUT = 8  # seconds
+DEFAULT_RETRY_TOTAL = 3
+DEFAULT_RETRY_BACKOFF_FACTOR = 0.5
+DEFAULT_RETRY_STATUS_FORCELIST = (429, 500, 502, 503, 504)
 
+# Batching / memory
+DEFAULT_BATCH_SIZE = 200  # for DB bulk ops & symbol processing
+DEFAULT_PER_SYMBOL_DELAY = 0.03  # polite delay between external website hits
+MEMORY_CHECK_INTERVAL = 10  # check memory every N symbols during full runs (configurable)
+MEMORY_LIMIT_MB = 1500  # warn threshold
 
-def _fetch_historical_data(symbol_name, days_limit=None):
-    """
-    Fetches historical data for a given symbol using pytse_client.
-    Returns a pandas DataFrame.
-    """
+# Misc
+ZERO_WIDTH_CHARS = ["\u200c", "\u200b", "\ufeff"]  # remove zero width and BOM
+HALF_SPACE = "\u200f"  # any specific characters you'd like to normalize
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def normalize_symbol_text(txt: Optional[str]) -> str:
+    """Normalize symbol / company names: strip, remove zero-width, collapse spaces."""
+    if not txt:
+        return ""
+    s = str(txt)
+    for ch in ZERO_WIDTH_CHARS:
+        s = s.replace(ch, "")
+    # replace multiple whitespace with single space and strip
+    s = " ".join(s.split())
+    return s.strip()
+
+def check_memory_usage_mb() -> float:
+    """Return current process memory usage in MB (if psutil available)."""
     try:
-        # Use a reasonable days_limit if not specified to prevent overly long requests
-        days = days_limit if days_limit is not None else 365
-        
-        # Get data with the specified number of days
-        df = download(symbols=[symbol_name], write_to_csv=False, adjust=True, days_limit=days)
-        
-        if df.empty or symbol_name not in df.columns.get_level_values(0):
-            logger.warning(f"No historical data found for {symbol_name} in the last {days} days.")
-            return pd.DataFrame()
-
-        # Clean up the DataFrame
-        df.columns = df.columns.get_level_values(1)
-        df = df.reset_index().rename(columns={'index': 'date'})
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # Calculate `close` price if `adj_close` is available.
-        # This is important as some indicators use `close` and some use `adj_close`.
-        # pytse_client's `close` is adjusted already, but we will add a raw `close` for clarity.
-        # However, the library behavior seems to provide an adjusted close, so we will use it as is.
-        # The column is named 'adj_close' by the library, which is what we need.
-        df.rename(columns={'adj_close': 'close'}, inplace=True)
-        
-        # Add a new column for `value` which is `close * volume` for later calculations
-        df['value'] = df['close'] * df['volume']
-
-        # Ensure all required columns are present. If not, fill with 0s or NaNs.
-        required_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'value']
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = np.nan
-        
-        df = df[required_cols]
-        logger.debug(f"Fetched historical data for {symbol_name}: {df.shape[0]} rows.")
-        return df
+        if psutil:
+            proc = psutil.Process()
+            mem = proc.memory_info().rss / (1024 * 1024)
+            return mem
+        else:
+            # fallback: attempt approximate using resource module (Unix only) or 0
+            return 0.0
     except Exception as e:
-        logger.error(f"Error fetching historical data for {symbol_name}: {e}")
-        return pd.DataFrame()
+        logger.debug("Memory check failed: %s", e)
+        return 0.0
 
-
-def _update_or_create_historical_data(symbol_id, symbol_name, df, session):
-    """
-    Updates or creates historical data records for a given symbol from a DataFrame.
-    """
-    if df.empty:
-        return 0, f"No data to update for {symbol_name}."
-
-    added_count = 0
-    updated_count = 0
-
+def safe_sleep(seconds: float):
+    """Sleep but allow KeyboardInterrupt to bubble up quickly."""
     try:
-        # Determine the last recorded date for the symbol
-        last_date = session.query(func.max(HistoricalData.date)).filter_by(symbol_id=symbol_id).scalar()
-        
-        # Filter the DataFrame to only include new data
-        if last_date:
-            df = df[df['date'] > last_date]
-        
-        if df.empty:
-            return 0, f"Historical data for {symbol_name} is already up to date."
+        time.sleep(seconds)
+    except KeyboardInterrupt:
+        raise
 
-        # Process and add new records
-        for index, row in df.iterrows():
-            gregorian_date = row['date'].date()
-            jalali_date = convert_gregorian_to_jalali(gregorian_date)
-            
-            new_record = HistoricalData(
-                symbol_id=symbol_id,
-                date=gregorian_date,
-                jalali_date=jalali_date,
-                open_price=normalize_value(row['open']),
-                high_price=normalize_value(row['high']),
-                low_price=normalize_value(row['low']),
-                close_price=normalize_value(row['close']),
-                volume=normalize_value(row['volume']),
-                value=normalize_value(row['value']),
-                count=normalize_value(row.get('count', 0)) # Assuming 'count' might not always be present
-            )
-            session.add(new_record)
-            added_count += 1
-        
-        session.commit()
-        
-        return added_count, f"Historical data for {symbol_name} updated successfully. {added_count} new records added, {updated_count} records updated."
-    
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Error updating historical data for {symbol_name}: {e}")
-        return 0, f"An error occurred while updating historical data for {symbol_name}."
-
-
-def update_historical_data_for_symbol(symbol_id, symbol_name, days_limit=365):
+# ----------------------------
+# Retry decorator (general)
+# ----------------------------
+def retry_on_exception(
+    exceptions: Tuple[type, ...] = (Exception,),
+    tries: int = 3,
+    delay: float = 0.5,
+    backoff: float = 2.0,
+    logger_obj: Optional[logging.Logger] = None,
+):
     """
-    Fetches and updates historical data for a single symbol.
+    Generic retry decorator with exponential backoff.
+    Usage:
+        @retry_on_exception((requests.RequestException,), tries=3)
+        def fn(...): ...
     """
-    try:
-        logger.info(f"Updating historical data for {symbol_name}...")
-        df = _fetch_historical_data(symbol_name, days_limit)
-        added_count, msg = _update_or_create_historical_data(symbol_id, symbol_name, df, db.session)
-        logger.info(f"Historical data update for {symbol_name}: {msg}")
-        return True, msg
-    except Exception as e:
-        logger.error(f"Full historical update failed for {symbol_name}: {e}")
-        return False, f"Full historical update failed due to an internal error."
-
-
-def _update_technical_indicators(symbol_id, symbol_name, days_limit=365, session=db.session):
-    """
-    Calculates and updates technical indicators for a given symbol.
-    """
-    try:
-        logger.info(f"Calculating and updating technical indicators for {symbol_name}...")
-        
-        # Fetch existing historical data from the database
-        query = session.query(HistoricalData).filter_by(symbol_id=symbol_id).order_by(HistoricalData.date)
-        
-        # Apply a days_limit to the query if it's specified, to prevent fetching too much data
-        if days_limit is not None:
-            # We need enough data to calculate indicators (e.g., 200 days for long-term SMA)
-            # Fetch a bit more than the days_limit to ensure calculations are correct
-            start_date = date.today() - timedelta(days=days_limit + 100) # Buffer of 100 days
-            query = query.filter(HistoricalData.date >= start_date)
-            
-        historical_records = query.all()
-        
-        if not historical_records:
-            logger.warning(f"No historical data found for {symbol_name} to calculate indicators.")
-            return 0, f"No historical data to calculate technical indicators for {symbol_name}."
-
-        # Convert records to a DataFrame for easier calculation
-        df = pd.DataFrame([rec.__dict__ for rec in historical_records])
-        df = df.sort_values('date')
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # Calculate indicators
-        df['rsi'] = calculate_rsi(df['close_price'])
-        df['macd'], df['macd_signal'] = calculate_macd(df['close_price'])
-        df['sma_20'] = calculate_sma(df['close_price'], window=20)
-        df['sma_50'] = calculate_sma(df['close_price'], window=50)
-        df['sma_200'] = calculate_sma(df['close_price'], window=200)
-        df['bollinger_upper'], df['bollinger_middle'], df['bollinger_lower'] = calculate_bollinger_bands(df['close_price'])
-        df['volume_ma'] = calculate_volume_ma(df['volume'])
-        df['atr'] = calculate_atr(df['high_price'], df['low_price'], df['close_price'])
-        df['smf'] = calculate_smart_money_flow(df['close_price'], df['volume'])
-
-        # Now, update the database with the calculated indicators
-        added_count = 0
-        
-        # Get the last date for technical indicators to update only new ones
-        last_indicator_date = session.query(func.max(TechnicalIndicatorData.date)).filter_by(symbol_id=symbol_id).scalar()
-        
-        # Filter the DataFrame to only include new data points for indicators
-        if last_indicator_date:
-            df = df[df['date'].dt.date > last_indicator_date]
-        
-        if df.empty:
-            return 0, f"Technical indicators for {symbol_name} are already up to date."
-
-        for index, row in df.iterrows():
-            gregorian_date = row['date'].date()
-            jalali_date = convert_gregorian_to_jalali(gregorian_date)
-            
-            # Use `merge` to check for existing record and update, otherwise add new one
-            existing_indicator = session.query(TechnicalIndicatorData).filter_by(symbol_id=symbol_id, date=gregorian_date).first()
-            
-            if existing_indicator:
-                # Update existing record
-                existing_indicator.rsi = row['rsi']
-                existing_indicator.macd = row['macd']
-                existing_indicator.macd_signal = row['macd_signal']
-                existing_indicator.sma_20 = row['sma_20']
-                existing_indicator.sma_50 = row['sma_50']
-                existing_indicator.sma_200 = row['sma_200']
-                existing_indicator.bollinger_upper = row['bollinger_upper']
-                existing_indicator.bollinger_middle = row['bollinger_middle']
-                existing_indicator.bollinger_lower = row['bollinger_lower']
-                existing_indicator.volume_ma = row['volume_ma']
-                existing_indicator.atr = row['atr']
-                existing_indicator.smf = row['smf']
-                # added_count += 1 # We're only adding, not updating for now.
-            else:
-                # Add new record
-                new_indicator = TechnicalIndicatorData(
-                    symbol_id=symbol_id,
-                    date=gregorian_date,
-                    jalali_date=jalali_date,
-                    rsi=row['rsi'],
-                    macd=row['macd'],
-                    macd_signal=row['macd_signal'],
-                    sma_20=row['sma_20'],
-                    sma_50=row['sma_50'],
-                    sma_200=row['sma_200'],
-                    bollinger_upper=row['bollinger_upper'],
-                    bollinger_middle=row['bollinger_middle'],
-                    bollinger_lower=row['bollinger_lower'],
-                    volume_ma=row['volume_ma'],
-                    atr=row['atr'],
-                    smf=row['smf']
-                )
-                session.add(new_indicator)
-                added_count += 1
-        
-        session.commit()
-        return added_count, f"Technical indicators for {symbol_name} updated successfully. {added_count} new records added."
-    
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Error updating technical indicators for {symbol_name}: {e}")
-        return 0, f"An error occurred while updating technical indicators for {symbol_name}."
-
-
-def update_technical_data_for_symbol(symbol_id, symbol_name, days_limit=365):
-    """
-    Wrapper to calculate and update technical data for a single symbol.
-    """
-    try:
-        added_count, msg = _update_technical_indicators(symbol_id, symbol_name, days_limit, db.session)
-        return True, msg
-    except Exception as e:
-        logger.error(f"Full technical data update failed for {symbol_name}: {e}")
-        return False, f"Full technical data update failed due to an internal error."
-
-
-def _get_fundamental_data_from_tsetmc(symbol_id, session):
-    """
-    Fetches fundamental data from TSETMC's html page for a specific symbol.
-    Parses key financial metrics.
-    Returns a dict of parsed data or None on failure.
-    """
-    url = f'http://www.tsetmc.com/Loader.aspx?ParTree=111C1411&i={symbol_id}'
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'lxml')
-        
-        data = {}
-        
-        # --- Parsing the "اثرات مالی" (Financial effects) table ---
-        financial_table_div = soup.find('div', id='MainContent_C2P')
-        if financial_table_div:
-            table = financial_table_div.find('table')
-            if table:
-                rows = table.find_all('tr')
-                for row in rows:
-                    cols = row.find_all(['td', 'th'])
-                    cols = [ele.text.strip() for ele in cols]
-                    
-                    # The table has multiple rows with different data
-                    # Let's map based on the label in the first column
-                    if 'سود هر سهم' in cols[0]:
-                        try:
-                            # EPS is in the 2nd column
-                            data['eps'] = float(cols[1].replace(',', ''))
-                        except (ValueError, IndexError):
-                            data['eps'] = None
-                    elif 'P/E گروه' in cols[0]:
-                        try:
-                            data['pe_group'] = float(cols[1].replace(',', ''))
-                        except (ValueError, IndexError):
-                            data['pe_group'] = None
-                    elif 'P/E' in cols[0]:
-                        try:
-                            data['pe_ratio'] = float(cols[1].replace(',', ''))
-                        except (ValueError, IndexError):
-                            data['pe_ratio'] = None
-                    elif 'نسبت P/B' in cols[0]:
-                        try:
-                            data['pb_ratio'] = float(cols[1].replace(',', ''))
-                        except (ValueError, IndexError):
-                            data['pb_ratio'] = None
-                    elif 'نسبت P/S' in cols[0]:
-                        try:
-                            data['ps_ratio'] = float(cols[1].replace(',', ''))
-                        except (ValueError, IndexError):
-                            data['ps_ratio'] = None
-                    elif 'حجم مبنا' in cols[0]:
-                        try:
-                            # حجم مبنا is an integer, but sometimes has commas
-                            data['base_volume'] = int(cols[1].replace(',', ''))
-                        except (ValueError, IndexError):
-                            data['base_volume'] = None
-
-        # --- Parsing the "مشخصات" (Specifications) and other divs ---
-        # These are usually in `div`s with specific `id`s. We can iterate and find them.
-        specs_div = soup.find('div', id='MainContent_C1P')
-        if specs_div:
-            table = specs_div.find('table')
-            if table:
-                rows = table.find_all('tr')
-                for row in rows:
-                    cols = row.find_all(['td', 'th'])
-                    cols = [ele.text.strip() for ele in cols]
-
-                    if 'قیمت پایانی' in cols[0]:
-                        try:
-                            data['closing_price'] = float(cols[1].replace(',', ''))
-                        except (ValueError, IndexError):
-                            data['closing_price'] = None
-                    elif 'تعداد سهام' in cols[0]:
-                        try:
-                            data['total_shares'] = int(cols[1].replace(',', ''))
-                        except (ValueError, IndexError):
-                            data['total_shares'] = None
-
-        # --- Parsing data from the main header area (usually has a table or spans) ---
-        main_header_table = soup.find('table', class_='InfoTbl')
-        if main_header_table:
-            # Finding the market value (ارزش بازار)
-            market_value_row = main_header_table.find('tr', string=lambda text: 'ارزش بازار' in text)
-            if market_value_row:
+    def deco_retry(func):
+        def wrapper(*args, **kwargs):
+            _tries, _delay = tries, delay
+            while _tries > 1:
                 try:
-                    market_value_td = market_value_row.find_next_sibling('td')
-                    if market_value_td:
-                        data['market_value'] = int(market_value_td.text.strip().replace(',', ''))
-                except (ValueError, IndexError, AttributeError):
-                    data['market_value'] = None
-        
-        # We can also parse from the JavaScript data at the top of the page.
-        # This is a more robust approach for real-time data.
-        # Let's find the `t111C1411_t1` object from script tags.
-        script_tag = soup.find('script', text=lambda text: 't111C1411_t1=' in text)
-        if script_tag:
-            js_code = script_tag.string
-            # A simple regex to extract JSON-like data. Not perfect, but can work.
-            import re
-            match = re.search(r'var t111C1411_t1=(.+?);', js_code)
-            if match:
-                js_data = match.group(1)
-                # This is a raw JavaScript object. It needs careful parsing.
-                # A simple and fragile way is to use eval, but that's a security risk.
-                # A safer way is to replace single quotes with double quotes and parse it.
-                # We'll skip this for now as it's complex and the HTML parsing is sufficient.
-        
-        # Check if we have enough data
-        if not data:
-            logger.warning(f"Fundamental data extraction failed for symbol ID {symbol_id}. No data found.")
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    msg = f"Retryable error in {func.__name__}: {e}. Retrying in {_delay}s..."
+                    if logger_obj:
+                        logger_obj.warning(msg)
+                    else:
+                        logger.warning(msg)
+                    time.sleep(_delay)
+                    _tries -= 1
+                    _delay *= backoff
+            # final attempt
+            return func(*args, **kwargs)
+        wrapper.__name__ = func.__name__
+        return wrapper
+    return deco_retry
+
+# ----------------------------
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ایجاد session برای requests
+def create_requests_session():
+    """Create a requests session with retry logic"""
+    session = requests.Session()
+    
+    # Retry configuration
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Set default headers
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+    })
+    
+    return session
+
+_requests_session = create_requests_session()
+
+# ----------------------------
+# Wrapper: pytse-client safe adapter (primary)
+# ----------------------------
+
+try:
+    import pytse_client as tse
+    from pytse_client import Ticker, download, config
+except ImportError:
+    tse = None
+    Ticker = None
+    download = None
+    config = None
+    logger.warning("pytse_client not available")
+
+class PytseClientWrapper:
+    """
+    Safe wrapper around pytse_client (primary source).
+    Provides:
+      - all_symbols()
+      - ticker(symbol)
+      - fetch_historical(symbol_id, start_date, end_date)
+    Behavior:
+      - If pytse-client is not importable or throws errors, this wrapper raises its own exceptions
+        so caller can fallback to InternalTseWrapper.
+    """
+    def __init__(self, per_symbol_delay: float = DEFAULT_PER_SYMBOL_DELAY):
+        self.per_symbol_delay = per_symbol_delay
+        self.tse = tse  # may be None
+        if self.tse is None:
+            logger.info("pytse_client not available at import time.")
+        # local small cache to reduce repeated ticker creations in same run
+        self._ticker_cache: Dict[str, Any] = {}
+        # requests session reuse for any direct HTTP calls if needed
+        self.session = _requests_session
+
+    def is_available(self):
+        """بررسی آیا pytse_client در دسترس است"""
+        return self.tse is not None
+
+    def available(self) -> bool:
+        """متد جایگزین برای سازگاری"""
+        return self.is_available()
+
+    @retry_on_exception((Exception,), tries=2, delay=0.5, backoff=2.0, logger_obj=logger)
+    def all_symbols(self) -> List[str]:
+        """Return list of symbol ids (or keys) from pytse-client"""
+        if not self.is_available():
+            raise RuntimeError("pytse_client not available")
+        try:
+            result = self.tse.all_symbols()
+            # some versions return dict of id->meta
+            if isinstance(result, dict):
+                return list(result.keys())
+            if isinstance(result, (list, tuple, set)):
+                return list(result)
+            # fallback: try to coerce
+            return [str(x) for x in result]
+        except Exception as e:
+            logger.exception("pytse_client.all_symbols() failed: %s", e)
+            raise
+
+    def get_all_symbols(self):
+        """دریافت تمامی نمادها - متد سازگار با کد موجود"""
+        if not self.is_available():
+            return {}
+        try:
+            tickers = download(symbols="all", write_to_csv=False)
+            return tickers
+        except Exception as e:
+            logger.error(f"Error getting all symbols: {e}")
+            return {}
+
+    def ticker(self, symbol_id: str):
+        """Return Ticker object from pytse_client, cached"""
+        if not self.is_available():
+            raise RuntimeError("pytse_client not available")
+        key = str(symbol_id)
+        if key in self._ticker_cache:
+            return self._ticker_cache[key]
+        try:
+            ticker = Ticker(symbol=key)
+            self._ticker_cache[key] = ticker
+            # polite delay
+            if self.per_symbol_delay:
+                safe_sleep(self.per_symbol_delay)
+            return ticker
+        except Exception:
+            logger.exception("Failed to get Ticker for %s", symbol_id)
+            raise
+
+    def get_ticker(self, symbol_name):
+        """ایجاد Ticker object با مدیریت خطا - نسخه سازگار با کد موجود"""
+        if not self.is_available():
             return None
-            
-        logger.debug(f"Successfully fetched fundamental data for {symbol_id}: {data}")
-        return data
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching fundamental data for symbol ID {symbol_id}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Error parsing fundamental data for symbol ID {symbol_id}: {e}")
-        return None
+        try:
+            ticker = Ticker(symbol_name)
+            return ticker
+        except Exception as e:
+            logger.error(f"Error creating Ticker for {symbol_name}: {e}")
+            return None
 
+    @retry_on_exception((Exception,), tries=2, delay=1.0, backoff=2.0, logger_obj=logger)
+    def fetch_historical(self, symbol_id: str, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None) -> Any:
+        """
+        Fetch historical data for symbol using pytse-client high-level APIs if available.
+        Return types may vary by pytse-client version: pandas.DataFrame OR dict OR text.
+        Caller should handle/normalize.
+        """
+        if not self.is_available():
+            raise RuntimeError("pytse_client not available")
 
-def _update_or_create_fundamental_data(symbol_id, data, session):
+        try:
+            # many pytse-client versions expose a function to download history. We try common patterns.
+            # 1) tse.download... or tse.get_historical or Ticker().history
+            if hasattr(self.tse, "download") or hasattr(self.tse, "history"):
+                # attempt Ticker.history first if available
+                try:
+                    t = self.ticker(symbol_id)
+                    if hasattr(t, "history"):
+                        hist = getattr(t, "history")()
+                        return hist
+                except Exception:
+                    pass
+
+            # Fallback generic APIs (some versions implement get_history or download_from)
+            if hasattr(self.tse, "get_history"):
+                return self.tse.get_history(symbol_id, start_date=start_date, end_date=end_date)
+            if hasattr(self.tse, "download"):
+                # typical signature: tse.download(symbol_id, start, end)
+                try:
+                    return self.tse.download(symbol_id, start=start_date, end=end_date)
+                except TypeError:
+                    # try alternative signature
+                    return self.tse.download(symbol_id)
+            # Last resort: try calling tse.Ticker and reading attributes or methods
+            t = self.ticker(symbol_id)
+            if hasattr(t, "history"):
+                return t.history()
+            # If nothing works, raise
+            raise RuntimeError("No supported historical API in installed pytse_client")
+        except Exception as e:
+            logger.exception("pytse-client historical fetch failed for %s: %s", symbol_id, e)
+            raise
+
+# ----------------------------
+# Internal fallback wrapper (if pytse-client fails)
+# ----------------------------
+
+class InternalTseWrapper:
     """
-    Updates or creates a fundamental data record for a given symbol.
+    Fallback methods that use TSETMC endpoints directly (HTTP scraping/JSON endpoints).
+    This is slower and more brittle, but necessary as a fallback.
+    Key functions:
+      - search_symbol_by_name(name)
+      - fetch_instrument_info_by_id(instrument_id)
+      - fetch_export_txt(...)
+      - parse loader page to infer market/group etc.
+    NOTE: Keep polite delays and caching here to avoid hammering TSETMC.
     """
-    if not data:
-        return False, "No data to update."
+    def __init__(self, per_call_delay: float = DEFAULT_PER_SYMBOL_DELAY):
+        self.session = _requests_session
+        self.per_call_delay = per_call_delay
+        self._simple_cache: Dict[str, Any] = {}
+
+    def _get(self, url: str, params: Optional[Dict[str, Any]] = None, timeout: Optional[int] = None) -> requests.Response:
+        try:
+            resp = self.session.get(url, params=params, timeout=timeout or DEFAULT_REQUESTS_TIMEOUT)
+            return resp
+        except Exception:
+            logger.exception("HTTP GET failed for %s", url)
+            raise
+
+    def search_symbol_by_name(self, query: str) -> List[Dict[str, Any]]:
+        """
+        Use old.tsetmc.com search endpoint to find instrument IDs by textual name.
+        Returns a list of dicts (best-effort) with keys like 'id', 'symbol', 'title'
+        """
+        q = normalize_symbol_text(query)
+        cache_key = f"search:{q}"
+        if cache_key in self._simple_cache:
+            return self._simple_cache[cache_key]
+
+        try:
+            url = "https://old.tsetmc.com/tsev2/data/search.aspx"
+            params = {"skey": q}
+            resp = self._get(url, params=params)
+            if resp.status_code != 200:
+                logger.debug("search endpoint returned status %s for %s", resp.status_code, q)
+                return []
+            text = resp.text or ""
+            # The search endpoint often returns a small text: small html or some csv-like
+            # try to parse ids from text heuristically
+            results = []
+            # simple heuristics: split lines and find parenthesis with id or pattern 'i=...'
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # example pattern: "some name (symbol) - <a href='...i=1234567'>"
+                # fallback: look for sequences of digits length>6
+                import re
+                m = re.search(r"i=(\d{6,})", line)
+                if m:
+                    iid = m.group(1)
+                    results.append({"id": iid, "raw": line})
+            # fallback more: if we didn't parse anything, try to extract trailing tokens
+            if not results:
+                # try whitespace tokenization for any long numeric tokens
+                import re
+                for token in re.findall(r"\d{6,}", text):
+                    results.append({"id": token, "raw": token})
+            self._simple_cache[cache_key] = results
+            safe_sleep(self.per_call_delay)
+            return results
+        except Exception:
+            logger.exception("search_symbol_by_name failed for query: %s", query)
+            return []
+
+    def fetch_export_txt(self, instrument_id: str) -> Optional[str]:
+        """
+        Call Export-txt.aspx to get instrument details text
+        """
+        try:
+            url = f"https://old.tsetmc.com/tsev2/data/Export-txt.aspx"
+            params = {"t": "i", "a": 1, "b": 0, "i": instrument_id}
+            resp = self._get(url, params=params)
+            if resp.status_code != 200:
+                logger.debug("export-txt returned %s for %s", resp.status_code, instrument_id)
+                return None
+            safe_sleep(self.per_call_delay)
+            return resp.text
+        except Exception:
+            logger.exception("fetch_export_txt failed for %s", instrument_id)
+            return None
+
+    def fetch_instrument_info_api(self, instrument_id: str) -> Optional[Dict[str, Any]]:
+        """Call cdn.tsetmc.com/api/Instrument/GetInstrumentInfo/{id}"""
+        try:
+            url = f"https://cdn.tsetmc.com/api/Instrument/GetInstrumentInfo/{instrument_id}"
+            resp = self._get(url)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if not data or not isinstance(data, dict):
+                return None
+            # extract useful fields
+            result = {}
+            # example structure: {"instrumentInfo": { ... }, ... }
+            # we try to extract common fields
+            if "instrumentInfo" in data:
+                info = data["instrumentInfo"]
+                if isinstance(info, dict):
+                    result["name"] = info.get("lVal18AFC")
+                    result["symbol"] = info.get("lVal18")
+                    result["company_name"] = info.get("lVal30")
+                    result["market"] = info.get("market")
+                    result["industry"] = info.get("sector")
+            safe_sleep(self.per_call_delay)
+            return result
+        except Exception:
+            logger.exception("instrument info API failed for %s", instrument_id)
+            return None
+
+    def fetch_loader_page(self, instrument_id: str) -> Optional[str]:
+        """Fetch loader.aspx page to parse market/group info from HTML"""
+        try:
+            url = f"https://old.tsetmc.com/Loader.aspx"
+            params = {"i": instrument_id, "Partree": "15131M"}
+            resp = self._get(url, params=params)
+            if resp.status_code != 200:
+                return None
+            safe_sleep(self.per_call_delay)
+            return resp.text
+        except Exception:
+            logger.exception("loader page fetch failed for %s", instrument_id)
+            return None
+
+    def parse_loader_page(self, html: str) -> Dict[str, Any]:
+        """Parse loader.aspx HTML to extract market/group info"""
+        result = {}
+        if not html:
+            return result
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            # look for breadcrumbs or specific table rows
+            # example: <a href="...">بازار اول</a> or <td>بازار</td><td>بازار اول</td>
+            # try to find common patterns
+            # pattern 1: breadcrumb links
+            links = soup.find_all("a")
+            for link in links:
+                href = link.get("href", "")
+                text = normalize_symbol_text(link.get_text())
+                if "Partree" in href and text:
+                    # example href: "?Partree=15131P&i=1234567"
+                    # text might be like "بازار اول", "بازار دوم", etc.
+                    result["market"] = text
+            # pattern 2: table rows with key-value
+            rows = soup.find_all("tr")
+            for row in rows:
+                tds = row.find_all("td")
+                if len(tds) >= 2:
+                    key = normalize_symbol_text(tds[0].get_text())
+                    value = normalize_symbol_text(tds[1].get_text())
+                    if key and value:
+                        # common keys: "بازار", "گروه صنعت", "نماد", "نام شرکت"
+                        if "بازار" in key:
+                            result["market"] = value
+                        elif "گروه" in key:
+                            result["industry"] = value
+                        elif "نام شرکت" in key:
+                            result["company_name"] = value
+                        elif "نماد" in key:
+                            result["symbol"] = value
+            return result
+        except Exception:
+            logger.exception("parse_loader_page failed")
+            return result
+
+    def get_instrument_details(self, instrument_id: str) -> Dict[str, Any]:
+        """Combined method to get details for an instrument ID using multiple fallbacks"""
+        result = {}
+        # try API first
+        api_info = self.fetch_instrument_info_api(instrument_id)
+        if api_info:
+            result.update(api_info)
+        # then try loader page
+        html = self.fetch_loader_page(instrument_id)
+        if html:
+            parsed = self.parse_loader_page(html)
+            result.update(parsed)
+        # then try export-txt
+        txt = self.fetch_export_txt(instrument_id)
+        if txt:
+            # simple parsing: split lines and look for patterns
+            lines = txt.splitlines()
+            for line in lines:
+                line = line.strip()
+                if ":" in line:
+                    parts = line.split(":", 1)
+                    key = parts[0].strip()
+                    value = parts[1].strip() if len(parts) > 1 else ""
+                    # map known keys
+                    if key == "نماد":
+                        result["symbol"] = value
+                    elif key == "نام شرکت":
+                        result["company_name"] = value
+                    elif key == "بازار":
+                        result["market"] = value
+                    elif key == "گروه صنعت":
+                        result["industry"] = value
+        return result
+
+# ----------------------------
+# Global instances
+# ----------------------------
+pytse_wrapper = PytseClientWrapper()
+internal_wrapper = InternalTseWrapper()
+
+# ----------------------------
+# تابع fetch_symbols_from_pytse_client (نسخه اصلاح‌شده)
+# ----------------------------
+
+def fetch_symbols_from_pytse_client(db_session: Session, limit: int = None):
+    """
+    گرفتن لیست نمادها از pytse-client و درج در ComprehensiveSymbolData.
+    """
+    logger.info("📥 شروع دریافت نمادها از pytse_client برای درج در comprehensive_symbol_data...")
 
     try:
-        # Check if a record for today already exists
-        today = date.today()
-        existing_record = session.query(FundamentalData).filter_by(symbol_id=symbol_id, date=today).first()
-
-        if existing_record:
-            # Update existing record
-            existing_record.eps = data.get('eps')
-            existing_record.pe_ratio = data.get('pe_ratio')
-            existing_record.pe_group = data.get('pe_group')
-            existing_record.pb_ratio = data.get('pb_ratio')
-            existing_record.ps_ratio = data.get('ps_ratio')
-            existing_record.base_volume = data.get('base_volume')
-            existing_record.closing_price = data.get('closing_price')
-            existing_record.total_shares = data.get('total_shares')
-            existing_record.market_value = data.get('market_value')
-            logger.debug(f"Updated fundamental data for {symbol_id} for today.")
-        else:
-            # Create a new record
-            jalali_date = convert_gregorian_to_jalali(today)
-            new_record = FundamentalData(
-                symbol_id=symbol_id,
-                date=today,
-                jalali_date=jalali_date,
-                eps=data.get('eps'),
-                pe_ratio=data.get('pe_ratio'),
-                pe_group=data.get('pe_group'),
-                pb_ratio=data.get('pb_ratio'),
-                ps_ratio=data.get('ps_ratio'),
-                base_volume=data.get('base_volume'),
-                closing_price=data.get('closing_price'),
-                total_shares=data.get('total_shares'),
-                market_value=data.get('market_value')
-            )
-            session.add(new_record)
-            logger.debug(f"Added new fundamental data record for {symbol_id} for today.")
+        import pytse_client as tse
+        all_tickers = tse.download(symbols="all", write_to_csv=False)
         
-        session.commit()
-        return True, "Fundamental data updated successfully."
-    
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Error updating fundamental data for {symbol_id}: {e}")
-        return False, "An error occurred while updating fundamental data."
+        added_count = 0
+        updated_count = 0
+        now = datetime.now()
 
+        for idx, (symbol_name, ticker_data) in enumerate(all_tickers.items()):
+            if limit and idx >= limit:
+                break
 
+            try:
+                # ایجاد شی Ticker برای دسترسی به اطلاعات کامل
+                ticker = tse.Ticker(symbol_name)
+                
+                # ⚠️ اضافه کردن منطق فیلترینگ در ابتدای حلقه
+                market_type_name = getattr(ticker, 'flow', '')
 
-def analyze_technical_data_for_symbol(symbol_id, symbol_name, limit_days=120):
-    """
-    Analyzes technical indicators for a given symbol based on historical data
-    and updates the TechnicalIndicatorData table.
-    
-    Args:
-        symbol_id (str): The ID of the symbol.
-        symbol_name (str): The name of the symbol.
-        limit_days (int): Number of days to fetch historical data for technical analysis.
-        
-    Returns:
-        Tuple[bool, str]: True and a success message, or False and an error message.
-    """
-    logger.info(f"Analyzing technical data for {symbol_name} ({symbol_id}).")
-    try:
-        # Fetch historical data for technical analysis
-        # Ensure we fetch enough data for indicators (e.g., SMA_50 needs 50 days lookback)
-        historical_records = HistoricalData.query.filter_by(symbol_id=symbol_id)\
-                                                .order_by(HistoricalData.jdate.asc())\
-                                                .limit(limit_days).all()
+                good_markets = [
+                    'بورس', 'فرابورس', 'بورس کالا', 'بورس انرژی',
+                    'صندوق سرمایه گذاری', 'اوراق با درآمد ثابت',
+                    'پایه فرابورس', 'اوراق تامین مالی'
+                ]
+                
+                is_good_market = market_type_name in good_markets
+                is_bad_suffix = symbol_name.endswith(BAD_SUFFIXES)
 
-        if not historical_records:
-            logger.warning(f"No historical data found for technical analysis for {symbol_name} ({symbol_id}).")
-            return False, f"No historical data for {symbol_name}."
-
-        hist_df = pd.DataFrame([rec.__dict__ for rec in historical_records]).drop(columns=['_sa_instance_state'], errors='ignore')
-        
-        # Ensure 'jdate' is properly converted for sorting and calculations
-        hist_df['gregorian_date'] = hist_df['jdate'].apply(
-            lambda x: jdatetime.date(*map(int, x.split('-'))).togregorian() if pd.notna(x) and isinstance(x, str) else pd.NaT
-        )
-        hist_df = hist_df.sort_values(by='gregorian_date', ascending=True).reset_index(drop=True)
-        hist_df = hist_df.dropna(subset=['gregorian_date']) # Drop rows with invalid dates
-
-        # Ensure numeric columns are indeed numeric and fill NaNs
-        numeric_cols = ['close', 'open', 'high', 'low', 'volume', 'final']
-        for col in numeric_cols:
-            if col in hist_df.columns:
-                hist_df[col] = pd.to_numeric(hist_df[col], errors='coerce')
-                # Replace NaN with 0 after conversion
-                hist_df[col] = hist_df[col].replace([np.inf, -np.inf], np.nan).fillna(0)
-            else:
-                logger.warning(f"Column '{col}' not found in historical data for {symbol_name}. This may affect indicator calculations.")
-                hist_df[col] = 0 # Add column with zeros if missing
-
-        # Calculate indicators
-        hist_df['RSI'] = calculate_rsi(hist_df['close'])
-        macd, macd_signal, macd_hist = calculate_macd(hist_df['close'])
-        hist_df['MACD'] = macd
-        hist_df['MACD_Signal'] = macd_signal
-        hist_df['MACD_Hist'] = macd_hist
-        hist_df['SMA_20'] = calculate_sma(hist_df['close'], window=20)
-        hist_df['SMA_50'] = calculate_sma(hist_df['close'], window=50)
-        hist_df['Volume_MA_20'] = calculate_volume_ma(hist_df['volume'], window=20)
-        
-        # Bollinger Bands need enough data (typically 20 periods)
-        if len(hist_df) >= 20:
-            hist_df['Bollinger_MA'], hist_df['Bollinger_High'], hist_df['Bollinger_Low'] = calculate_bollinger_bands(hist_df['close'], window=20)
-        else:
-            hist_df['Bollinger_MA'] = np.nan
-            hist_df['Bollinger_High'] = np.nan
-            hist_df['Bollinger_Low'] = np.nan
-            logger.warning(f"Not enough data for Bollinger Bands for {symbol_name}. Setting to NaN.")
-        
-        # ATR (Average True Range) - Ensure 'high', 'low', 'close' are available and numeric
-        if len(hist_df) > 1: # ATR needs at least previous close
-            hist_df['ATR'] = calculate_atr(hist_df['high'], hist_df['low'], hist_df['close'])
-        else:
-            hist_df['ATR'] = np.nan
-            logger.warning(f"Not enough data for ATR for {symbol_name}. Setting to NaN.")
-
-        # --- MODIFIED: Iterate and save all calculated technical indicator rows ---
-        processed_tech_rows = 0
-        for index, row in hist_df.iterrows():
-            current_jdate_str = row['jdate']
-            
-            # Ensure symbol_id is consistent
-            db_symbol_id = get_symbol_id(symbol_id)
-            if not db_symbol_id:
-                logger.warning(f"Resolved symbol_id not found for {symbol_id}. Skipping technical data update for this row.")
+                if not is_good_market or is_bad_suffix:
+                    logger.debug(f"ℹ️ نماد {symbol_name} به دلیل نوع بازار یا پسوند نامناسب فیلتر شد.")
+                    continue  # پرش به نماد بعدی در حلقه
+                
+                # دریافت شناسه منحصر به فرد (index) از Tsetmc
+                tse_index = getattr(ticker, 'index', None)
+                if not tse_index:
+                    logger.warning(f"⚠️ نماد {symbol_name} شناسه بورس ندارد و نادیده گرفته شد.")
+                    continue
+                
+                # بررسی وجود نماد در دیتابیس با tse_index
+                existing_symbol = db_session.query(ComprehensiveSymbolData).filter_by(
+                    tse_index=tse_index
+                ).first()
+                
+                # دریافت اطلاعات پایه
+                base_volume = getattr(ticker, 'base_volume', None)
+                eps = getattr(ticker, 'eps', None)
+                p_e_ratio = getattr(ticker, 'p_e_ratio', None)
+                market_cap = getattr(ticker, 'market_cap', None)
+                float_shares = getattr(ticker, 'float_shares', None)
+                fiscal_year = getattr(ticker, 'fiscal_year', None)
+                state = getattr(ticker, 'state', None)
+                
+                # دریافت فیلدهای اختیاری - فقط اگر وجود دارند
+                p_s_ratio = getattr(ticker, 'p_s_ratio', None)
+                nav = getattr(ticker, 'nav', None)
+                
+                # تبدیل NAV به عدد اگر به صورت رشته است
+                if nav and isinstance(nav, str):
+                    try:
+                        nav = float(nav.replace(',', ''))
+                    except ValueError:
+                        nav = None
+                
+                if existing_symbol:
+                    # به‌روزرسانی نماد موجود
+                    existing_symbol.symbol_name = symbol_name
+                    existing_symbol.company_name = getattr(ticker, 'title', '')
+                    existing_symbol.group_name = getattr(ticker, 'group_name', '')
+                    existing_symbol.market_type = getattr(ticker, 'flow', '')
+                    existing_symbol.base_volume = base_volume
+                    existing_symbol.eps = eps
+                    existing_symbol.p_e_ratio = p_e_ratio
+                    existing_symbol.market_cap = market_cap
+                    existing_symbol.float_shares = float_shares
+                    existing_symbol.fiscal_year = fiscal_year
+                    existing_symbol.state = state
+                    existing_symbol.tse_index = tse_index
+                    
+                    if p_s_ratio is not None:
+                        existing_symbol.p_s_ratio = p_s_ratio
+                    if nav is not None:
+                        existing_symbol.nav = nav
+                    
+                    existing_symbol.updated_at = now
+                    updated_count += 1
+                    
+                else:
+                    # ابتدا شی را بدون فیلدهای اختیاری ایجاد کن
+                    new_symbol = ComprehensiveSymbolData(
+                        # 🚨 تغییر اصلی: tse_index را به عنوان symbol_id نیز استفاده کنید.
+                        symbol_id=tse_index,
+                        tse_index=tse_index,
+                        symbol_name=symbol_name,
+                        company_name=getattr(ticker, 'title', ''),
+                        group_name=getattr(ticker, 'group_name', ''),
+                        market_type=getattr(ticker, 'flow', ''),
+                        base_volume=base_volume,
+                        eps=eps,
+                        p_e_ratio=p_e_ratio,
+                        market_cap=market_cap,
+                        float_shares=float_shares,
+                        fiscal_year=fiscal_year,
+                        state=state,
+                        created_at=now,
+                        updated_at=now
+                    )
+                    
+                    # سپس فیلدهای اختیاری را جداگانه تنظیم کن
+                    if p_s_ratio is not None:
+                        new_symbol.p_s_ratio = p_s_ratio
+                    if nav is not None:
+                        new_symbol.nav = nav
+                    
+                    db_session.add(new_symbol)
+                    added_count += 1
+                    
+                # commit هر 5 رکورد برای جلوگیری از lock طولانی
+                if (added_count + updated_count) % 5 == 0:
+                    db_session.commit()
+                    time.sleep(3)  # تاخیر 3 ثانیه برای جلوگیری از بلاک
+                    
+            except Exception as e:
+                logger.error(f"❌ خطا در پردازش نماد {symbol_name}: {e}")
+                db_session.rollback()
                 continue
 
-            existing_record = TechnicalIndicatorData.query.filter_by(
-                symbol_id=db_symbol_id,
-                jdate=current_jdate_str
-            ).first()
+        db_session.commit()
+        logger.info(f"✅ دریافت و ذخیره نمادها کامل شد. {added_count} نماد جدید اضافه شد، {updated_count} نماد به‌روزرسانی شد.")
+        return {"added": added_count, "updated": updated_count}
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در دریافت نمادها از pytse-client: {e}")
+        db_session.rollback()
+        return {"added": 0, "updated": 0}
 
-            record_data = {
-                'symbol_id': db_symbol_id,
-                'jdate': current_jdate_str,
-                'close_price': float(row.get('close')) if pd.notna(row.get('close')) else 0.0,
-                'RSI': float(row.get('RSI')) if pd.notna(row.get('RSI')) else 0.0,
-                'MACD': float(row.get('MACD')) if pd.notna(row.get('MACD')) else 0.0,
-                'MACD_Signal': float(row.get('MACD_Signal')) if pd.notna(row.get('MACD_Signal')) else 0.0,
-                'MACD_Hist': float(row.get('MACD_Hist')) if pd.notna(row.get('MACD_Hist')) else 0.0,
-                'SMA_20': float(row.get('SMA_20')) if pd.notna(row.get('SMA_20')) else 0.0,
-                'SMA_50': float(row.get('SMA_50')) if pd.notna(row.get('SMA_50')) else 0.0,
-                'Volume_MA_20': float(row.get('Volume_MA_20')) if pd.notna(row.get('Volume_MA_20')) else 0.0,
-                'Bollinger_High': float(row.get('Bollinger_High')) if pd.notna(row.get('Bollinger_High')) else 0.0,
-                'Bollinger_Low': float(row.get('Bollinger_Low')) if pd.notna(row.get('Bollinger_Low')) else 0.0,
-                'Bollinger_MA': float(row.get('Bollinger_MA')) if pd.notna(row.get('Bollinger_MA')) else 0.0,
-                'ATR': float(row.get('ATR')) if pd.notna(row.get('ATR')) else 0.0,
-            }
 
-            if existing_record:
-                for key, value in record_data.items():
-                    setattr(existing_record, key, value)
-                existing_record.updated_at = datetime.now()
-                db.session.add(existing_record)
-            else:
-                new_record = TechnicalIndicatorData(
-                    **record_data
+
+def fetch_realtime_data_for_all_symbols(db_session: Session):
+    """
+    دریافت اطلاعات لحظه‌ای برای تمام نمادها
+    """
+    try:
+        # این تابع نیاز به پیاده‌سازی دارد
+        # فعلاً return 0 می‌کنیم تا خطا ندهد
+        logger.warning("⚠️ تابع fetch_realtime_data_for_all_symbols هنوز پیاده‌سازی نشده است")
+        return 0
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در دریافت اطلاعات لحظه‌ای: {e}")
+        return 0
+
+
+# ----------------------------
+# تابع fetch_and_process_historical_data (نسخه بازنویسی شده و جامع)
+# ----------------------------
+
+def fetch_and_process_historical_data(
+    db_session: Session,
+    limit: Optional[int] = None,
+    specific_symbols_list: Optional[List[str]] = None
+) -> Tuple[int, str]:
+    """
+    دریافت و پردازش داده‌های تاریخی جامع برای نمادهای مشخص یا تمام نمادها.
+    این تابع داده‌های تاریخی، داده‌های حقیقی/حقوقی را در یک حلقه تجمیع می‌کند.
+    """
+    logger.info("📈 آپدیت داده‌های تاریخی به صورت جامع...")
+    updated_count = 0
+    message = ""
+
+    try:
+        query = db_session.query(ComprehensiveSymbolData)
+        if specific_symbols_list:
+            symbol_conditions = []
+            for symbol_identifier in specific_symbols_list:
+                if str(symbol_identifier).isdigit():
+                    symbol_conditions.append(ComprehensiveSymbolData.tse_index == str(symbol_identifier))
+                else:
+                    symbol_conditions.append(ComprehensiveSymbolData.symbol_name == symbol_identifier)
+            query = query.filter(or_(*symbol_conditions))
+        
+        symbols_to_update = query.all()
+        if not symbols_to_update:
+            return 0, "No symbols to update."
+
+        for sym in symbols_to_update:
+            logger.info(f"📊 آپدیت دیتای تاریخی جامع برای {sym.symbol_name} (ID: {sym.id})")
+            
+            # دریافت آخرین تاریخ موجود در پایگاه داده
+            last_db_date = db_session.query(
+                func.max(HistoricalData.date)
+            ).filter(HistoricalData.symbol_id == sym.id).scalar()
+            
+            try:
+                ticker = tse.Ticker(symbol_name=sym.symbol_name, index=sym.tse_index)
+
+                # 1. دریافت داده‌های اصلی تاریخی (شامل OHLCV)
+                df_history = ticker.history
+                if df_history is None or df_history.empty:
+                    logger.info(f"ℹ️ دیتای تاریخی جدیدی برای نماد {sym.symbol_name} یافت نشد.")
+                    continue
+                
+                # 2. دریافت داده‌های حقیقی/حقوقی
+                df_client_types = ticker.client_types
+                if df_client_types is None:
+                    # اگر داده‌ای یافت نشد، یک DataFrame خالی ایجاد می‌کنیم تا عملیات merge خطا ندهد
+                    df_client_types = pd.DataFrame(columns=['date', 'buy_count_i', 'buy_count_n', 'sell_count_i', 'sell_count_n', 
+                                                           'buy_i_volume', 'buy_n_volume', 'sell_i_volume', 'sell_n_volume'])
+                else:
+                    # 📌 اصلاح: تغییر نام ستون‌ها برای تطابق با مدل دیتابیس
+                    df_client_types = df_client_types.rename(columns={
+                        "individual_buy_count": "buy_count_i",
+                        "corporate_buy_count": "buy_count_n",
+                        "individual_sell_count": "sell_count_i",
+                        "corporate_sell_count": "sell_count_n",
+                        "individual_buy_vol": "buy_i_volume",
+                        "corporate_buy_vol": "buy_n_volume",
+                        "individual_sell_vol": "sell_i_volume",
+                        "corporate_sell_vol": "sell_n_volume"
+                    })                                           
+
+                # 3. دریافت داده‌های آماری (برای price_change و market_value)
+                # توجه: این داده‌ها فقط برای آخرین روز در دسترس هستند و به‌صورت تاریخی نیستند.
+                # برای این منظور، می‌توان از یک تابع جداگانه استفاده کرد که در پایان روز اجرا می‌شود.
+                # برای یکپارچگی، ما فرض می‌کنیم که این داده‌ها به صورت تاریخی از طریق یک تابع دیگر جمع‌آوری شده‌اند،
+                # یا از فیلدهای موجود در history استفاده می‌کنیم.
+                
+                # برای مثال، `final` و `yesterday_price` در تاریخچه اصلی وجود ندارند،
+                # اما `pytse_client` در برخی نسخه‌ها آنها را برمی‌گرداند.
+                # ما از متد .get() برای دسترسی امن به این فیلدها استفاده می‌کنیم.
+
+                # 4. ادغام داده‌ها
+                df_history['date'] = pd.to_datetime(df_history['date'])
+                df_client_types['date'] = pd.to_datetime(df_client_types['date'])
+                
+                # ادغام بر اساس ستون 'date'
+                df_merged = pd.merge(df_history, df_client_types, on='date', how='left')
+
+                # فیلتر کردن داده‌های جدید
+                if last_db_date:
+                    new_data = df_merged[df_merged['date'] > last_db_date]
+                else:
+                    new_data = df_merged.copy()
+
+                if new_data.empty:
+                    logger.info(f"ℹ️ دیتای تاریخی جدیدی برای نماد {sym.symbol_name} یافت نشد.")
+                    continue
+                
+                # تبدیل تاریخ میلادی به شمسی
+                new_data['jdate'] = new_data['date'].apply(
+                    lambda x: jdatetime.date.fromgregorian(date=x.date()).strftime("%Y-%m-%d")
                 )
-                db.session.add(new_record)
-            processed_tech_rows += 1
+                
+                records = new_data.to_dict('records')
+                historical_records = [
+                    HistoricalData(
+                        symbol_id=sym.id,
+                        symbol_name=sym.symbol_name,
+                        date=rec['date'].date(),
+                        jdate=rec['jdate'],
+                        open=rec.get('open'),
+                        high=rec.get('high'),
+                        low=rec.get('low'),
+                        close=rec.get('close'),
+                        final=rec.get('final'),
+                        yesterday_price=rec.get('yesterday_price'),
+                        volume=rec.get('volume'),
+                        value=rec.get('value'),
+                        num_trades=rec.get('count'), # در pytse_client، تعداد معاملات با 'count' نامگذاری شده است
+                        plc=rec.get('price_change_close'),
+                        plp=rec.get('price_percent_change_close'),
+                        pcc=rec.get('price_change_final'),
+                        pcp=rec.get('price_percent_change_final'),
+                        mv=rec.get('market_value'),
+                        buy_count_i=rec.get('buy_count_i'),
+                        buy_count_n=rec.get('buy_count_n'),
+                        sell_count_i=rec.get('sell_count_i'),
+                        sell_count_n=rec.get('sell_count_n'),
+                        buy_i_volume=rec.get('buy_i_volume'),
+                        buy_n_volume=rec.get('buy_n_volume'),
+                        sell_i_volume=rec.get('sell_i_volume'),
+                        sell_n_volume=rec.get('sell_n_volume'),
+                        # توجه: داده‌های عمق بازار (مانند qd1, pd1, zd1) فقط برای اطلاعات لحظه‌ای در دسترس هستند
+                        # و به صورت تاریخی توسط pytse-client ارائه نمی‌شوند.
+                        zd1=None, qd1=None, pd1=None,
+                        zo1=None, qo1=None, po1=None,
+                        zd2=None, qd2=None, pd2=None,
+                        zo2=None, qo2=None, po2=None,
+                        zd3=None, qd3=None, pd3=None,
+                        zo3=None, qo3=None, po3=None,
+                        zd4=None, qd4=None, pd4=None,
+                        zo4=None, qo4=None, po4=None,
+                        zd5=None, qd5=None, pd5=None,
+                        zo5=None, qo5=None, po5=None
+                    ) for rec in records
+                ]
 
-        db.session.commit()
-        logger.info(f"Successfully updated/added {processed_tech_rows} technical indicator data rows for {symbol_name}.")
-        return True, f"Successfully analyzed and saved {processed_tech_rows} technical data rows for {symbol_name}."
+                if historical_records:
+                    db_session.bulk_save_objects(historical_records)
+                    updated_count += len(historical_records)
+                    logger.info(f"✅ {len(historical_records)} رکورد جدید برای {sym.symbol_name} اضافه شد.")
+                    db_session.commit()
+                    safe_sleep(DEFAULT_PER_SYMBOL_DELAY)
+            
+            except Exception as e:
+                logger.error(f"❌ خطا در پردازش داده‌های تاریخی برای نماد {sym.symbol_name}: {e}")
+                db_session.rollback()
+                continue
+    
+    except SQLAlchemyError as e:
+        logger.error(f"❌ خطا در پایگاه داده: {e}")
+        db_session.rollback()
+        return 0, f"Database error: {e}"
+    except Exception as e:
+        logger.error(f"❌ خطا در تابع اصلی: {e}")
+        return 0, f"An unexpected error occurred: {e}"
+        
+    message = f"✅ آپدیت داده‌های تاریخی کامل شد. {updated_count} رکورد جدید اضافه شد."
+    logger.info(message)
+    return updated_count, message
+
+
+
+# ----------------------------
+# تابع update_historical_data_limited (نسخه اصلاح‌شده)
+# ----------------------------
+
+def update_historical_data_limited(
+    db_session: Session, 
+    limit: Optional[int] = None, 
+    specific_symbols_list: list = None,
+    days_limit: int = 365 # این پارامتر را اضافه کنید
+) -> Tuple[int, str]:
+    """
+    آپدیت داده‌های تاریخی برای نمادهایی که نیاز به به‌روزرسانی دارند.
+    این تابع به صورت هوشمند و بهینه، تنها داده‌های جدید را دانلود و ذخیره می‌کند.
+    """
+    logger.info("📈 آپدیت داده‌های تاریخی...")
+    updated_symbols_count = 0
+    message = "Historical data updated successfully."
+
+    try:
+        query = db_session.query(ComprehensiveSymbolData)
+        if specific_symbols_list:
+            query = query.filter(ComprehensiveSymbolData.symbol_id.in_(specific_symbols_list))
+
+        symbols_to_update = query.order_by(ComprehensiveSymbolData.last_historical_update_date.asc()).limit(limit).all()
+
+        if not symbols_to_update:
+            return 0, "No symbols to update."
+
+        for sym in symbols_to_update:
+            logger.info(f"📊 آپدیت دیتای تاریخی برای {sym.symbol_name} (SymbolID: {sym.symbol_id})")
+
+            try:
+                # 1. گرفتن آخرین تاریخ موجود در پایگاه داده
+                last_date_record = db_session.query(func.max(HistoricalData.date)).filter_by(symbol_id=sym.symbol_id).scalar()
+
+                # 2. دریافت کل تاریخچه از Ticker با استفاده از symbol_name
+                ticker = tse.Ticker(symbol=sym.symbol_name)
+                df_history = ticker.history
+
+                if df_history is not None and not df_history.empty:
+                    # 3. فیلتر کردن تاریخچه برای دریافت فقط داده‌های جدید
+                    if last_date_record:
+                        # اضافه کردن یک روز به آخرین تاریخ موجود برای جلوگیری از تکرار
+                        start_date_to_filter = last_date_record + timedelta(days=1)
+                        # فیلتر کردن دیتافریم بر اساس تاریخ
+                        df_history = df_history[df_history['date'] >= pd.to_datetime(start_date_to_filter)]
+
+                    if not df_history.empty:
+                        # 4. آماده‌سازی داده‌ها برای bulk insert
+                        df_history['symbol_id'] = sym.symbol_id
+                        df_history['symbol_name'] = sym.symbol_name
+
+                        # تبدیل ستون تاریخ میلادی به شمسی
+                        df_history['jdate'] = df_history['date'].apply(
+                            lambda d: str(jdatetime.date.fromgregorian(date=d)) if d else None
+                        )
+
+                        # حذف ستون‌های اضافی و تغییر نام ستون‌ها
+                        df_history.rename(columns={'count': 'num_trades'}, inplace=True)
+                        #df_history = df_history.drop(columns=['final_price', 'yesterday_price', 'value_b'], errors='ignore')
+
+                        # تبدیل مقادیر NaN به None برای سازگاری با SQLAlchemy
+                        df_history = df_history.where(pd.notnull(df_history), None)
+                        records_to_insert = df_history.replace({np.nan: None}).to_dict('records')
+
+                        # 5. درج داده‌های جدید در پایگاه داده
+                        db_session.bulk_insert_mappings(HistoricalData, records_to_insert)
+
+                        # 6. به‌روزرسانی تاریخ آخرین آپدیت در ComprehensiveSymbolData
+                        sym.last_historical_update_date = date.today()
+                        updated_symbols_count += 1
+                    else:
+                        logger.info("➡️ نماد به روز است.")
+
+                db_session.commit()
+
+            except Exception as e:
+                db_session.rollback()
+                logger.error(f"❌ خطا در آپدیت دیتای تاریخی برای نماد {sym.symbol_name}: {e}")
+                continue
 
     except Exception as e:
-        db.session.rollback()
-        logger.error(f"Error analyzing technical data for {symbol_name} ({symbol_id}): {e}", exc_info=True)
-        return False, f"Error analyzing technical data for {symbol_name}: {str(e)}"
+        db_session.rollback()
+        logger.error(f"❌ خطا در آپدیت دیتای تاریخی: {e}")
+        message = str(e)
+
+    return updated_symbols_count, message
 
 
-
-
-def update_comprehensive_data_for_symbol(symbol_id, symbol_name):
+# ----------------------------
+# تابع اجرای update_symbol_fundamental_data
+# ----------------------------
+def update_symbol_fundamental_data(
+    db_session: Session, 
+    limit: Optional[int] = None, 
+    specific_symbols_list: list = None
+) -> Tuple[int, str]:
     """
-    Fetches and updates fundamental data for a single symbol.
+    آپدیت اطلاعات بنیادی (Fundamental) نمادها.
+    این تابع اطلاعاتی مانند EPS, P/E, و Market Cap را از Ticker دریافت می‌کند.
+    """
+    logger.info("📈 آپدیت اطلاعات بنیادی...")
+    updated_symbols_count = 0
+    message = "Fundamental data updated successfully."
+
+    try:
+        query = db_session.query(ComprehensiveSymbolData)
+        if specific_symbols_list:
+            symbol_conditions = []
+            for symbol_identifier in specific_symbols_list:
+                if str(symbol_identifier).isdigit():
+                    # ورودی عددی → tse_index
+                    symbol_conditions.append(ComprehensiveSymbolData.tse_index == int(symbol_identifier))
+                else:
+                    # ورودی متنی → نام نماد
+                    symbol_conditions.append(ComprehensiveSymbolData.symbol_name == symbol_identifier)
+            
+            query = query.filter(or_(*symbol_conditions))
+
+        symbols_to_update = query.order_by(
+            ComprehensiveSymbolData.last_fundamental_update_date.asc()
+        ).limit(limit).all()
+
+        if not symbols_to_update:
+            return 0, "No symbols to update."
+
+        for sym in symbols_to_update:
+            logger.info(f"📊 آپدیت دیتای بنیادی برای {sym.symbol_name} (TSEIndex: {sym.tse_index})")
+            
+            try:
+                ticker = tse.Ticker(sym.symbol_name, index=sym.tse_index)
+                
+                # دریافت یا ایجاد رکورد FundamentalData
+                fundamental_data = db_session.query(FundamentalData).filter_by(symbol_id=sym.id).first()
+                if not fundamental_data:
+                    fundamental_data = FundamentalData(symbol_id=sym.id)
+                    db_session.add(fundamental_data)
+                
+                # بروزرسانی فیلدهای بنیادی
+                try:
+                    fundamental_data.eps = ticker.eps
+                except ValueError:
+                    fundamental_data.eps = None
+                    logger.warning(f"⚠️ EPS برای {sym.symbol_name} معتبر نبود.")
+                
+                try:
+                    fundamental_data.p_e_ratio = ticker.p_e_ratio
+                except ValueError:
+                    fundamental_data.p_e_ratio = None
+                    logger.warning(f"⚠️ P/E Ratio برای {sym.symbol_name} معتبر نبود.")
+
+                try:
+                    fundamental_data.group_p_e_ratio = ticker.group_p_e_ratio
+                except ValueError:
+                    fundamental_data.group_p_e_ratio = None
+
+                try:
+                    fundamental_data.p_s_ratio = ticker.p_s_ratio
+                except ValueError:
+                    fundamental_data.p_s_ratio = None
+
+                fundamental_data.total_shares = ticker.total_shares
+                fundamental_data.float_shares = ticker.float_shares
+                fundamental_data.market_cap = ticker.market_cap
+                fundamental_data.fiscal_year = ticker.fiscal_year
+                fundamental_data.last_update_date = date.today()
+                
+                # آپدیت تاریخ آخرین بروزرسانی
+                sym.last_fundamental_update_date = date.today()
+                
+                updated_symbols_count += 1
+                db_session.commit()
+            
+            except Exception as e:
+                db_session.rollback()
+                logger.error(f"❌ خطا در آپدیت دیتای بنیادی برای {sym.symbol_name}: {e}")
+                continue
+
+    except Exception as e:
+        db_session.rollback()
+        logger.error(f"❌ خطا در آپدیت دیتای بنیادی: {e}")
+        message = str(e)
+        
+    return updated_symbols_count, message
+
+
+
+
+# ----------------------------
+# تابع run_full_data_update (نسخه 10 جولای)
+# ----------------------------
+# تابع کمکی برای یافتن آخرین تاریخ هر نماد
+def get_last_dates(db_session: Session) -> dict:
+    """
+    آخرین تاریخ ثبت شده در جدول HistoricalData را برای هر نماد برمی‌گرداند.
     """
     try:
-        logger.info(f"Updating fundamental data for {symbol_name}...")
-        data = _get_fundamental_data_from_tsetmc(symbol_id, db.session)
-        if not data:
-            return False, "Failed to fetch fundamental data from source."
-        success, msg = _update_or_create_fundamental_data(symbol_id, data, db.session)
-        logger.info(f"Fundamental data update for {symbol_name}: {msg}")
-        return success, msg
+        results = db_session.query(
+            HistoricalData.symbol_id,
+            func.max(HistoricalData.date)
+        ).group_by(
+            HistoricalData.symbol_id
+        ).all()
+        return {symbol_id: last_date for symbol_id, last_date in results}
     except Exception as e:
-        logger.error(f"Full fundamental data update failed for {symbol_name}: {e}")
-        return False, f"Full fundamental data update failed due to an internal error."
+        logger.error(f"❌ خطا در دریافت آخرین تاریخ‌های نمادها: {e}")
+        return {}
 
 
-def run_full_data_update(days_limit=120):
-    """
-    Runs a full data update for all symbols: historical, technical, and fundamental.
-    This should be run periodically (e.g., daily).
-    
-    Args:
-        days_limit (int): Number of days to fetch historical data for each symbol.
-        
-    Returns:
-        Tuple[int, str]: Total processed count and a summary message.
-    """
-    logger.info(f"Starting full data update for all symbols for the last {days_limit} days.")
-    
+# ایجاد sessionmaker برای مدیریت connection pooling
+def get_session_local():
+    """ایجاد session local با application context"""
     try:
-        symbols_to_process = ComprehensiveSymbolData.query.all()
-        
-        if not symbols_to_process:
-            logger.warning("No symbols found in ComprehensiveSymbolData. Please run initial population first.")
-            return 0, "No symbols to process."
-
-        total_processed_count = 0
-        
-        for symbol in symbols_to_process:
-            # 1. Update Historical Data
-            # آرگومان 'limit_days' به 'days_limit' تغییر یافت تا با تابع update_historical_data_for_symbol هماهنگ شود
-            success_hist, msg_hist = update_historical_data_for_symbol(symbol.symbol_id, symbol.symbol_name, days_limit=days_limit)
-            if success_hist:
-                total_processed_count += 1
-                logger.info(f"Historical data update for {symbol.symbol_name}: {msg_hist}")
-            else:
-                logger.warning(f"Failed historical data update for {symbol.symbol_name}: {msg_hist}")
-
-            # 2. Analyze Technical Data
-            # فراخوانی تابع analyze_technical_data_for_symbol با آرگومان days_limit
-            success_tech, msg_tech = analyze_technical_data_for_symbol(symbol.symbol_id, symbol.symbol_name, limit_days=days_limit)
-            if success_tech:
-                total_processed_count += 1
-                logger.info(f"Technical analysis for {symbol.symbol_name}: {msg_tech}")
-            else:
-                logger.warning(f"Failed technical data analysis for {symbol.symbol_name}: {msg_tech}")
-
-            # 3. Update Fundamental Data (using the comprehensive update function)
-            success_fund, msg_fund = update_comprehensive_data_for_symbol(symbol.symbol_id, symbol.symbol_name)
-            if success_fund:
-                total_processed_count += 1
-                logger.info(f"Fundamental data update for {symbol.symbol_name}: {msg_fund}")
-            else:
-                logger.warning(f"Failed fundamental data update for {symbol.symbol_name}: {msg_fund}")
-
-        final_message = f"Full data update summary: Total processed operations: {total_processed_count}. Check logs for details on each symbol."
-        current_app.logger.info(final_message)
-        return total_processed_count, final_message
-
-    except Exception as e:
-        logger.error(f"Error during full data update: {e}", exc_info=True)
-        return 0, f"An error occurred during the full data update process: {e}"
+        from flask import current_app
+        with current_app.app_context():
+            return sessionmaker(bind=db.engine)()
+    except RuntimeError:
+        # اگر خارج از application context هستیم
+        return sessionmaker(bind=db.get_engine())()
 
 
-def initial_populate_all_symbols_and_data():
+# ----------------------------
+# تابع اجرای آپدیت کامل
+# ----------------------------
+def run_full_data_update(
+    db_session: Session = None,
+    limit_per_run: int = 100,
+    specific_symbols_list: list = None,
+    days_limit: int = 365,
+    update_fundamental: bool = True,
+    update_realtime: bool = True,
+    update_technical: bool = True
+):
     """
-    Initial population of ComprehensiveSymbolData and then fetches historical/technical/fundamental data for them.
-    This should be run once to seed the database.
+    اجرای آپدیت کامل دیتای نمادها (تاریخی + تکنیکال + بنیادی + لحظه‌ای)
+    اگر db_session پاس داده نشود، خودش session را از extensions.db می‌سازد.
     """
-    current_app.logger.info("Starting initial population of all symbols and their data.")
-    
-    total_comp_symbols_added, msg_comp = populate_all_symbols_initial()
-    current_app.logger.info(msg_comp)
+    if db_session is None:
+        db_session = db.session
 
-    # After initial population of symbols, run a full data update for them
-    # Use a larger days_limit for initial population
-    processed_count, msg_data_update = run_full_data_update(days_limit=365) 
-    current_app.logger.info(msg_data_update)
+    logger.info("🚀 شروع آپدیت کامل داده‌ها برای همه نمادها...")
 
-    final_message = f"Initial population process finished. Added {total_comp_symbols_added} new symbols and updated data for all symbols. Total data update operations: {processed_count}."
-    current_app.logger.info(final_message)
-    return total_comp_symbols_added, processed_count, final_message
-
-
-def update_and_get_historical_data(symbol_id, symbol_name):
-    """
-    Updates historical data for a symbol and returns all of its historical data.
-    """
-    update_historical_data_for_symbol(symbol_id, symbol_name)
-    
-    historical_records = HistoricalData.query.filter_by(symbol_id=symbol_id).order_by(HistoricalData.date).all()
-    
-    data_points = []
-    for record in historical_records:
-        data_points.append({
-            'date': str(record.date),
-            'open': record.open_price,
-            'high': record.high_price,
-            'low': record.low_price,
-            'close': record.close_price,
-            'volume': record.volume,
-            'value': record.value,
-            'count': record.count
-        })
-    
-    return data_points
-
-
-def update_and_get_technical_indicators(symbol_id, symbol_name):
-    """
-    Updates technical indicators for a symbol and returns all of its technical data.
-    """
-    update_technical_data_for_symbol(symbol_id, symbol_name)
-    
-    technical_records = TechnicalIndicatorData.query.filter_by(symbol_id=symbol_id).order_by(TechnicalIndicatorData.date).all()
-
-    data_points = []
-    for record in technical_records:
-        data_points.append({
-            'date': str(record.date),
-            'rsi': record.rsi,
-            'macd': record.macd,
-            'macd_signal': record.macd_signal,
-            'sma_20': record.sma_20,
-            'sma_50': record.sma_50,
-            'sma_200': record.sma_200,
-            'bollinger_upper': record.bollinger_upper,
-            'bollinger_middle': record.bollinger_middle,
-            'bollinger_lower': record.bollinger_lower,
-            'volume_ma': record.volume_ma,
-            'atr': record.atr,
-            'smf': record.smf
-        })
-    
-    return data_points
-
-
-def update_and_get_fundamental_data(symbol_id, symbol_name):
-    """
-    Updates fundamental data for a symbol and returns its most recent fundamental data.
-    """
-    update_comprehensive_data_for_symbol(symbol_id, symbol_name)
-
-    fundamental_record = FundamentalData.query.filter_by(symbol_id=symbol_id).order_by(FundamentalData.date.desc()).first()
-    
-    if fundamental_record:
-        data_point = {
-            'date': str(fundamental_record.date),
-            'eps': fundamental_record.eps,
-            'pe_ratio': fundamental_record.pe_ratio,
-            'pe_group': fundamental_record.pe_group,
-            'pb_ratio': fundamental_record.pb_ratio,
-            'ps_ratio': fundamental_record.ps_ratio,
-            'base_volume': fundamental_record.base_volume,
-            'closing_price': fundamental_record.closing_price,
-            'total_shares': fundamental_record.total_shares,
-            'market_value': fundamental_record.market_value
-        }
-        return data_point
-    
-    return None
-
-
-def get_all_symbols():
-    """
-    Retrieves all symbols from the database.
-    """
-    symbols = ComprehensiveSymbolData.query.all()
-    
-    symbol_list = []
-    for s in symbols:
-        symbol_list.append({
-            'symbol_id': s.symbol_id,
-            'symbol_name': s.symbol_name,
-            'market_type': s.market_type,
-            'is_active': s.is_active
-        })
-        
-    return symbol_list
-
-
-def get_historical_data_by_symbol_id(symbol_id):
-    """
-    Retrieves all historical data points for a given symbol_id.
-    """
-    historical_records = HistoricalData.query.filter_by(symbol_id=symbol_id).order_by(HistoricalData.date).all()
-    
-    data_points = []
-    for record in historical_records:
-        data_points.append({
-            'date': str(record.date),
-            'open': record.open_price,
-            'high': record.high_price,
-            'low': record.low_price,
-            'close': record.close_price,
-            'volume': record.volume,
-            'value': record.value,
-            'count': record.count
-        })
-        
-    return data_points
-
-
-def get_technical_data_by_symbol_id(symbol_id):
-    """
-    Retrieves all technical indicator data points for a given symbol_id.
-    """
-    technical_records = TechnicalIndicatorData.query.filter_by(symbol_id=symbol_id).order_by(TechnicalIndicatorData.date).all()
-    
-    data_points = []
-    for record in technical_records:
-        data_points.append({
-            'date': str(record.date),
-            'rsi': record.rsi,
-            'macd': record.macd,
-            'macd_signal': record.macd_signal,
-            'sma_20': record.sma_20,
-            'sma_50': record.sma_50,
-            'sma_200': record.sma_200,
-            'bollinger_upper': record.bollinger_upper,
-            'bollinger_middle': record.bollinger_middle,
-            'bollinger_lower': record.bollinger_lower,
-            'volume_ma': record.volume_ma,
-            'atr': record.atr,
-            'smf': record.smf
-        })
-        
-    return data_points
-
-
-def get_fundamental_data_by_symbol_id(symbol_id):
-    """
-    Retrieves the most recent fundamental data record for a given symbol_id.
-    """
-    fundamental_record = FundamentalData.query.filter_by(symbol_id=symbol_id).order_by(FundamentalData.date.desc()).first()
-    
-    if fundamental_record:
-        data_point = {
-            'date': str(fundamental_record.date),
-            'eps': fundamental_record.eps,
-            'pe_ratio': fundamental_record.pe_ratio,
-            'pe_group': fundamental_record.pe_group,
-            'pb_ratio': fundamental_record.pb_ratio,
-            'ps_ratio': fundamental_record.ps_ratio,
-            'base_volume': fundamental_record.base_volume,
-            'closing_price': fundamental_record.closing_price,
-            'total_shares': fundamental_record.total_shares,
-            'market_value': fundamental_record.market_value
-        }
-        return data_point
-        
-    return None
-
-def find_symbol_by_id(symbol_id):
-    """
-    Finds a ComprehensiveSymbolData object by its symbol_id.
-    Returns the object or None if not found.
-    """
-    return ComprehensiveSymbolData.query.filter_by(symbol_id=symbol_id).first()
-
-
-def find_symbol_by_name(symbol_name):
-    """
-    Finds a ComprehensiveSymbolData object by its symbol_name.
-    Returns the object or None if not found.
-    """
-    return ComprehensiveSymbolData.query.filter_by(symbol_name=symbol_name).first()
-
-
-def get_symbol_name_by_id(symbol_id):
-    """
-    Retrieves the symbol name for a given symbol ID.
-    """
-    symbol = ComprehensiveSymbolData.query.filter_by(symbol_id=symbol_id).first()
-    if symbol:
-        return symbol.symbol_name
-    return None
-
-
-def get_symbol_id_by_name(symbol_name):
-    """
-    Retrieves the symbol ID for a given symbol name.
-    """
-    symbol = ComprehensiveSymbolData.query.filter_by(symbol_name=symbol_name).first()
-    if symbol:
-        return symbol.symbol_id
-    return None
-
-
-def update_all_data_for_symbol(symbol_id, symbol_name, days_limit=365):
-    """
-    A single function to update all data (historical, technical, fundamental) for a symbol.
-    """
-    success_hist, msg_hist = update_historical_data_for_symbol(symbol_id, symbol_name, days_limit)
-    success_tech, msg_tech = update_technical_data_for_symbol(symbol_id, symbol_name, days_limit)
-    success_fund, msg_fund = update_comprehensive_data_for_symbol(symbol_id, symbol_name)
-
-    return (
-        f"Historical Update: {msg_hist}\n"
-        f"Technical Update: {msg_tech}\n"
-        f"Fundamental Update: {msg_fund}"
-    )
-
-
-def get_all_data_for_symbol(symbol_id):
-    """
-    Retrieves all available data (historical, technical, fundamental) for a given symbol.
-    Returns a dictionary.
-    """
-    symbol = find_symbol_by_id(symbol_id)
-    if not symbol:
-        return None
-
-    historical_data = get_historical_data_by_symbol_id(symbol_id)
-    technical_data = get_technical_data_by_symbol_id(symbol_id)
-    fundamental_data = get_fundamental_data_by_symbol_id(symbol_id)
-
-    return {
-        'symbol_info': {
-            'symbol_id': symbol.symbol_id,
-            'symbol_name': symbol.symbol_name,
-            'market_type': symbol.market_type,
-            'is_active': symbol.is_active
-        },
-        'historical_data': historical_data,
-        'technical_data': technical_data,
-        'fundamental_data': fundamental_data
+    results = {
+        "historical": {"count": 0, "message": ""},
+        "technical": {"count": 0, "message": ""},
+        "fundamental": {"count": 0, "message": ""},
+        "realtime": {"count": 0, "message": ""}
     }
 
-
-def update_specific_data_for_symbol(symbol_id, symbol_name, data_type, days_limit=365):
-    """
-    Updates a specific type of data (historical, technical, or fundamental) for a symbol.
-    """
-    if data_type.lower() == 'historical':
-        success, msg = update_historical_data_for_symbol(symbol_id, symbol_name, days_limit)
-        return f"Historical update for {symbol_name}: {msg}"
-    elif data_type.lower() == 'technical':
-        success, msg = update_technical_data_for_symbol(symbol_id, symbol_name, days_limit)
-        return f"Technical update for {symbol_name}: {msg}"
-    elif data_type.lower() == 'fundamental':
-        success, msg = update_comprehensive_data_for_symbol(symbol_id, symbol_name)
-        return f"Fundamental update for {symbol_name}: {msg}"
-    else:
-        return f"Error: Invalid data type '{data_type}'. Please choose from 'historical', 'technical', or 'fundamental'."
-
-
-def delete_symbol_data(symbol_id):
-    """
-    Deletes all data associated with a symbol from all tables.
-    """
+    # 1. ابتدا نمادها را از pytse-client دریافت و به‌روزرسانی کنیم
     try:
-        # Start a transaction to ensure atomicity
-        db.session.begin_nested()
-
-        # Delete from all related tables
-        HistoricalData.query.filter_by(symbol_id=symbol_id).delete()
-        TechnicalIndicatorData.query.filter_by(symbol_id=symbol_id).delete()
-        FundamentalData.query.filter_by(symbol_id=symbol_id).delete()
-        
-        # Finally, delete the symbol from the main table
-        ComprehensiveSymbolData.query.filter_by(symbol_id=symbol_id).delete()
-        
-        db.session.commit()
-        return True, f"All data for symbol ID {symbol_id} has been successfully deleted."
+        logger.info("📥 به‌روزرسانی لیست نمادها از pytse-client...")
+        symbol_update_result = fetch_symbols_from_pytse_client(db_session, limit=None)
+        logger.info(f"✅ به‌روزرسانی لیست نمادها کامل شد: {symbol_update_result}")
     except Exception as e:
-        db.session.rollback()
-        logger.error(f"Error deleting data for symbol ID {symbol_id}: {e}")
-        return False, f"Failed to delete data for symbol ID {symbol_id}: {e}"
+        logger.error(f"❌ خطا در به‌روزرسانی لیست نمادها: {e}")
 
-
-def get_top_symbols_by_volume(limit=10):
-    """
-    Retrieves the top symbols based on the sum of their recent volume.
-    This is a basic example and might need more advanced logic.
-    """
-    # Fetch all historical data for the last 30 days
-    last_30_days = date.today() - timedelta(days=30)
-    
-    # We can perform this aggregation in the database for better performance
+    # 2. آپدیت داده‌های تاریخی
     try:
-        top_symbols = db.session.query(
-            HistoricalData.symbol_id,
-            func.sum(HistoricalData.volume).label('total_volume')
-        ).filter(
-            HistoricalData.date >= last_30_days
-        ).group_by(
-            HistoricalData.symbol_id
-        ).order_by(
-            func.sum(HistoricalData.volume).desc()
-        ).limit(limit).all()
-        
-        results = []
-        for sym_id, total_vol in top_symbols:
-            symbol_name = get_symbol_name_by_id(sym_id)
-            if symbol_name:
-                results.append({
-                    'symbol_id': sym_id,
-                    'symbol_name': symbol_name,
-                    'total_volume': total_vol
-                })
-        
-        return results
-    except Exception as e:
-        logger.error(f"Error retrieving top symbols by volume: {e}")
-        return []
-
-
-def get_top_symbols_by_value(limit=10):
-    """
-    Retrieves the top symbols based on the sum of their recent transaction value.
-    """
-    # Fetch all historical data for the last 30 days
-    last_30_days = date.today() - timedelta(days=30)
-    
-    try:
-        top_symbols = db.session.query(
-            HistoricalData.symbol_id,
-            func.sum(HistoricalData.value).label('total_value')
-        ).filter(
-            HistoricalData.date >= last_30_days
-        ).group_by(
-            HistoricalData.symbol_id
-        ).order_by(
-            func.sum(HistoricalData.value).desc()
-        ).limit(limit).all()
-        
-        results = []
-        for sym_id, total_val in top_symbols:
-            symbol_name = get_symbol_name_by_id(sym_id)
-            if symbol_name:
-                results.append({
-                    'symbol_id': sym_id,
-                    'symbol_name': symbol_name,
-                    'total_value': total_val
-                })
-        
-        return results
-    except Exception as e:
-        logger.error(f"Error retrieving top symbols by value: {e}")
-        return []
-
-
-def get_symbols_by_market_type(market_type):
-    """
-    Retrieves all symbols belonging to a specific market type.
-    """
-    symbols = ComprehensiveSymbolData.query.filter_by(market_type=market_type).all()
-    
-    symbol_list = []
-    for s in symbols:
-        symbol_list.append({
-            'symbol_id': s.symbol_id,
-            'symbol_name': s.symbol_name,
-            'market_type': s.market_type,
-            'is_active': s.is_active
-        })
-        
-    return symbol_list
-
-
-def search_symbols(query):
-    """
-    Searches for symbols by name, case-insensitively.
-    """
-    # Use SQLAlchemy's `ilike` for case-insensitive search
-    symbols = ComprehensiveSymbolData.query.filter(ComprehensiveSymbolData.symbol_name.ilike(f'%{query}%')).all()
-    
-    symbol_list = []
-    for s in symbols:
-        symbol_list.append({
-            'symbol_id': s.symbol_id,
-            'symbol_name': s.symbol_name,
-            'market_type': s.market_type,
-            'is_active': s.is_active
-        })
-        
-    return symbol_list
-
-def add_new_symbol(symbol_name, is_active=True):
-    """
-    Adds a new symbol to the database and fetches its initial data.
-    """
-    try:
-        # First, get the symbol's TSE ID
-        tickers = all_tickers()
-        ticker_obj = tickers.get(symbol_name)
-        
-        if not ticker_obj:
-            return False, f"Symbol '{symbol_name}' not found in TSETMC data."
-        
-        symbol_id = ticker_obj.get_tse_id()
-        if not symbol_id:
-            return False, f"TSE ID not available for symbol '{symbol_name}'."
-            
-        # Check if the symbol already exists in our database
-        existing_symbol = ComprehensiveSymbolData.query.filter_by(symbol_id=symbol_id).first()
-        if existing_symbol:
-            return False, f"Symbol '{symbol_name}' with ID {symbol_id} already exists in the database."
-
-        # Determine market type
-        market_type = get_market_type_for_symbol(symbol_id, symbol_name)
-
-        # Create the new symbol record
-        new_symbol = ComprehensiveSymbolData(
-            symbol_id=symbol_id,
-            symbol_name=symbol_name,
-            market_type=market_type,
-            is_active=is_active
+        logger.info("📊 شروع آپدیت داده‌های تاریخی...")
+        processed_hist_count, hist_msg = update_historical_data_limited(
+            db_session,
+            limit=limit_per_run,
+            specific_symbols_list=specific_symbols_list,
+            days_limit=days_limit
         )
-        db.session.add(new_symbol)
-        db.session.commit()
-        
-        # Now fetch and update all its data
-        update_all_data_for_symbol(symbol_id, symbol_name)
-        
-        return True, f"Symbol '{symbol_name}' added successfully and initial data fetched."
+        results["historical"]["count"] = processed_hist_count
+        results["historical"]["message"] = hist_msg
+        logger.info(hist_msg)
     except Exception as e:
-        db.session.rollback()
-        logger.error(f"Error adding new symbol {symbol_name}: {e}")
-        return False, f"An error occurred while adding symbol '{symbol_name}'."
+        error_msg = f"❌ خطا در اجرای آپدیت تاریخی: {e}"
+        results["historical"]["message"] = error_msg
+        logger.error(error_msg)
 
+    # 3. آپدیت داده‌های لحظه‌ای
+    if update_realtime:
+        try:
+            logger.info("⏰ شروع آپدیت داده‌های لحظه‌ای...")
+            realtime_count = fetch_realtime_data_for_all_symbols(db_session)
+            results["realtime"]["count"] = realtime_count
+            results["realtime"]["message"] = f"✅ اطلاعات لحظه‌ای برای {realtime_count} نماد به‌روزرسانی شد"
+            logger.info(results["realtime"]["message"])
+        except Exception as e:
+            error_msg = f"❌ خطا در اجرای آپدیت لحظه‌ای: {e}"
+            results["realtime"]["message"] = error_msg
+            logger.error(error_msg)
 
-def get_latest_close_price(symbol_id):
-    """
-    Retrieves the latest closing price for a given symbol.
-    """
-    latest_record = HistoricalData.query.filter_by(symbol_id=symbol_id).order_by(HistoricalData.date.desc()).first()
-    if latest_record:
-        return latest_record.close_price
-    return None
-
-
-def get_latest_fundamental_data_for_all_symbols():
-    """
-    Retrieves the latest fundamental data for all symbols.
-    This can be a heavy query, so it should be used with caution.
-    """
-    from sqlalchemy import distinct
-    
-    # Get the latest date for each symbol
-    latest_dates = db.session.query(
-        FundamentalData.symbol_id,
-        func.max(FundamentalData.date).label('max_date')
-    ).group_by(
-        FundamentalData.symbol_id
-    ).subquery()
-
-    # Join the latest_dates subquery with the FundamentalData table
-    latest_fundamental_data = db.session.query(
-        FundamentalData
-    ).join(
-        latest_dates,
-        (FundamentalData.symbol_id == latest_dates.c.symbol_id) & (FundamentalData.date == latest_dates.c.max_date)
-    ).all()
-    
-    results = []
-    for record in latest_fundamental_data:
-        symbol = find_symbol_by_id(record.symbol_id)
-        if symbol:
-            results.append({
-                'symbol_name': symbol.symbol_name,
-                'date': str(record.date),
-                'eps': record.eps,
-                'pe_ratio': record.pe_ratio,
-                'pe_group': record.pe_group,
-                'pb_ratio': record.pb_ratio,
-                'ps_ratio': record.ps_ratio,
-                'market_value': record.market_value
-            })
+    # 4. آپدیت داده‌های بنیادی
+    if update_fundamental:
+        try:
+            logger.info("📈 شروع آپدیت داده‌های بنیادی...")
             
+            # 🛠️ بهینه‌سازی: دریافت لیست نمادها بر اساس آخرین آپدیت
+            query = db_session.query(ComprehensiveSymbolData)
+            if specific_symbols_list:
+                symbol_conditions = [or_(ComprehensiveSymbolData.symbol_name == s, ComprehensiveSymbolData.tse_index == s) for s in specific_symbols_list]
+                query = query.filter(or_(*symbol_conditions))
+            
+            # ⚠️ اصلاح فیلتر هوشمند بر اساس ستون درست و با استفاده از timedelta
+            symbols_to_update = query.filter(
+                (ComprehensiveSymbolData.last_fundamental_update_date.is_(None)) | 
+                (ComprehensiveSymbolData.last_fundamental_update_date < (date.today() - timedelta(days=7)))
+            ).order_by(ComprehensiveSymbolData.last_fundamental_update_date.asc()).limit(limit_per_run).all()
+            
+            fundamental_count = 0
+            for symbol in symbols_to_update:
+                try:
+                    updated_count, msg = update_symbol_fundamental_data(db_session, specific_symbols_list=[symbol.tse_index])
+                    if updated_count > 0:
+                        fundamental_count += updated_count
+                        # ⚠️ آپدیت ستون زمان آخرین آپدیت
+                        symbol.last_fundamental_update_date = date.today()
+                        db_session.add(symbol)
+                        db_session.commit()
+                    time.sleep(0.1)
+                except Exception as e:
+                    logger.warning(f"⚠️ خطا در به‌روزرسانی بنیادی {symbol.symbol_name}: {e}")
+                    db_session.rollback()
+                    continue
+            
+            results["fundamental"]["count"] = fundamental_count
+            results["fundamental"]["message"] = f"✅ اطلاعات بنیادی برای {fundamental_count} نماد به‌روزرسانی شد"
+            logger.info(results["fundamental"]["message"])
+            
+        except Exception as e:
+            error_msg = f"❌ خطا در اجرای آپدیت بنیادی: {e}"
+            results["fundamental"]["message"] = error_msg
+            logger.error(error_msg)
+            db_session.rollback()
+
+    # 5. آپدیت تحلیل تکنیکال
+    if update_technical:
+        try:
+            logger.info("📉 شروع تحلیل تکنیکال...")
+            technical_count, tech_msg = run_technical_analysis(
+                db_session,
+                limit=limit_per_run,
+                symbols_list=specific_symbols_list
+            )
+            results["technical"]["count"] = technical_count
+            results["technical"]["message"] = tech_msg
+            logger.info(results["technical"]["message"])
+        except Exception as e:
+            error_msg = f"❌ خطا در اجرای تحلیل تکنیکال: {e}"
+            results["technical"]["message"] = error_msg
+            logger.error(error_msg)
+            db_session.rollback()
+
+    logger.info("✅ آپدیت کامل داده‌ها به اتمام رسید.")
+    
+    # خلاصه نتایج
+    summary = f"""
+📊 خلاصه نتایج آپدیت:
+• تاریخی: {results['historical']['count']} نماد - {results['historical']['message']}
+• لحظه‌ای: {results['realtime']['count']} نماد - {results['realtime']['message']}
+• بنیادی: {results['fundamental']['count']} نماد - {results['fundamental']['message']}
+• تکنیکال: {results['technical']['count']} نماد - {results['technical']['message']}
+    """
+    logger.info(summary)
+
+    # برای سازگاری با callerهای قدیمی، دو مقدار return می‌کنیم
     return results
 
 
-def calculate_price_change_percentage(symbol_id, days=1):
-    """
-    Calculates the price change percentage over the last `days`.
-    """
-    records = HistoricalData.query.filter_by(symbol_id=symbol_id).order_by(HistoricalData.date.desc()).limit(days + 1).all()
-    
-    if len(records) < days + 1:
-        return None, "Not enough historical data to calculate price change."
-        
-    start_price = records[-1].close_price
-    end_price = records[0].close_price
-    
-    if start_price == 0:
-        return None, "Start price is zero, cannot calculate percentage change."
-        
-    change = ((end_price - start_price) / start_price) * 100
-    
-    return change, "Price change calculated successfully."
+# ----------------------------
+# تابع initial_populate_all_symbols_and_data (نسخه اصلاح شده)
+# ----------------------------
 
-
-def get_market_types():
+def initial_populate_all_symbols_and_data(db_session, limit: int = None):
     """
-    Retrieves a list of all unique market types from the database.
-    """
-    market_types = db.session.query(distinct(ComprehensiveSymbolData.market_type)).all()
-    
-    # The result is a list of tuples, e.g., [('بورس',), ('فرابورس',)]
-    return [mt[0] for mt in market_types]
-
-
-def get_historical_data_range(symbol_id, start_date, end_date):
-    """
-    Retrieves historical data for a symbol within a specified date range.
-    Dates should be datetime.date objects.
-    """
-    records = HistoricalData.query.filter_by(symbol_id=symbol_id).filter(
-        HistoricalData.date.between(start_date, end_date)
-    ).order_by(HistoricalData.date).all()
-    
-    data_points = []
-    for record in records:
-        data_points.append({
-            'date': str(record.date),
-            'open': record.open_price,
-            'high': record.high_price,
-            'low': record.low_price,
-            'close': record.close_price,
-            'volume': record.volume,
-            'value': record.value,
-            'count': record.count
-        })
-    
-    return data_points
-
-
-def get_technical_data_range(symbol_id, start_date, end_date):
-    """
-    Retrieves technical data for a symbol within a specified date range.
-    """
-    records = TechnicalIndicatorData.query.filter_by(symbol_id=symbol_id).filter(
-        TechnicalIndicatorData.date.between(start_date, end_date)
-    ).order_by(TechnicalIndicatorData.date).all()
-    
-    data_points = []
-    for record in records:
-        data_points.append({
-            'date': str(record.date),
-            'rsi': record.rsi,
-            'macd': record.macd,
-            'macd_signal': record.macd_signal,
-            'sma_20': record.sma_20,
-            'sma_50': record.sma_50,
-            'sma_200': record.sma_200,
-            'bollinger_upper': record.bollinger_upper,
-            'bollinger_middle': record.bollinger_middle,
-            'bollinger_lower': record.bollinger_lower,
-            'volume_ma': record.volume_ma,
-            'atr': record.atr,
-            'smf': record.smf
-        })
-    
-    return data_points
-
-
-def get_fundamental_data_range(symbol_id, start_date, end_date):
-    """
-    Retrieves fundamental data for a symbol within a specified date range.
-    """
-    records = FundamentalData.query.filter_by(symbol_id=symbol_id).filter(
-        FundamentalData.date.between(start_date, end_date)
-    ).order_by(FundamentalData.date).all()
-    
-    data_points = []
-    for record in records:
-        data_points.append({
-            'date': str(record.date),
-            'eps': record.eps,
-            'pe_ratio': record.pe_ratio,
-            'pe_group': record.pe_group,
-            'pb_ratio': record.pb_ratio,
-            'ps_ratio': record.ps_ratio,
-            'base_volume': record.base_volume,
-            'closing_price': record.closing_price,
-            'total_shares': record.total_shares,
-            'market_value': record.market_value
-        })
-        
-    return data_points
-
-
-def get_most_recent_data_by_type(symbol_id, data_type):
-    """
-    Retrieves the most recent data point for a given symbol and data type.
-    """
-    if data_type.lower() == 'historical':
-        record = HistoricalData.query.filter_by(symbol_id=symbol_id).order_by(HistoricalData.date.desc()).first()
-        if record:
-            return {
-                'date': str(record.date),
-                'open': record.open_price,
-                'high': record.high_price,
-                'low': record.low_price,
-                'close': record.close_price,
-                'volume': record.volume,
-                'value': record.value,
-                'count': record.count
-            }
-    elif data_type.lower() == 'technical':
-        record = TechnicalIndicatorData.query.filter_by(symbol_id=symbol_id).order_by(TechnicalIndicatorData.date.desc()).first()
-        if record:
-            return {
-                'date': str(record.date),
-                'rsi': record.rsi,
-                'macd': record.macd,
-                'macd_signal': record.macd_signal,
-                'sma_20': record.sma_20,
-                'sma_50': record.sma_50,
-                'sma_200': record.sma_200,
-                'bollinger_upper': record.bollinger_upper,
-                'bollinger_middle': record.bollinger_middle,
-                'bollinger_lower': record.bollinger_lower,
-                'volume_ma': record.volume_ma,
-                'atr': record.atr,
-                'smf': record.smf
-            }
-    elif data_type.lower() == 'fundamental':
-        record = FundamentalData.query.filter_by(symbol_id=symbol_id).order_by(FundamentalData.date.desc()).first()
-        if record:
-            return {
-                'date': str(record.date),
-                'eps': record.eps,
-                'pe_ratio': record.pe_ratio,
-                'pe_group': record.pe_group,
-                'pb_ratio': record.pb_ratio,
-                'ps_ratio': record.ps_ratio,
-                'base_volume': record.base_volume,
-                'closing_price': record.closing_price,
-                'total_shares': record.total_shares,
-                'market_value': record.market_value
-            }
-    
-    return None
-
-
-def get_symbols_by_activity_status(is_active=True):
-    """
-    Retrieves symbols based on their active status.
-    """
-    symbols = ComprehensiveSymbolData.query.filter_by(is_active=is_active).all()
-    
-    symbol_list = []
-    for s in symbols:
-        symbol_list.append({
-            'symbol_id': s.symbol_id,
-            'symbol_name': s.symbol_name,
-            'market_type': s.market_type,
-            'is_active': s.is_active
-        })
-        
-    return symbol_list
-
-
-def set_symbol_activity_status(symbol_id, is_active):
-    """
-    Sets the active status for a given symbol.
+    تابع اولیه برای پر کردن دیتابیس با نمادها و داده‌های تاریخی، لحظه‌ای و بنیادی
     """
     try:
-        symbol = ComprehensiveSymbolData.query.filter_by(symbol_id=symbol_id).first()
-        if not symbol:
-            return False, f"Symbol with ID {symbol_id} not found."
+        logger.info("🔄 شروع فرآیند اولیه پر کردن دیتابیس...")
+        
+        # 1. دریافت نمادها از pytse-client و ذخیره در ComprehensiveSymbolData
+        logger.info("📥 دریافت نمادها از pytse-client...")
+        symbol_result = fetch_symbols_from_pytse_client(db_session, limit)
+        
+        added_count = symbol_result.get("added", 0)
+        updated_count = symbol_result.get("updated", 0)
+        
+        if added_count > 0 or updated_count > 0:
+            logger.info(f"📊 {added_count} نماد جدید اضافه شد، {updated_count} نماد به‌روزرسانی شد.")
             
-        symbol.is_active = is_active
-        db.session.commit()
-        
-        status_text = "active" if is_active else "inactive"
-        return True, f"Symbol {symbol.symbol_name} (ID: {symbol_id}) is now set to {status_text}."
+            # 2. آپدیت داده‌های تاریخی
+            logger.info("📈 آپدیت داده‌های تاریخی...")
+            processed_count, msg = update_historical_data_limited(
+                db_session, 
+                limit=limit
+            )
+            logger.info(msg)
+            
+            # 3. آپدیت داده‌های لحظه‌ای
+            logger.info("⏰ آپدیت داده‌های لحظه‌ای...")
+            realtime_count = fetch_realtime_data_for_all_symbols(db_session)
+            logger.info(f"✅ اطلاعات لحظه‌ای برای {realtime_count} نماد به‌روزرسانی شد")
+            
+            # 4. آپدیت داده‌های بنیادی
+            logger.info("📊 آپدیت داده‌های بنیادی...")
+
+            # ⚠️ اصلاح: استفاده از tse_index به جای symbol_name
+            symbols_to_update = db_session.query(ComprehensiveSymbolData.tse_index).limit(limit).all()
+            symbols_to_update = [symbol[0] for symbol in symbols_to_update]
+
+            fundamental_count = 0
+            for tse_index in symbols_to_update:
+                try:
+                    updated_count, msg = update_symbol_fundamental_data(db_session, specific_symbols_list=[tse_index])
+                    fundamental_count += updated_count
+                    time.sleep(0.2)
+                except Exception as e:
+                    logger.warning(f"⚠️ خطا در به‌روزرسانی بنیادی {tse_index}: {e}")
+                    continue
+
+            logger.info(f"✅ اطلاعات بنیادی برای {fundamental_count} نماد به‌روزرسانی شد")
+
+            # 5. اجرای تحلیل تکنیکال
+            logger.info("📉 اجرای تحلیل تکنیکال...")
+            try:
+                # ⚠️ فراخوانی با همان لیست نمادها که شامل tse_index است
+                run_technical_analysis(db_session, limit=limit, symbols_list=symbols_to_update)
+                logger.info("✅ تحلیل تکنیکال با موفقیت اجرا شد")
+            except Exception as e:
+                logger.error(f"❌ خطا در اجرای تحلیل تکنیکال: {e}")
+            
+            total_processed = added_count + updated_count
+            success_msg = f"""
+✅ فرآیند اولیه پر کردن دیتابیس کامل شد:
+• {added_count} نماد جدید اضافه شد
+• {updated_count} نماد به‌روزرسانی شد
+• {processed_count} نماد داده‌های تاریخی دریافت کردند
+• {realtime_count} نماد داده‌های لحظه‌ای دریافت کردند
+• {fundamental_count} نماد داده‌های بنیادی دریافت کردند
+            """
+            logger.info(success_msg)
+            
+            return {
+                "added": added_count,
+                "updated": updated_count,
+                "historical": processed_count,
+                "realtime": realtime_count,
+                "fundamental": fundamental_count,
+                "message": success_msg
+            }
+        else:
+            logger.info("ℹ️ هیچ نماد جدیدی اضافه یا به‌روزرسانی نشد.")
+            return {
+                "added": 0,
+                "updated": 0,
+                "historical": 0,
+                "realtime": 0,
+                "fundamental": 0,
+                "message": "ℹ️ هیچ نماد جدیدی اضافه یا به‌روزرسانی نشد."
+            }
+            
     except Exception as e:
-        db.session.rollback()
-        logger.error(f"Error setting activity status for symbol ID {symbol_id}: {e}")
-        return False, f"An error occurred while setting the activity status."
+        error_msg = f"❌ خطا در فرآیند اولیه پر کردن دیتابیس: {e}"
+        logger.error(error_msg)
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        return {
+            "added": 0,
+            "updated": 0,
+            "historical": 0,
+            "realtime": 0,
+            "fundamental": 0,
+            "message": error_msg
+        }
 
 
-def get_database_statistics():
+# ----------------------------
+# توابع تحلیل تکنیکال
+# ----------------------------
+
+# ----------------------------
+# تابع run_technical_analysis (نسخه بازنویسی شده نهایی)
+# ----------------------------
+
+def run_technical_analysis(db_session: Session, limit: int = None, symbols_list: list = None):
     """
-    Provides statistics about the database content.
+    اجرای تحلیل تکنیکال برای نمادها با استفاده از داده‌های تاریخی کامل.
+    این تابع از کلاس HistoricalData برای کوئری گرفتن از جدول 'stock_data' استفاده می‌کند.
     """
     try:
-        total_symbols = db.session.query(ComprehensiveSymbolData).count()
-        active_symbols = db.session.query(ComprehensiveSymbolData).filter_by(is_active=True).count()
+        logger.info("📈 شروع تحلیل تکنیکال...")
+
+        # 🛠️ توجه: در SQLAlchemy ORM، از نام کلاس (HistoricalData) استفاده می‌شود،
+        # و ORM آن را به نام جدول (stock_data) نگاشت می‌کند.
+        query = db_session.query(
+            HistoricalData.symbol_id,
+            HistoricalData.symbol_name,
+            HistoricalData.date,
+            HistoricalData.jdate,
+            HistoricalData.open,
+            HistoricalData.close,
+            HistoricalData.high,
+            HistoricalData.low,
+            HistoricalData.volume,
+            HistoricalData.final,
+            HistoricalData.yesterday_price,
+            HistoricalData.plc,
+            HistoricalData.plp,
+            HistoricalData.pcc,
+            HistoricalData.pcp,
+            HistoricalData.mv,
+            HistoricalData.buy_count_i,
+            HistoricalData.buy_count_n,
+            HistoricalData.sell_count_i,
+            HistoricalData.sell_count_n,
+            HistoricalData.buy_i_volume,
+            HistoricalData.buy_n_volume,
+            HistoricalData.sell_i_volume,
+            HistoricalData.sell_n_volume
+        )
         
-        total_historical_records = db.session.query(HistoricalData).count()
-        total_technical_records = db.session.query(TechnicalIndicatorData).count()
-        total_fundamental_records = db.session.query(FundamentalData).count()
+        if symbols_list:
+            symbol_conditions = []
+            for symbol_identifier in symbols_list:
+                if str(symbol_identifier).isdigit():
+                    symbol_conditions.append(HistoricalData.symbol_id == symbol_identifier)
+                else:
+                    symbol_conditions.append(HistoricalData.symbol_name == symbol_identifier)
+            query = query.filter(or_(*symbol_conditions))
+        
+        query = query.order_by(HistoricalData.symbol_id, HistoricalData.date)
 
-        latest_historical_date = db.session.query(func.max(HistoricalData.date)).scalar()
-        latest_technical_date = db.session.query(func.max(TechnicalIndicatorData.date)).scalar()
-        latest_fundamental_date = db.session.query(func.max(FundamentalData.date)).scalar()
+        historical_data = query.all()
 
-        stats = {
+        if not historical_data:
+            logger.warning("⚠️ هیچ داده تاریخی برای تحلیل تکنیکال یافت نشد.")
+            return 0
+
+        columns = [
+            'symbol_id', 'symbol_name', 'date', 'jdate', 'open', 'close', 'high', 'low', 'volume',
+            'final', 'yesterday_price', 'plc', 'plp', 'pcc', 'pcp', 'mv',
+            'buy_count_i', 'buy_count_n', 'sell_count_i', 'sell_count_n',
+            'buy_i_volume', 'buy_n_volume', 'sell_i_volume', 'sell_n_volume'
+        ]
+        df = pd.DataFrame(historical_data, columns=columns)
+        
+        grouped = df.groupby('symbol_id')
+        processed_count = 0
+        success_count = 0
+        error_count = 0
+        
+        logger.info(f"🔍 یافت شد {len(grouped)} نماد برای تحلیل تکنیکال")
+
+        for symbol_id, group_df in grouped:
+            processed_count += 1
+            try:
+                calculate_technical_indicators(db_session, symbol_id, group_df)
+                success_count += 1
+                
+                if processed_count % 10 == 0:
+                    logger.info(f"📊 پیشرفت تحلیل تکنیکال: {processed_count}/{len(grouped)} نماد")
+                    
+            except Exception as e:
+                error_count += 1
+                logger.error(f"❌ خطا در تحلیل تکنیکال برای نماد با ID {symbol_id}: {e}")
+                
+        logger.info(f"✅ تحلیل تکنیکال کامل شد. {success_count} نماد موفق، {error_count} خطا")
+        return success_count, f"تحلیل تکنیکال کامل شد. {success_count} نماد موفق، {error_count} خطا"
+
+    except Exception as e:
+        logger.error(f"❌ خطا در اجرای تحلیل تکنیکال: {e}")
+        # 🛠️ اصلاح: در صورت خطا، tuple برگردانید
+        return 0, f"خطا در اجرای تحلیل تکنیکال: {e}"
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+
+
+# ----------------------------
+# توابع کمکی برای محاسبه اندیکاتورها
+# ----------------------------
+
+def calculate_sma(series: pd.Series, period: int) -> pd.Series:
+    """محاسبه میانگین متحرک ساده (SMA)"""
+    return series.rolling(window=period).mean()
+
+def calculate_volume_ma(series: pd.Series, period: int) -> pd.Series:
+    """محاسبه میانگین متحرک حجم"""
+    return series.rolling(window=period).mean()
+
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """محاسبه RSI"""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
+    """محاسبه MACD"""
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    macd_histogram = macd - macd_signal
+    return macd, macd_signal, macd_histogram
+
+def calculate_bollinger_bands(series: pd.Series, period: int = 20, std_dev: int = 2) -> tuple:
+    """محاسبه Bollinger Bands"""
+    middle = series.rolling(window=period).mean()
+    std = series.rolling(window=period).std()
+    upper = middle + (std * std_dev)
+    lower = middle - (std * std_dev)
+    return upper, middle, lower
+
+def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """محاسبه ATR (Average True Range)"""
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
+
+# ----------------------------
+# توابع اصلی تحلیل تکنیکال
+# ----------------------------
+
+def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    محاسبه تمام اندیکاتورهای تکنیکال مورد نیاز و اضافه کردن آنها به DataFrame.
+    """
+    
+    # اطمینان از اینکه دیتافریم خالی نیست و دارای ستون‌های ضروری است
+    if df.empty or not {'open', 'high', 'low', 'close', 'volume'}.issubset(df.columns):
+        logger.warning("DataFrame خالی است یا ستون‌های لازم را ندارد.")
+        return df
+
+    try:
+        # تبدیل ستون‌ها به نوع عددی و حذف مقادیر نامعتبر
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if not pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.dropna(subset=['open', 'high', 'low', 'close', 'volume'], inplace=True)
+
+        if df.empty:
+            logger.warning("پس از تبدیل و پاکسازی، دیتای معتبری برای محاسبه اندیکاتورها باقی نماند.")
+            return df
+        
+        # محاسبه RSI
+        df['RSI'] = calculate_rsi(df['close'])
+        
+        # محاسبه MACD
+        macd, signal, histogram = calculate_macd(df['close'])
+        df['MACD'] = macd
+        df['MACD_Signal'] = signal
+        df['MACD_Histogram'] = histogram
+        
+        # محاسبه میانگین متحرک ساده (SMA)
+        df['SMA_20'] = calculate_sma(df['close'], 20)
+        df['SMA_50'] = calculate_sma(df['close'], 50)
+        
+        # محاسبه نوارهای بولینگر (Bollinger Bands)
+        upper, middle, lower = calculate_bollinger_bands(df['close'])
+        df['Bollinger_Upper'] = upper
+        df['Bollinger_Middle'] = middle
+        df['Bollinger_Lower'] = lower
+        
+        # محاسبه میانگین متحرک حجم (Volume Moving Average)
+        df['Volume_MA_20'] = calculate_volume_ma(df['volume'], 20)
+        
+        # محاسبه ATR (Average True Range)
+        df['ATR'] = calculate_atr(df['high'], df['low'], df['close'])
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در محاسبه اندیکاتورها در تابع calculate_all_indicators: {e}")
+        return df
+
+    return df
+
+# ----------------------------
+# تابع calculate_technical_indicators (نسخه بازنویسی شده نهایی)
+# ----------------------------
+
+def calculate_technical_indicators(db_session: Session, symbol_id: int, df: pd.DataFrame):
+    """
+    محاسبه و ذخیره اندیکاتورهای تکنیکال برای یک نماد با استفاده از DataFrame ورودی.
+    
+    Args:
+        db_session: جلسه پایگاه داده SQLAlchemy.
+        symbol_id: شناسه نماد.
+        df: DataFrame حاوی داده‌های تاریخی کامل نماد.
+    """
+    try:
+        if df.empty:
+            logger.warning(f"⚠️ DataFrame ورودی برای نماد با ID {symbol_id} خالی است.")
+            return
+            
+        # 1. آماده‌سازی داده‌ها
+        # 🛠️ اصلاح: از ستون 'date' که یک datetime معتبر است استفاده می‌کنیم و آن را به عنوان ایندکس قرار می‌دهیم.
+        df.set_index('date', inplace=True)
+        
+        # 2. محاسبه اندیکاتورها
+        df = calculate_all_indicators(df)
+        
+        # 3. آماده‌سازی داده‌ها برای bulk insert
+        df.replace({np.nan: None}, inplace=True)
+        df.reset_index(inplace=True) # بازگرداندن date از ایندکس به ستون
+        
+        # تنها ستون‌هایی که می‌خواهید ذخیره کنید را انتخاب کنید
+        # ⚠️ اطمینان حاصل کنید که ستون‌های 'date' و 'jdate' از قبل در DataFrame وجود دارند.
+        # ستون date برای کوئری به دیتابیس نیاز است.
+        records_to_insert = df.filter(items=[
+            'date', 'jdate', 'close', 'RSI', 'MACD', 'MACD_Signal', 'MACD_Histogram', 
+            'SMA_20', 'SMA_50', 'Bollinger_Upper', 'Bollinger_Lower', 
+            'Bollinger_Middle', 'Volume_MA_20', 'ATR'
+        ]).to_dict('records')
+
+        # افزودن symbol_id به هر رکورد و تغییر نام ستون‌ها
+        for record in records_to_insert:
+            record['symbol_id'] = symbol_id
+            record['close_price'] = record.pop('close', None)
+            record['MACD_Hist'] = record.pop('MACD_Histogram', None)
+            record['Bollinger_High'] = record.pop('Bollinger_Upper', None)
+            record['Bollinger_Low'] = record.pop('Bollinger_Lower', None)
+            record['Bollinger_MA'] = record.pop('Bollinger_Middle', None)
+            record['Volume_MA_20'] = record.pop('Volume_MA_20', None)
+            
+        # 4. شناسایی رکوردهای جدید برای جلوگیری از تکرار
+        # 🛠️ اصلاح: استفاده از 'jdate' برای کوئری به دیتابیس که در مدل شما وجود دارد.
+        existing_dates = db_session.query(TechnicalIndicatorData.jdate)\
+                                    .filter(TechnicalIndicatorData.symbol_id == symbol_id)\
+                                    .all()
+        # تبدیل تاریخ‌های موجود به یک مجموعه (Set) از تاریخ‌های شمسی
+        existing_dates_set = {str(d[0]) for d in existing_dates}
+        
+        # فیلتر کردن رکوردهای جدید
+        new_records_to_add = [
+            record for record in records_to_insert 
+            # 🛠️ اصلاح: مقایسه با تاریخ شمسی
+            if str(record['jdate']) not in existing_dates_set
+        ]
+
+        if not new_records_to_add:
+            logger.info(f"ℹ️ تحلیل تکنیکال برای نماد {symbol_id} به‌روز بود و نیازی به درج رکورد جدید نبود.")
+            return
+
+        # 5. استفاده از bulk_insert_mappings برای عملکرد بهتر
+        db_session.bulk_insert_mappings(TechnicalIndicatorData, new_records_to_add)
+        db_session.commit()
+        logger.info(f"✅ {len(new_records_to_add)} رکورد تحلیل تکنیکال برای نماد {symbol_id} با موفقیت درج شد.")
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در محاسبه اندیکاتورهای تکنیکال برای نماد {symbol_id}: {e}")
+        db_session.rollback()
+        return 0, f"خطا در تحلیل تکنیکال: {e}"
+
+# ----------------------------
+# توابع آپدیت داده‌های بنیادی (برای سازگاری)
+# ----------------------------
+
+def update_comprehensive_symbol_data(db_session: Session, symbols_list: list = None):
+    """
+    آپدیت داده‌های بنیادی نمادها
+    """
+    try:
+        logger.info("📊 شروع آپدیت داده‌های بنیادی...")
+        
+        query = db_session.query(ComprehensiveSymbolData)
+        if symbols_list:
+            # اگر لیست شامل idهای ComprehensiveSymbolData است
+            if all(isinstance(x, int) for x in symbols_list):
+                query = query.filter(ComprehensiveSymbolData.id.in_(symbols_list))
+            # اگر لیست شامل نام نمادها است
+            else:
+                query = query.filter(ComprehensiveSymbolData.symbol_name.in_(symbols_list))
+            
+        symbols = query.all()
+        
+        processed_count = 0
+        for symbol in symbols:
+            try:
+                # اصلاحیه: استفاده از symbol_name و symbol_index
+                fundamental_data = fetch_fundamental_data(symbol.symbol_name, symbol.tse_index) # در این تابع ورودی را اصلاح کنید.
+                
+                if fundamental_data:
+                    # ذخیره داده‌های بنیادی
+                    save_fundamental_data(db_session, symbol.id, fundamental_data)
+                    processed_count += 1
+                    
+            except Exception as e:
+                logger.error(f"❌ خطا در آپدیت داده‌های بنیادی برای نماد {symbol.symbol_name}: {e}")
+        
+        logger.info(f"✅ آپدیت داده‌های بنیادی کامل شد. {processed_count} نماد پردازش شد.")
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در اجرای آپدیت بنیادی: {e}")
+
+def fetch_fundamental_data(symbol_name: str, symbol_index: str) -> dict:
+    """
+    دریافت داده‌های بنیادی از pytse-client
+    """
+    try:
+        # اینجا از symbol_name و symbol_index استفاده می‌کنید
+        ticker = tse.Ticker(symbol_name, index=symbol_index)
+        
+        fundamental_data = {
+            'p_e': ticker.p_e_ratio,
+            'eps': ticker.eps,
+            'p_s': ticker.p_s_ratio,
+            'p_b': ticker.p_b_ratio,
+            'dividend_yield': ticker.dividend_yield,
+            'market_cap': ticker.market_cap,
+            'shares_outstanding': ticker.shares_outstanding,
+            'float_shares': ticker.float_shares,
+            'base_volume': ticker.base_volume,
+            'sector_pe': ticker.sector_pe,
+            'group_pe': ticker.group_pe,
+            'sector_pb': ticker.sector_pb,
+            'group_pb': ticker.group_pb,
+            'sector_eps': ticker.sector_eps,
+            'group_eps': ticker.group_eps,
+            'sector_dividend_yield': ticker.sector_dividend_yield,
+            'group_dividend_yield': ticker.group_dividend_yield
+        }
+        
+        return fundamental_data
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در دریافت داده‌های بنیادی برای {symbol_name}: {e}")
+        return {}
+
+def save_fundamental_data(db_session: Session, symbol_id: int, fundamental_data: dict):
+    """
+    ذخیره داده‌های بنیادی در دیتابیس
+    """
+    try:
+        existing_data = db_session.query(FundamentalData).filter_by(symbol_id=symbol_id).first()
+        
+        if existing_data:
+            # آپدیت داده موجود
+            for key, value in fundamental_data.items():
+                if hasattr(existing_data, key):
+                    setattr(existing_data, key, value)
+        else:
+            # ایجاد داده جدید
+            new_data = FundamentalData(
+                symbol_id=symbol_id,
+                p_e=fundamental_data.get('p_e'),
+                eps=fundamental_data.get('eps'),
+                p_s=fundamental_data.get('p_s'),
+                p_b=fundamental_data.get('p_b'),
+                dividend_yield=fundamental_data.get('dividend_yield'),
+                market_cap=fundamental_data.get('market_cap'),
+                shares_outstanding=fundamental_data.get('shares_outstanding'),
+                float_shares=fundamental_data.get('float_shares'),
+                base_volume=fundamental_data.get('base_volume'),
+                sector_pe=fundamental_data.get('sector_pe'),
+                group_pe=fundamental_data.get('group_pe'),
+                sector_pb=fundamental_data.get('sector_pb'),
+                group_pb=fundamental_data.get('group_pb'),
+                sector_eps=fundamental_data.get('sector_eps'),
+                group_eps=fundamental_data.get('group_eps'),
+                sector_dividend_yield=fundamental_data.get('sector_dividend_yield'),
+                group_dividend_yield=fundamental_data.get('group_dividend_yield')
+            )
+            db_session.add(new_data)
+            
+        db_session.commit()
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در ذخیره داده‌های بنیادی: {e}")
+        db_session.rollback()
+
+# ----------------------------
+# توابع مدیریت حافظه و بهینه‌سازی
+# ----------------------------
+
+def cleanup_memory():
+    """پاکسازی حافظه"""
+    try:
+        gc.collect()
+        current_memory = check_memory_usage_mb()
+        if current_memory > MEMORY_LIMIT_MB:
+            logger.warning(f"⚠️ مصرف حافظه بالا: {current_memory:.2f} MB")
+    except Exception as e:
+        logger.debug(f"خطا در پاکسازی حافظه: {e}")
+
+def batch_process_symbols(symbols: list, process_func: callable, batch_size: int = DEFAULT_BATCH_SIZE):
+    """پردازش دسته‌ای نمادها"""
+    results = []
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
+        batch_results = []
+        
+        for symbol in batch:
+            try:
+                result = process_func(symbol)
+                batch_results.append(result)
+            except Exception as e:
+                logger.error(f"❌ خطا در پردازش نماد {symbol}: {e}")
+                batch_results.append(None)
+                
+        results.extend(batch_results)
+        
+        # پاکسازی حافظه بعد از هر بچ
+        cleanup_memory()
+        
+    return results
+
+# ----------------------------
+# توابع گزارش‌گیری و مانیتورینگ
+# ----------------------------
+
+def get_data_status_report(db_session: Session) -> dict:
+    """
+    گزارش وضعیت داده‌های موجود در دیتابیس
+    """
+    try:
+        total_symbols = db_session.query(ComprehensiveSymbolData).count()
+        symbols_with_historical = db_session.query(
+            func.count(distinct(HistoricalData.symbol_id))
+        ).scalar()
+        symbols_with_technical = db_session.query(
+            func.count(distinct(TechnicalIndicatorData.symbol_id))
+        ).scalar()
+        symbols_with_fundamental = db_session.query(
+            func.count(distinct(FundamentalData.symbol_id))
+        ).scalar()
+        
+        total_historical_records = db_session.query(HistoricalData).count()
+        total_technical_records = db_session.query(TechnicalIndicatorData).count()
+        
+        latest_historical_date = db_session.query(
+            func.max(HistoricalData.date)
+        ).scalar()
+        
+        return {
             'total_symbols': total_symbols,
-            'active_symbols': active_symbols,
+            'symbols_with_historical': symbols_with_historical,
+            'symbols_with_technical': symbols_with_technical,
+            'symbols_with_fundamental': symbols_with_fundamental,
             'total_historical_records': total_historical_records,
             'total_technical_records': total_technical_records,
-            'total_fundamental_records': total_fundamental_records,
-            'latest_data_dates': {
-                'historical': str(latest_historical_date) if latest_historical_date else None,
-                'technical': str(latest_technical_date) if latest_technical_date else None,
-                'fundamental': str(latest_fundamental_date) if latest_fundamental_date else None
-            }
+            'latest_historical_date': latest_historical_date,
+            'historical_coverage': f"{symbols_with_historical}/{total_symbols}",
+            'technical_coverage': f"{symbols_with_technical}/{total_symbols}",
+            'fundamental_coverage': f"{symbols_with_fundamental}/{total_symbols}"
         }
-        return stats, "Database statistics retrieved successfully."
+        
     except Exception as e:
-        logger.error(f"Error retrieving database statistics: {e}")
-        return None, "An error occurred while retrieving database statistics."
+        logger.error(f"❌ خطا در تهیه گزارش وضعیت: {e}")
+        return {}
 
-
-def update_and_get_all_data_for_symbol(symbol_id, symbol_name, days_limit=365):
+def check_data_consistency(db_session: Session) -> dict:
     """
-    A single function to update all data and then retrieve it for a given symbol.
+    بررسی سازگاری داده‌ها در دیتابیس
     """
-    # First, run the update process
-    update_all_data_for_symbol(symbol_id, symbol_name, days_limit)
+    try:
+        # بررسی نمادهایی که داده تاریخی دارند اما تحلیل تکنیکال ندارند
+        symbols_missing_technical = db_session.query(ComprehensiveSymbolData).filter(
+            ComprehensiveSymbolData.id.in_(
+                db_session.query(HistoricalData.symbol_id).distinct()
+            ),
+            ~ComprehensiveSymbolData.id.in_(
+                db_session.query(TechnicalIndicatorData.symbol_id).distinct()
+            )
+        ).count()
+        
+        # بررسی نمادهایی که داده تاریخی دارند اما داده بنیادی ندارند
+        symbols_missing_fundamental = db_session.query(ComprehensiveSymbolData).filter(
+            ComprehensiveSymbolData.id.in_(
+                db_session.query(HistoricalData.symbol_id).distinct()
+            ),
+            ~ComprehensiveSymbolData.id.in_(
+                db_session.query(FundamentalData.symbol_id).distinct()
+            )
+        ).count()
+        
+        # بررسی داده‌های تکراری
+        duplicate_historical = db_session.query(
+            HistoricalData.symbol_id,
+            HistoricalData.date,
+            func.count('*')
+        ).group_by(
+            HistoricalData.symbol_id,
+            HistoricalData.date
+        ).having(func.count('*') > 1).count()
+        
+        return {
+            'symbols_missing_technical': symbols_missing_technical,
+            'symbols_missing_fundamental': symbols_missing_fundamental,
+            'duplicate_historical_records': duplicate_historical,
+            'issues_found': symbols_missing_technical + symbols_missing_fundamental + duplicate_historical > 0
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در بررسی سازگاری داده‌ها: {e}")
+        return {}
 
-    # Then, retrieve and return all the data
-    return get_all_data_for_symbol(symbol_id)
+# ----------------------------
+# توابع بازیابی و تعمیر داده‌ها
+# ----------------------------
+
+def repair_missing_data(db_session: Session, data_type: str = 'all', limit: int = 50):
+    """
+    تعمیر داده‌های از دست رفته
+    """
+    try:
+        logger.info(f"🔧 شروع تعمیر داده‌های از دست رفته ({data_type})...")
+        
+        if data_type in ['historical', 'all']:
+            # تعمیر داده‌های تاریخی
+            symbols_missing_historical = db_session.query(ComprehensiveSymbolData).filter(
+                ~ComprehensiveSymbolData.id.in_(
+                    db_session.query(HistoricalData.symbol_id).distinct()
+                )
+            ).limit(limit).all()
+            
+            if symbols_missing_historical:
+                # استفاده از idهای ComprehensiveSymbolData
+                symbol_ids = [s.id for s in symbols_missing_historical]
+                processed_count, msg = update_historical_data_limited(
+                    db_session,
+                    limit_per_run=limit,
+                    specific_symbols_list=symbol_ids
+                )
+                logger.info(f"✅ تعمیر داده‌های تاریخی: {msg}")
+        
+        if data_type in ['technical', 'all']:
+            # تعمیر داده‌های تکنیکال
+            symbols_missing_technical = db_session.query(ComprehensiveSymbolData).filter(
+                ComprehensiveSymbolData.id.in_(
+                    db_session.query(HistoricalData.symbol_id).distinct()
+                ),
+                ~ComprehensiveSymbolData.id.in_(
+                    db_session.query(TechnicalIndicatorData.symbol_id).distinct()
+                )
+            ).limit(limit).all()
+            
+            if symbols_missing_technical:
+                # استفاده از idهای ComprehensiveSymbolData
+                symbol_ids = [s.id for s in symbols_missing_technical]
+                run_technical_analysis(
+                    db_session,
+                    limit=limit,
+                    symbols_list=symbol_ids
+                )
+                logger.info(f"✅ تعمیر داده‌های تکنیکال برای {len(symbols_missing_technical)} نماد")
+        
+        if data_type in ['fundamental', 'all']:
+            # تعمیر داده‌های بنیادی
+            symbols_missing_fundamental = db_session.query(ComprehensiveSymbolData).filter(
+                ComprehensiveSymbolData.id.in_(
+                    db_session.query(HistoricalData.symbol_id).distinct()
+                ),
+                ~ComprehensiveSymbolData.id.in_(
+                    db_session.query(FundamentalData.symbol_id).distinct()
+                )
+            ).limit(limit).all()
+            
+            if symbols_missing_fundamental:
+                # استفاده از idهای ComprehensiveSymbolData
+                symbol_ids = [s.id for s in symbols_missing_fundamental]
+                update_comprehensive_symbol_data(
+                    db_session,
+                    symbols_list=symbol_ids
+                )
+                logger.info(f"✅ تعمیر داده‌های بنیادی برای {len(symbols_missing_fundamental)} نماد")
+                
+        logger.info("✅ تعمیر داده‌ها کامل شد.")
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در تعمیر داده‌ها: {e}")
+        raise
+
+def cleanup_duplicate_data(db_session: Session):
+    """
+    پاکسازی داده‌های تکراری
+    """
+    try:
+        logger.info("🧹 شروع پاکسازی داده‌های تکراری...")
+        
+        # حذف داده‌های تاریخی تکراری
+        duplicate_historical = db_session.query(
+            HistoricalData.symbol_id,
+            HistoricalData.date
+        ).group_by(
+            HistoricalData.symbol_id,
+            HistoricalData.date
+        ).having(func.count('*') > 1).all()
+        
+        for symbol_id, date in duplicate_historical:
+            # نگه داشتن تنها اولین رکورد
+            records_to_keep = db_session.query(HistoricalData).filter_by(
+                symbol_id=symbol_id,
+                date=date
+            ).order_by(HistoricalData.id).first()
+            
+            if records_to_keep:
+                db_session.query(HistoricalData).filter_by(
+                    symbol_id=symbol_id,
+                    date=date
+                ).filter(HistoricalData.id != records_to_keep.id).delete()
+        
+        db_session.commit()
+        logger.info(f"✅ پاکسازی داده‌های تکراری کامل شد. {len(duplicate_historical)} رکورد تکراری حذف شد.")
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در پاکسازی داده‌های تکراری: {e}")
+        db_session.rollback()
+
+# ----------------------------
+# توابع اصلی برای endpointها
+# ----------------------------
+
+def run_full_update_with_limits(limit_per_run: int = 100, days_limit: int = 365):
+    """
+    اجرای آپدیت کامل با محدودیت‌های مشخص
+    """
+    try:
+        session = get_session_local()
+        try:
+            run_full_data_update(
+                session,
+                limit_per_run=limit_per_run,
+                days_limit=days_limit
+            )
+            return True, "آپدیت کامل با موفقیت انجام شد"
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در اجرای آپدیت کامل: {e}")
+        return False, f"خطا در آپدیت کامل: {str(e)}"
+
+def run_historical_update_only(limit_per_run: int = 100, days_limit: int = 365):
+    """
+    اجرای تنها آپدیت داده‌های تاریخی
+    """
+    try:
+        session = get_session_local()
+        try:
+            processed_count, msg = update_historical_data_limited(
+                session,
+                limit_per_run=limit_per_run,
+                days_limit=days_limit
+            )
+            return True, msg
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در آپدیت داده‌های تاریخی: {e}")
+        return False, f"خطا در آپدیت داده‌های تاریخی: {str(e)}"
+
+def run_technical_update_only(limit: int = 100):
+    """
+    اجرای تنها آپدیت تحلیل تکنیکال
+    """
+    try:
+        session = get_session_local()
+        try:
+            run_technical_analysis(session, limit=limit)
+            return True, "آپدیت تحلیل تکنیکال با موفقیت انجام شد"
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در آپدیت تحلیل تکنیکال: {e}")
+        return False, f"خطا در آپدیت تحلیل تکنیکال: {str(e)}"
+
+def run_fundamental_update_only():
+    """
+    اجرای تنها آپدیت داده‌های بنیادی
+    """
+    try:
+        session = get_session_local()
+        try:
+            update_comprehensive_symbol_data(session)
+            return True, "آپدیت داده‌های بنیادی با موفقیت انجام شد"
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در آپدیت داده‌های بنیادی: {e}")
+        return False, f"خطا در آپدیت داده‌های بنیادی: {str(e)}"
+
+def get_status_report():
+    """
+    دریافت گزارش وضعیت
+    """
+    try:
+        session = get_session_local()
+        try:
+            status = get_data_status_report(session)
+            consistency = check_data_consistency(session)
+            
+            report = {
+                'status': status,
+                'consistency': consistency,
+                'timestamp': datetime.now().isoformat(),
+                'memory_usage_mb': check_memory_usage_mb()
+            }
+            
+            return True, report
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در دریافت گزارش وضعیت: {e}")
+        return False, f"خطا در دریافت گزارش وضعیت: {str(e)}"
+
+def run_data_repair(data_type: str = 'all', limit: int = 50):
+    """
+    اجرای تعمیر داده‌ها
+    """
+    try:
+        session = get_session_local()
+        try:
+            repair_missing_data(session, data_type=data_type, limit=limit)
+            return True, "تعمیر داده‌ها با موفقیت انجام شد"
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در تعمیر داده‌ها: {e}")
+        return False, f"خطا در تعمیر داده‌ها: {str(e)}"
+
+def run_cleanup_duplicates():
+    """
+    اجرای پاکسازی داده‌های تکراری
+    """
+    try:
+        session = get_session_local()
+        try:
+            cleanup_duplicate_data(session)
+            return True, "پاکسازی داده‌های تکراری با موفقیت انجام شد"
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در پاکسازی داده‌های تکراری: {e}")
+        return False, f"خطا در پاکسازی داده‌های تکراری: {str(e)}"
+
+# ----------------------------
+# توابع کمکی برای مدیریت نمادها
+# ----------------------------
+
+def add_single_symbol(db_session: Session, symbol_name: str) -> Tuple[bool, str]:
+    """
+    اضافه کردن یک نماد جدید به دیتابیس و دریافت داده‌های اولیه آن.
+    """
+    logger.info(f"📥 تلاش برای افزودن نماد {symbol_name}...")
+    
+    try:
+        # گام ۱: دریافت اطلاعات نماد اصلی و بررسی اعتبار
+        import pytse_client as tse
+        ticker = tse.Ticker(symbol_name)
+        
+        tse_index = getattr(ticker, 'index', None)
+        if not tse_index:
+            return False, f"⚠️ نماد {symbol_name} شناسه بورس ندارد و نمی‌تواند اضافه شود."
+            
+        # بررسی وجود نماد در دیتابیس بر اساس tse_index
+        existing_symbol = db_session.query(ComprehensiveSymbolData).filter_by(tse_index=tse_index).first()
+        if existing_symbol:
+            return False, f"ℹ️ نماد {symbol_name} از قبل در دیتابیس وجود دارد."
+
+        # ایجاد نماد جدید با استفاده از tse_index به عنوان symbol_id
+        now = datetime.now()
+        new_symbol = ComprehensiveSymbolData(
+            symbol_id=tse_index,
+            tse_index=tse_index,
+            symbol_name=symbol_name,
+            company_name=getattr(ticker, 'title', ''),
+            isin=getattr(ticker, 'isin', None),
+            market_type=getattr(ticker, 'flow', ''),
+            group_name=getattr(ticker, 'group_name', ''),
+            base_volume=getattr(ticker, 'base_volume', None),
+            eps=getattr(ticker, 'eps', None),
+            p_e_ratio=getattr(ticker, 'p_e_ratio', None),
+            p_s_ratio=getattr(ticker, 'p_s_ratio', None),
+            nav=getattr(ticker, 'nav', None),
+            float_shares=getattr(ticker, 'float_shares', None),
+            market_cap=getattr(ticker, 'market_cap', None),
+            industry=getattr(ticker, 'industry', None),
+            capital=getattr(ticker, 'capital', None),
+            fiscal_year=getattr(ticker, 'fiscal_year', None),
+            flow=getattr(ticker, 'flow', None),
+            state=getattr(ticker, 'state', None),
+            last_historical_update_date=None,
+            last_fundamental_update_date=None,
+            last_realtime_update=None,
+            created_at=now,
+            updated_at=now
+        )
+        
+        db_session.add(new_symbol)
+        db_session.commit()
+        
+        logger.info(f"✅ نماد {symbol_name} با موفقیت به دیتابیس اضافه شد. شناسه: {new_symbol.symbol_id}")
+
+        # گام ۲: دریافت و ذخیره داده‌های تاریخی با تابع اختصاصی
+        hist_updated_count, hist_msg = fetch_and_process_historical_data(db_session, specific_symbols_list=[new_symbol.symbol_name])
+        logger.info(f"📊 دیتای تاریخی برای {symbol_name}: {hist_updated_count} رکورد به‌روزرسانی شد. {hist_msg}")
+        
+        # گام ۳: دریافت و ذخیره داده‌های بنیادی با تابع اختصاصی
+        fund_updated_count, fund_msg = update_symbol_fundamental_data(db_session, specific_symbols_list=[new_symbol.symbol_name])
+        logger.info(f"📊 دیتای بنیادی برای {symbol_name}: {fund_updated_count} رکورد به‌روزرسانی شد. {fund_msg}")
+        
+        # گام ۴: اجرای تحلیل تکنیکال با استفاده از شناسه صحیح
+        calculate_technical_indicators(db_session, specific_symbols_list=[new_symbol.symbol_name])
+        logger.info(f"📈 تحلیل تکنیکال برای نماد {symbol_name} اجرا شد.")
+        
+        return True, f"✅ نماد {symbol_name} و داده‌های اولیه آن با موفقیت اضافه شدند."
+
+    except Exception as e:
+        db_session.rollback()
+        logger.error(f"❌ خطا در افزودن نماد {symbol_name}: {e}")
+        return False, f"❌ خطا در افزودن نماد: {str(e)}"
+
+
+def remove_symbol(symbol_name: str):
+    """
+    حذف یک نماد از دیتابیس
+    """
+    try:
+        session = get_session_local()
+        try:
+            # پیدا کردن نماد در ComprehensiveSymbolData
+            symbol = session.query(ComprehensiveSymbolData).filter_by(symbol_id=symbol_name).first()
+            if not symbol:
+                return False, "نماد یافت نشد"
+            
+            # حذف داده‌های وابسته
+            session.query(HistoricalData).filter_by(symbol_id=symbol.id).delete()
+            session.query(TechnicalIndicatorData).filter_by(symbol_id=symbol.id).delete()
+            session.query(FundamentalData).filter_by(symbol_id=symbol.id).delete()
+            
+            # حذف خود نماد
+            session.delete(symbol)
+            session.commit()
+            
+            return True, f"نماد {symbol_name} با موفقیت حذف شد"
+            
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در حذف نماد {symbol_name}: {e}")
+        return False, f"خطا در حذف نماد: {str(e)}"
+
+def update_symbol_info(symbol_name: str):
+    """
+    آپدیت اطلاعات یک نماد
+    """
+    try:
+        session = get_session_local()
+        try:
+            # پیدا کردن نماد در ComprehensiveSymbolData
+            symbol = session.query(ComprehensiveSymbolData).filter_by(symbol_id=symbol_name).first()
+            if not symbol:
+                return False, "نماد یافت نشد"
+            
+            # دریافت اطلاعات به روز از pytse-client
+            ticker = tse.Ticker(symbol_name)
+            if not ticker:
+                return False, "خطا در دریافت اطلاعات نماد"
+            
+            # آپدیت اطلاعات نماد
+            symbol.symbol_name = getattr(ticker, 'title', symbol_name)
+            symbol.company_name = getattr(ticker, 'company_name', symbol.company_name)
+            symbol.market_type = getattr(ticker, 'market', symbol.market_type)
+            symbol.group_name = getattr(ticker, 'group_name', symbol.group_name)
+            symbol.base_volume = getattr(ticker, 'base_volume', symbol.base_volume)
+            symbol.updated_at = datetime.now()
+            
+            session.commit()
+            
+            return True, f"اطلاعات نماد {symbol_name} با موفقیت آپدیت شد"
+            
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در آپدیت اطلاعات نماد {symbol_name}: {e}")
+        return False, f"خطا در آپدیت اطلاعات نماد: {str(e)}"
+
+# ----------------------------
+# توابع فیلتر و جستجو
+# ----------------------------
+
+def search_symbols(query: str, limit: int = 20):
+    """
+    جستجوی نمادها بر اساس نام یا نماد
+    """
+    try:
+        session = get_session_local()
+        try:
+            results = session.query(ComprehensiveSymbolData).filter(
+                (ComprehensiveSymbolData.symbol_name.ilike(f"%{query}%")) |
+                (ComprehensiveSymbolData.symbol_id.ilike(f"%{query}%")) |
+                (ComprehensiveSymbolData.company_name.ilike(f"%{query}%"))
+            ).limit(limit).all()
+            
+            symbols_list = []
+            for symbol in results:
+                symbols_list.append({
+                    'id': symbol.id,
+                    'symbol_id': symbol.symbol_id,
+                    'symbol_name': symbol.symbol_name,
+                    'company_name': symbol.company_name,
+                    'market_type': symbol.market_type,
+                    'created_at': symbol.created_at.isoformat() if symbol.created_at else None
+                })
+            
+            return True, symbols_list
+            
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در جستجوی نمادها: {e}")
+        return False, f"خطا در جستجوی نمادها: {str(e)}"
+
+
+def filter_symbols_by_market(market: str, limit: int = 100):
+    """
+    فیلتر نمادها بر اساس بازار
+    """
+    try:
+        session = get_session_local()
+        try:
+            results = session.query(ComprehensiveSymbolData).filter(
+                ComprehensiveSymbolData.market_type.ilike(f"%{market}%")
+            ).limit(limit).all()
+            
+            symbols_list = []
+            for symbol in results:
+                symbols_list.append({
+                    'id': symbol.id,
+                    'symbol_id': symbol.symbol_id,
+                    'symbol_name': symbol.symbol_name,
+                    'market_type': symbol.market_type,
+                    'company_name': symbol.company_name
+                })
+            
+            return True, symbols_list
+            
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در فیلتر نمادها: {e}")
+        return False, f"خطا در فیلتر نمادها: {str(e)}"
+
+    
+def get_symbol_comprehensive_report(symbol_identifier: str):
+    """
+    دریافت گزارش جامع برای یک نماد (با استفاده از symbol_id یا symbol_name)
+    """
+    try:
+        session = get_session_local()
+        try:
+            # جستجوی نماد بر اساس symbol_id یا symbol_name
+            symbol = session.query(ComprehensiveSymbolData).filter(
+                (ComprehensiveSymbolData.symbol_id == symbol_identifier) |
+                (ComprehensiveSymbolData.symbol_name == symbol_identifier)
+            ).first()
+            
+            if not symbol:
+                return False, "نماد یافت نشد"
+            
+            # اطلاعات پایه
+            symbol_info = {
+                'id': symbol.id,
+                'symbol_id': symbol.symbol_id,
+                'symbol_name': symbol.symbol_name,
+                'company_name': symbol.company_name,
+                'market_type': symbol.market_type,
+                'industry': symbol.industry,
+                'group_name': symbol.group_name,
+                'base_volume': symbol.base_volume,
+                'created_at': symbol.created_at.isoformat() if symbol.created_at else None
+            }
+            
+            # اطلاعات تاریخی
+            historical_data = session.query(HistoricalData).filter_by(
+                symbol_id=symbol.id
+            ).order_by(HistoricalData.date.desc()).limit(30).all()
+            
+            historical_list = []
+            for hist in historical_data:
+                historical_list.append({
+                    'date': hist.date.isoformat() if hist.date else None,
+                    'jdate': hist.jdate,
+                    'open': hist.open,
+                    'high': hist.high,
+                    'low': hist.low,
+                    'close': hist.close,
+                    'volume': hist.volume,
+                    'value': hist.value
+                })
+            
+            # اطلاعات تکنیکال
+            technical_data = session.query(TechnicalIndicatorData).filter_by(
+                symbol_id=symbol.id
+            ).order_by(TechnicalIndicatorData.jdate.desc()).first()
+            
+            technical_info = {}
+            if technical_data:
+                technical_info = {
+                    'RSI': technical_data.RSI,
+                    'MACD': technical_data.MACD,
+                    'MACD_Signal': technical_data.MACD_Signal,
+                    'MACD_Hist': technical_data.MACD_Hist,
+                    'SMA_20': technical_data.SMA_20,
+                    'SMA_50': technical_data.SMA_50,
+                    'Bollinger_High': technical_data.Bollinger_High,
+                    'Bollinger_Low': technical_data.Bollinger_Low,
+                    'Bollinger_MA': technical_data.Bollinger_MA,
+                    'Volume_MA_20': technical_data.Volume_MA_20,
+                    'ATR': technical_data.ATR,
+                    'jdate': technical_data.jdate
+                }
+            
+            # اطلاعات بنیادی
+            fundamental_data = session.query(FundamentalData).filter_by(
+                symbol_id=symbol.id
+            ).first()
+            
+            fundamental_info = {}
+            if fundamental_data:
+                fundamental_info = {
+                    'eps': fundamental_data.eps,
+                    'pe': fundamental_data.pe,
+                    'group_pe_ratio': fundamental_data.group_pe_ratio,
+                    'psr': fundamental_data.psr,
+                    'p_s_ratio': fundamental_data.p_s_ratio,
+                    'market_cap': fundamental_data.market_cap,
+                    'base_volume': fundamental_data.base_volume,
+                    'float_shares': fundamental_data.float_shares
+                }
+            
+            report = {
+                'symbol_info': symbol_info,
+                'historical_data': historical_list,
+                'technical_indicators': technical_info,
+                'fundamental_data': fundamental_info,
+                'report_date': datetime.now().isoformat()
+            }
+            
+            return True, report
+            
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در دریافت گزارش جامع برای {symbol_identifier}: {e}")
+        return False, f"خطا در دریافت گزارش جامع: {str(e)}"
+
+def get_market_summary():
+    """
+    دریافت خلاصه وضعیت بازار
+    """
+    try:
+        session = get_session_local()
+        try:
+            # تعداد نمادها به تفکیک بازار
+            market_stats = session.query(
+                ComprehensiveSymbolData.market_type,
+                func.count(ComprehensiveSymbolData.id)
+            ).group_by(ComprehensiveSymbolData.market_type).all()
+            
+            # میانگین P/E و P/B
+            avg_pe = session.query(
+                func.avg(FundamentalData.pe)
+            ).filter(FundamentalData.pe.isnot(None)).scalar()
+            
+            avg_pb = session.query(
+                func.avg(FundamentalData.p_b)
+            ).filter(FundamentalData.p_b.isnot(None)).scalar()
+            
+            # تعداد نمادهای با داده کامل
+            symbols_with_complete_data = session.query(ComprehensiveSymbolData).filter(
+                ComprehensiveSymbolData.id.in_(session.query(HistoricalData.symbol_id).distinct()),
+                ComprehensiveSymbolData.id.in_(session.query(TechnicalIndicatorData.symbol_id).distinct()),
+                ComprehensiveSymbolData.id.in_(session.query(FundamentalData.symbol_id).distinct())
+            ).count()
+            
+            summary = {
+                'total_symbols': session.query(ComprehensiveSymbolData).count(),
+                'symbols_with_historical': session.query(func.count(distinct(HistoricalData.symbol_id))).scalar(),
+                'symbols_with_technical': session.query(func.count(distinct(TechnicalIndicatorData.symbol_id))).scalar(),
+                'symbols_with_fundamental': session.query(func.count(distinct(FundamentalData.symbol_id))).scalar(),
+                'symbols_with_complete_data': symbols_with_complete_data,
+                'market_distribution': {market: count for market, count in market_stats},
+                'average_pe': float(avg_pe) if avg_pe else None,
+                'average_pb': float(avg_pb) if avg_pb else None,
+                'last_updated': datetime.now().isoformat()
+            }
+            
+            return True, summary
+            
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در دریافت خلاصه بازار: {e}")
+        return False, f"خطا در دریافت خلاصه بازار: {str(e)}"
+
+# ----------------------------
+# توابع زمان‌بندی و اجرای خودکار
+# ----------------------------
+
+def schedule_daily_update():
+    """
+    زمان‌بندی آپدیت روزانه
+    """
+    try:
+        logger.info("⏰ شروع آپدیت روزانه...")
+        
+        # آپدیت داده‌های تاریخی برای نمادها
+        success, msg = run_historical_update_only(limit_per_run=200, days_limit=1)
+        if not success:
+            logger.warning(f"⚠️ آپدیت تاریخی روزانه با خطا مواجه شد: {msg}")
+        
+        # آپدیت تحلیل تکنیکال
+        success, msg = run_technical_update_only(limit=200)
+        if not success:
+            logger.warning(f"⚠️ آپدیت تکنیکال روزانه با خطا مواجه شد: {msg}")
+        
+        logger.info("✅ آپدیت روزانه کامل شد")
+        return True, "آپدیت روزانه با موفقیت انجام شد"
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در آپدیت روزانه: {e}")
+        return False, f"خطا در آپدیت روزانه: {str(e)}"
+
+def schedule_weekly_update():
+    """
+    زمان‌بندی آپدیت هفتگی
+    """
+    try:
+        logger.info("⏰ شروع آپدیت هفتگی...")
+        
+        # آپدیت کامل داده‌ها
+        success, msg = run_full_update_with_limits(limit_per_run=300, days_limit=7)
+        if not success:
+            logger.warning(f"⚠️ آپدیت هفتگی با خطا مواجه شد: {msg}")
+        
+        # تعمیر داده‌های از دست رفته
+        success, msg = run_data_repair(data_type='all', limit=100)
+        if not success:
+            logger.warning(f"⚠️ تعمیر داده‌های هفتگی با خطا مواجه شد: {msg}")
+        
+        logger.info("✅ آپدیت هفتگی کامل شد")
+        return True, "آپدیت هفتگی با موفقیت انجام شد"
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در آپدیت هفتگی: {e}")
+        return False, f"خطا در آپدیت هفتگی: {str(e)}"
+
+def schedule_monthly_maintenance():
+    """
+    زمان‌بندی نگهداری ماهانه
+    """
+    try:
+        logger.info("⏰ شروع نگهداری ماهانه...")
+        
+        # پاکسازی داده‌های تکراری
+        success, msg = run_cleanup_duplicates()
+        if not success:
+            logger.warning(f"⚠️ پاکسازی ماهانه با خطا مواجه شد: {msg}")
+        
+        # آپدیت داده‌های بنیادی
+        success, msg = run_fundamental_update_only()
+        if not success:
+            logger.warning(f"⚠️ آپدیت بنیادی ماهانه با خطا مواجه شد: {msg}")
+        
+        # دریافت گزارش وضعیت
+        success, report = get_status_report()
+        if success:
+            logger.info(f"📊 گزارش وضعیت ماهانه: {report}")
+        
+        logger.info("✅ نگهداری ماهانه کامل شد")
+        return True, "نگهداری ماهانه با موفقیت انجام شد"
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در نگهداری ماهانه: {e}")
+        return False, f"خطا در نگهداری ماهانه: {str(e)}"
+
+# ----------------------------
+# توابع کمکی برای دیباگ و عیب‌یابی
+# ----------------------------
+
+def debug_symbol_data(symbol_name: str):
+    """
+    دیباگ اطلاعات یک نماد
+    """
+    try:
+        session = get_session_local()
+        try:
+            symbol = session.query(ComprehensiveSymbolData).filter_by(name=symbol_name).first()
+            if not symbol:
+                return False, "نماد یافت نشد"
+            
+            debug_info = {
+                'symbol': {
+                    'id': symbol.id,
+                    'name': symbol.name,
+                    'tse_index': symbol.tse_index,
+                    'market': symbol.market
+                },
+                'historical_count': session.query(HistoricalData).filter_by(symbol_id=symbol.id).count(),
+                'technical_count': session.query(TechnicalIndicatorData).filter_by(symbol_id=symbol.id).count(),
+                'fundamental_exists': session.query(FundamentalData).filter_by(symbol_id=symbol.id).first() is not None,
+                'latest_historical': session.query(HistoricalData).filter_by(symbol_id=symbol.id).order_by(HistoricalData.date.desc()).first(),
+                'latest_technical': session.query(TechnicalIndicatorData).filter_by(symbol_id=symbol.id).order_by(TechnicalIndicatorData.date.desc()).first()
+            }
+            
+            return True, debug_info
+            
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در دیباگ نماد {symbol_name}: {e}")
+        return False, f"خطا در دیباگ نماد: {str(e)}"
+
+def test_pytse_connection():
+    """
+    تست اتصال به pytse-client
+    """
+    try:
+        if not pytse_wrapper.is_available():
+            return False, "pytse-client در دسترس نیست"
+        
+        # تست دریافت نمادها
+        symbols = pytse_wrapper.get_all_symbols()
+        if not symbols:
+            return False, "خطا در دریافت نمادها از pytse-client"
+        
+        # تست دریافت داده‌های یک نماد
+        test_symbol = list(symbols.keys())[0] if symbols else None
+        if test_symbol:
+            ticker = pytse_wrapper.get_ticker(test_symbol)
+            if not ticker:
+                return False, f"خطا در دریافت اطلاعات نماد {test_symbol}"
+        
+        return True, "اتصال به pytse-client با موفقیت تست شد"
+        
+    except Exception as e:
+        logger.error(f"❌ خطا در تست اتصال به pytse-client: {e}")
+        return False, f"خطا در تست اتصال: {str(e)}"
+
+def test_database_connection():
+    """
+    تست اتصال به دیتابیس
+    """
+    try:
+        session = get_session_local()
+        try:
+            # تست query ساده
+            count = session.query(ComprehensiveSymbolData).count()
+            return True, f"اتصال به دیتابیس موفقیت‌آمیز. تعداد نمادها: {count}"
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ خطا در تست اتصال به دیتابیس: {e}")
+        return False, f"خطا در اتصال به دیتابیس: {str(e)}"
+
+# ----------------------------
+# توابع main برای اجرای مستقیم
+# ----------------------------
+
+def main():
+    """
+    تابع اصلی برای اجرای مستقیم
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='مدیریت داده‌های بازار بورس')
+    parser.add_argument('--full-update', action='store_true', help='اجرای آپدیت کامل')
+    parser.add_argument('--historical', action='store_true', help='اجرای آپدیت تاریخی')
+    parser.add_argument('--technical', action='store_true', help='اجرای آپدیت تکنیکال')
+    parser.add_argument('--fundamental', action='store_true', help='اجرای آپدیت بنیادی')
+    parser.add_argument('--repair', action='store_true', help='اجرای تعمیر داده‌ها')
+    parser.add_argument('--cleanup', action='store_true', help='پاکسازی داده‌های تکراری')
+    parser.add_argument('--status', action='store_true', help='دریافت گزارش وضعیت')
+    parser.add_argument('--limit', type=int, default=100, help='محدودیت تعداد نمادها')
+    parser.add_argument('--days', type=int, default=365, help='محدودیت روزهای تاریخی')
+    
+    args = parser.parse_args()
+    
+    try:
+        if args.full_update:
+            success, msg = run_full_update_with_limits(args.limit, args.days)
+            print(f"آپدیت کامل: {'✅ موفق' if success else '❌ خطا'} - {msg}")
+        
+        elif args.historical:
+            success, msg = run_historical_update_only(args.limit, args.days)
+            print(f"آپدیت تاریخی: {'✅ موفق' if success else '❌ خطا'} - {msg}")
+        
+        elif args.technical:
+            success, msg = run_technical_update_only(args.limit)
+            print(f"آپدیت تکنیکال: {'✅ موفق' if success else '❌ خطا'} - {msg}")
+        
+        elif args.fundamental:
+            success, msg = run_fundamental_update_only()
+            print(f"آپدیت بنیادی: {'✅ موفق' if success else '❌ خطا'} - {msg}")
+        
+        elif args.repair:
+            success, msg = run_data_repair('all', args.limit)
+            print(f"تعمیر داده‌ها: {'✅ موفق' if success else '❌ خطا'} - {msg}")
+        
+        elif args.cleanup:
+            success, msg = run_cleanup_duplicates()
+            print(f"پاکسازی: {'✅ موفق' if success else '❌ خطا'} - {msg}")
+        
+        elif args.status:
+            success, result = get_status_report()
+            if success:
+                import json
+                print(json.dumps(result, indent=2, ensure_ascii=False))
+            else:
+                print(f"❌ خطا: {result}")
+        
+        else:
+            parser.print_help()
+            
+    except Exception as e:
+        logger.error(f"❌ خطا در اجرای دستور: {e}")
+        print(f"خطا: {e}")
+
+if __name__ == "__main__":
+    main()
+
+# ----------------------------
+# Export functions for Flask app
+# ----------------------------
+
+__all__ = [
+    # توابع اصلی
+    'fetch_symbols_from_pytse_client',
+    'fetch_and_process_historical_data',
+    'update_historical_data_limited',
+    'run_full_data_update',
+    'run_technical_analysis',
+    'update_comprehensive_symbol_data',
+    'initial_populate_all_symbols_and_data',
+    
+    # توابع مدیریت
+    'run_full_update_with_limits',
+    'run_historical_update_only',
+    'run_technical_update_only',
+    'run_fundamental_update_only',
+    'get_status_report',
+    'run_data_repair',
+    'run_cleanup_duplicates',
+    
+    # توابع نمادها
+    'add_single_symbol',
+    'remove_symbol',
+    'update_symbol_info',
+    'search_symbols',
+    'filter_symbols_by_market',
+    
+    # توابع گزارش‌گیری
+    'get_symbol_comprehensive_report',
+    'get_market_summary',
+    
+    # توابع زمان‌بندی
+    'schedule_daily_update',
+    'schedule_weekly_update',
+    'schedule_monthly_maintenance',
+    
+    # توابع دیباگ
+    'debug_symbol_data',
+    'test_pytse_connection',
+    'test_database_connection',
+    
+    # utility
+    'get_session_local',
+    'cleanup_memory'
+]                        

@@ -11,6 +11,13 @@ from models import (
     TechnicalIndicatorData, MLPrediction # Removed models now in other route files
 )
 
+
+
+#init اولیه نمادها و بروزرسانی دوره‌ای لیست.
+from flask import Blueprint, jsonify
+from services.symbol_initializer import populate_symbols_into_db
+
+
 # Import services relevant to analysis_ns only
 from services import data_fetch_and_process
 from services.ml_prediction_service import get_ml_predictions_for_symbol, get_all_ml_predictions, generate_and_save_predictions_for_watchlist
@@ -157,6 +164,10 @@ ml_prediction_model = analysis_ns.model('MLPredictionModel', {
 })
 
 
+  
+
+
+
 # --- Parsers for API Endpoints ---
 
 # Parser for data update endpoint (for update_historical_data_limited)
@@ -186,11 +197,29 @@ class InitialSymbolPopulationResource(Resource):
         """
         current_app.logger.info("API call: Initiating initial symbol population and data fetch.")
         try:
-            total_processed_count, msg_text = data_fetch_and_process.initial_populate_all_symbols_and_data()
-            return {"message": msg_text, "processed_symbols_count": total_processed_count}, 200
+            from extensions import db
+            with db.session() as db_session:
+                result = data_fetch_and_process.initial_populate_all_symbols_and_data(db_session)
+
+            # استخراج مقادیر از dict
+            symbols_count = result.get("added", 0) + result.get("updated", 0)
+            data_operations_count = (
+                result.get("historical", 0)
+                + result.get("realtime", 0)
+                + result.get("fundamental", 0)
+            )
+            msg_text = result.get("message", "")
+
+            return {
+                "message": msg_text,
+                "symbols_added_or_updated": symbols_count,
+                "data_operations": data_operations_count
+            }, 200
+
         except Exception as e:
             current_app.logger.error(f"Error during initial population: {e}", exc_info=True)
             return {"message": f"An error occurred: {str(e)}"}, 500
+
 
 # NEW ENDPOINT: Full Data Update
 @analysis_ns.route('/run-full-data-update')
@@ -208,13 +237,25 @@ class FullDataUpdateResource(Resource):
         args = full_data_update_parser.parse_args()
         days_limit = args['days_limit']
         
-        current_app.logger.info(f"API call: Initiating full data update for all symbols for the last {days_limit} days.")
+        current_app.logger.info(
+            f"API call: Initiating full data update for all symbols for the last {days_limit} days."
+        )
         try:
-            processed_count, message = data_fetch_and_process.run_full_data_update(days_limit=days_limit)
+            from extensions import db
+            with db.session() as db_session:
+                result = data_fetch_and_process.run_full_data_update(
+                    db_session, days_limit=days_limit
+                )
+            
+            processed_count = result.get("processed_count", 0)
+            message = result.get("message", "")
+            
             return {"message": message, "processed_count": processed_count}, 200
+
         except Exception as e:
             current_app.logger.error(f"Error during full data update: {e}", exc_info=True)
             return {"message": f"An error occurred: {str(e)}"}, 500
+
 
 
 @analysis_ns.route('/update-historical-data')
@@ -240,11 +281,11 @@ class UpdateHistoricalDataResource(Resource):
         specific_symbols_list = [s.strip() for s in specific_symbols_str.split(',') if s.strip()] if specific_symbols_str else None
 
         try:
-            # Corrected function call to data_fetch_and_process.run_full_data_update
-            # Assuming update_historical_data_limited is now part of run_full_data_update
-            total_rows, msg_text = data_fetch_and_process.run_full_data_update(
-                limit_per_run=limit_per_run, specific_symbols_list=specific_symbols_list
-            )
+            from extensions import db
+            with db.session() as db_session:
+                total_rows, msg_text = data_fetch_and_process.run_full_data_update(
+                    db_session, limit_per_run=limit_per_run, specific_symbols_list=specific_symbols_list
+                )
             response_data = {"message": msg_text, "updated_or_inserted_rows": total_rows}
             return response_data, 200
         except Exception as e:
@@ -403,3 +444,36 @@ class MLPredictionListResource(Resource):
             predictions = get_all_ml_predictions()
             return predictions, 200
 
+
+
+
+
+#init اولیه نمادها و بروزرسانی دوره‌ای لیست.
+@analysis_ns.route('/init-symbols')
+class InitSymbolsResource(Resource):
+    @jwt_required()
+    def post(self):
+        """Initialize symbols in database"""
+        count, msg = populate_symbols_into_db()
+        return {
+            "success": True if count > 0 else False,
+            "message": msg,
+            "count": count
+        }, 200
+
+#For Debug
+@analysis_ns.route('/debug/tehran-stocks-structure')
+class DebugTehranStocksStructureResource(Resource):
+    def get(self):
+        """بررسی ساختار داده‌های tehran-stocks"""
+        from services.symbol_initializer import debug_tehran_stocks_structure
+        df = debug_tehran_stocks_structure()
+        
+        if df is not None and not df.empty:
+            return {
+                'columns': list(df.columns),
+                'row_count': len(df),
+                'sample_data': df.iloc[0].to_dict() if not df.empty else {}
+            }, 200
+        else:
+            return {'error': 'Failed to fetch data from tehran-stocks'}, 500

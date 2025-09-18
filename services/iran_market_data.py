@@ -101,17 +101,22 @@ def fetch_iran_market_indices() -> Dict[str, Dict[str, Any]]:
     }
 
     try:
-        # فقط یک فراخوانی به Wrapper که خودش timeout/retry/circuit را مدیریت می‌کند.
         financial_indexes = download_financial_indexes_safe(
             symbols=index_symbols_to_fetch,
-            timeout=10,
-            retries=2,
-            backoff=5,
         )
+
+        # ✅ بررسی‌های بیشتر برای اطمینان از ساختار داده
+        if financial_indexes is None:
+            logger.warning("تابع download_financial_indexes_safe None برگرداند")
+            return result
 
         if not financial_indexes:
             logger.warning("Wrapper هیچ داده‌ای برای شاخص‌ها برنگرداند. بازگشت دادهٔ پیش‌فرض.")
             return result
+
+        logger.info(f"ساختار داده‌های دریافتی: {type(financial_indexes)}")
+
+
 
         for pytse_name, df in financial_indexes.items():
             friendly_name = reverse_mapping.get(pytse_name)

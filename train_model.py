@@ -4,110 +4,146 @@
 import pandas as pd
 import numpy as np
 import jdatetime
-from datetime import datetime, timedelta, date
+from datetime import datetime
 import logging
 import os
-import joblib 
+import joblib
+import sys
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
-from sklearn.preprocessing import StandardScaler 
-from sqlalchemy import create_engine
+from sklearn.preprocessing import StandardScaler
 from sqlalchemy.orm import sessionmaker
 from config import Config
+from sqlalchemy import create_engine, text
 
 # --- تنظیمات لاگ‌نویسی ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- تنظیمات مسیردهی پروژه ---
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(PROJECT_ROOT, 'models')
-if not os.path.exists(MODELS_DIR):
-    os.makedirs(MODELS_DIR)
+# --- تنظیمات مسیردهی ---
+current_script_dir = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(current_script_dir)
 
-# اضافه کردن مسیر 'services' به sys.path برای ایمپورت توابع کمکی
-import sys
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# تشخیص محیط
+MODELS_DIR = '/app/models' if os.path.exists('/app') else os.path.join(PROJECT_ROOT, "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+print("✅ محیط تشخیص داده شد:")
+print("📁 مسیر پروژه:", PROJECT_ROOT)
+print("🤖 مسیر مدل‌ها:", MODELS_DIR)
+print("🏠 محیط:", "Docker" if os.path.exists('/app') else "Local Machine")
+
+# مسیرهای دیگر
 SERVICES_PATH = os.path.join(PROJECT_ROOT, 'services')
+DATA_PATH = os.path.join(PROJECT_ROOT, 'data')
+
 if SERVICES_PATH not in sys.path:
     sys.path.insert(0, SERVICES_PATH)
 
-# ایمپورت مدل‌ها و توابع کمکی
+# ایمپورت مدل‌ها
 try:
-    from models import HistoricalData, ComprehensiveSymbolData 
-    from utils import calculate_rsi, calculate_macd, calculate_sma, calculate_volume_ma, calculate_atr
+    from models import HistoricalData, ComprehensiveSymbolData
 except ImportError as e:
     logger.error(f"خطا در ایمپورت ماژول‌ها: {e}")
-    logger.error("لطفاً مطمئن شوید models.py و services/utils.py در مسیرهای صحیح قرار دارند.")
     sys.exit(1)
 
-# --- تنظیمات دیتابیس ---
+# دیتابیس
 DATABASE_URL = f"sqlite:///{os.path.join(PROJECT_ROOT, 'app.db')}"
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 
-# --- تابع مهندسی ویژگی ---
+# --- محاسبات اندیکاتورها ---
+def calculate_rsi(series, window=14):
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    delta = series.diff()
+    gains = delta.where(delta > 0, 0)
+    losses = -delta.where(delta < 0, 0)
+    avg_gain = gains.ewm(com=window - 1, min_periods=window).mean()
+    avg_loss = losses.ewm(com=window - 1, min_periods=window).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_macd(series, fast_window=12, slow_window=26, signal_window=9):
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    ema_fast = series.ewm(span=fast_window, min_periods=fast_window).mean()
+    ema_slow = series.ewm(span=slow_window, min_periods=slow_window).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal_window, min_periods=signal_window).mean()
+    macd_histogram = macd_line - signal_line
+    return macd_line, signal_line, macd_histogram
+
+def calculate_sma(series, window=20):
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    return series.rolling(window=window).mean()
+
+def calculate_volume_ma(series, window=5):
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    return series.rolling(window=window).mean()
+
+def calculate_atr(high, low, close, window=14):
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = true_range.ewm(com=window - 1, min_periods=window).mean()
+    return atr
+
+# --- مهندسی ویژگی ---
 def _perform_feature_engineering(df_symbol_hist, symbol_id_for_logging="N/A"):
-    """
-    انجام مهندسی ویژگی بر روی داده‌های تاریخی یک نماد.
-    این تابع داده‌های تاریخی را به ویژگی‌های قابل استفاده برای مدل ML تبدیل می‌کند.
-    """
-    # اطمینان از مرتب بودن داده‌ها بر اساس تاریخ و ایجاد کپی صریح
     df_processed = df_symbol_hist.sort_values(by='gregorian_date').set_index('gregorian_date').copy()
 
-    initial_rows = len(df_processed)
-
-    # --- محاسبه شاخص‌های تکنیکال ---
-    df_processed.loc[:, 'rsi'] = calculate_rsi(df_processed['close'])
+    # اندیکاتورها
+    df_processed['rsi'] = calculate_rsi(df_processed['close'])
     macd_line, signal_line, _ = calculate_macd(df_processed['close'])
-    df_processed.loc[:, 'macd'] = macd_line
-    df_processed.loc[:, 'signal_line'] = signal_line
-    df_processed.loc[:, 'sma_20'] = calculate_sma(df_processed['close'], window=20)
-    df_processed.loc[:, 'sma_50'] = calculate_sma(df_processed['close'], window=50)
-    df_processed.loc[:, 'volume_ma_5_day'] = calculate_volume_ma(df_processed['volume'], window=5)
-    df_processed.loc[:, 'atr'] = calculate_atr(df_processed['high'], df_processed['low'], df_processed['close'])
+    df_processed['macd'] = macd_line
+    df_processed['signal_line'] = signal_line
+    df_processed['sma_20'] = calculate_sma(df_processed['close'], window=20)
+    df_processed['sma_50'] = calculate_sma(df_processed['close'], window=50)
+    df_processed['volume_ma_5_day'] = calculate_volume_ma(df_processed['volume'], window=5)
+    df_processed['atr'] = calculate_atr(df_processed['high'], df_processed['low'], df_processed['close'])
 
-    # --- ویژگی‌های جدید اضافه شده ---
     # Stochastic Oscillator
     window_stoch = 14
-    df_processed.loc[:, 'lowest_low_stoch'] = df_processed['low'].rolling(window=window_stoch).min()
-    df_processed.loc[:, 'highest_high_stoch'] = df_processed['high'].rolling(window=window_stoch).max()
+    df_processed['lowest_low_stoch'] = df_processed['low'].rolling(window=window_stoch).min()
+    df_processed['highest_high_stoch'] = df_processed['high'].rolling(window=window_stoch).max()
     denominator_stoch = df_processed['highest_high_stoch'] - df_processed['lowest_low_stoch']
-    df_processed.loc[:, '%K'] = ((df_processed['close'] - df_processed['lowest_low_stoch']) / denominator_stoch.replace(0, np.nan)) * 100
-    df_processed.loc[:, '%D'] = df_processed['%K'].rolling(window=3).mean() 
+    df_processed['%K'] = ((df_processed['close'] - df_processed['lowest_low_stoch']) / denominator_stoch.replace(0, np.nan)) * 100
+    df_processed['%D'] = df_processed['%K'].rolling(window=3).mean()
 
-    # On-Balance Volume (OBV)
+    # OBV
     close_shifted = df_processed['close'].shift(1)
     volume_numeric = pd.to_numeric(df_processed['volume'], errors='coerce').fillna(0)
-    df_processed.loc[:, 'obv'] = (np.where(df_processed['close'] > close_shifted, volume_numeric,
-                                         np.where(df_processed['close'] < close_shifted, -volume_numeric, 0))).cumsum()
-    
-    # ویژگی‌های لگ (Lagged Features) برای تغییرات قیمت و حجم
-    df_processed.loc[:, 'price_change_1d'] = df_processed['close'].pct_change()
-    df_processed.loc[:, 'volume_change_1d'] = df_processed['volume'].pct_change()
-    df_processed.loc[:, 'price_change_3d'] = df_processed['close'].pct_change(periods=3)
-    df_processed.loc[:, 'volume_change_3d'] = df_processed['volume'].pct_change(periods=3)
-    df_processed.loc[:, 'price_change_5d'] = df_processed['close'].pct_change(periods=5)
-    df_processed.loc[:, 'volume_change_5d'] = df_processed['volume'].pct_change(periods=5)
+    df_processed['obv'] = (np.where(df_processed['close'] > close_shifted, volume_numeric,
+                                   np.where(df_processed['close'] < close_shifted, -volume_numeric, 0))).cumsum()
 
-    # نسبت قدرت خریدار حقیقی (Real Buyer Power Ratio)
+    # تغییرات قیمت و حجم
+    df_processed['price_change_1d'] = df_processed['close'].pct_change()
+    df_processed['volume_change_1d'] = df_processed['volume'].pct_change()
+    df_processed['price_change_3d'] = df_processed['close'].pct_change(periods=3)
+    df_processed['volume_change_3d'] = df_processed['volume'].pct_change(periods=3)
+    df_processed['price_change_5d'] = df_processed['close'].pct_change(periods=5)
+    df_processed['volume_change_5d'] = df_processed['volume'].pct_change(periods=5)
+
+    # نسبت قدرت خریدار حقیقی
     buy_i_vol = pd.to_numeric(df_processed['buy_i_volume'], errors='coerce').fillna(0)
     sell_i_vol = pd.to_numeric(df_processed['sell_i_volume'], errors='coerce').fillna(0)
     buy_count_i = pd.to_numeric(df_processed['buy_count_i'], errors='coerce').fillna(0)
     sell_count_i = pd.to_numeric(df_processed['sell_count_i'], errors='coerce').fillna(0)
-
     denominator_buy_power = (sell_i_vol * sell_count_i)
-    df_processed.loc[:, 'individual_buy_power_ratio'] = (buy_i_vol * buy_count_i) / denominator_buy_power.replace(0, np.nan)
-    
-    # --- مدیریت مقادیر گمشده و نامحدود (NaN/Inf) ---
-    df_processed.replace([np.inf, -np.inf], np.nan, inplace=True) 
-    df_processed = df_processed.ffill().bfill() 
-    df_processed.fillna(0, inplace=True) 
-    
-    rows_after_fillna = len(df_processed)
-    if rows_after_fillna < initial_rows:
-        logger.debug(f"برای نماد {symbol_id_for_logging}: {initial_rows - rows_after_fillna} ردیف به دلیل NaN/Inf پس از مهندسی ویژگی حذف شد.")
-    
-    # --- انتخاب ویژگی‌های نهایی برای مدل ---
+    df_processed['individual_buy_power_ratio'] = (buy_i_vol * buy_count_i) / denominator_buy_power.replace(0, np.nan)
+
+    df_processed.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_processed = df_processed.ffill().bfill().fillna(0)
+
+    # انتخاب ویژگی‌ها
     feature_columns = [
         'open', 'high', 'low', 'close', 'volume', 'num_trades',
         'rsi', 'macd', 'signal_line', 'sma_20', 'sma_50', 'volume_ma_5_day', 'atr',
@@ -116,48 +152,44 @@ def _perform_feature_engineering(df_symbol_hist, symbol_id_for_logging="N/A"):
         'price_change_3d', 'volume_change_3d',
         'price_change_5d', 'volume_change_5d',
         'individual_buy_power_ratio',
-        'buy_count_i', 'sell_count_i', 'buy_i_volume', 'sell_i_volume', 
+        'buy_count_i', 'sell_count_i', 'buy_i_volume', 'sell_i_volume',
         'zd1', 'qd1', 'pd1', 'zo1', 'qo1', 'po1',
         'zd2', 'qd2', 'pd2', 'zo2', 'qo2', 'po2',
         'zd3', 'qd3', 'pd3', 'zo3', 'qo3', 'po3',
         'zd4', 'qd4', 'pd4', 'zo4', 'qo4', 'po4',
         'zd5', 'qd5', 'pd5', 'zo5', 'qo5', 'po5'
     ]
-    
-    features_df = df_processed[feature_columns].copy() 
-    
-    if features_df.isnull().values.any() or np.isinf(features_df.values).any():
-        logger.warning(f"برای نماد {symbol_id_for_logging}: مقادیر NaN یا Inf پس از پاکسازی نهایی در ویژگی‌ها باقی مانده‌اند. این ممکن است نشان‌دهنده مشکل در داده‌های خام یا منطق مهندسی ویژگی باشد.")
-        features_df.fillna(0, inplace=True)
-        features_df.replace([np.inf, -np.inf], 0, inplace=True) 
-
+    features_df = df_processed[feature_columns].copy()
+    features_df.fillna(0, inplace=True)
+    features_df.replace([np.inf, -np.inf], 0, inplace=True)
     return features_df
 
-# --- تابع اصلی ---
+# --- آموزش مدل ---
 def train_model():
-    logger.info("در حال اتصال به دیتابیس و بارگذاری داده‌ها به صورت دسته‌ای (chunked)...")
-    
+    logger.info("در حال اتصال به دیتابیس و بارگذاری داده‌ها ...")
     CHUNK_SIZE = 10000
     all_chunks_df = []
-
     try:
         query = "SELECT * FROM stock_data ORDER BY symbol_id, date"
-        for chunk_df in pd.read_sql_query(query, engine, chunksize=CHUNK_SIZE):
-            logger.info(f"دسته جدید با {len(chunk_df)} ردیف بارگذاری شد.")
-            all_chunks_df.append(chunk_df)
+        with engine.connect() as conn:
+            result_proxy = conn.execute(text(query))
+            while True:
+                chunk_records = result_proxy.fetchmany(CHUNK_SIZE)
+                if not chunk_records:
+                    break
+                chunk_df = pd.DataFrame(chunk_records, columns=result_proxy.keys())
+                logger.info(f"دسته جدید با {len(chunk_df)} ردیف بارگذاری شد.")
+                all_chunks_df.append(chunk_df)
 
         if not all_chunks_df:
-            logger.error("داده تاریخی در دیتابیس یافت نشد. لطفاً ابتدا داده‌ها را جمع‌آوری کنید.")
+            logger.error("هیچ داده‌ای در دیتابیس نیست.")
             return
 
-        logger.info(f"تمام دسته‌ها با موفقیت بارگذاری شدند. در حال ادغام و پیش‌پردازش...")
         df_hist = pd.concat(all_chunks_df, ignore_index=True)
-        
-        logger.info(f"تعداد کل نقاط داده تاریخی پس از واکشی: {len(df_hist)}")
-
+        logger.info(f"تعداد کل نقاط داده: {len(df_hist)}")
         df_hist['gregorian_date'] = pd.to_datetime(df_hist['date'])
-        
         df_hist.drop(columns=['_sa_instance_state'], errors='ignore', inplace=True)
+
         numeric_cols = ['open', 'high', 'low', 'close', 'final', 'yesterday_price', 'volume', 'value', 'num_trades',
                          'plc', 'plp', 'pcc', 'pcp', 'mv',
                          'buy_count_i', 'buy_count_n', 'sell_count_i', 'sell_count_n',
@@ -170,65 +202,45 @@ def train_model():
         for col in numeric_cols:
             if col in df_hist.columns:
                 df_hist[col] = pd.to_numeric(df_hist[col], errors='coerce')
-        
-        initial_rows_count = len(df_hist)
+
         df_hist.dropna(subset=['close', 'volume', 'high', 'low', 'open'], inplace=True)
-        logger.info(f"تعداد نقاط داده پس از پیش‌پردازش اولیه و حذف NaNهای اساسی: {len(df_hist)} (حذف شده: {initial_rows_count - len(df_hist)})")
 
-        logger.info("در حال شروع مهندسی ویژگی‌ها...")
+        # مهندسی ویژگی
         all_features_df = pd.DataFrame()
-        skipped_symbols = []
-
         for symbol_id in df_hist['symbol_id'].unique():
             df_symbol = df_hist[df_hist['symbol_id'] == symbol_id].copy()
-            
+            # اصلاح: بررسی تعداد کافی داده قبل از پردازش
             if len(df_symbol) < 60:
-                skipped_symbols.append(f"{symbol_id}: داده کافی ({len(df_symbol)} روز) برای محاسبه ویژگی‌ها وجود ندارد.")
+                logger.warning(f"پرش از نماد {symbol_id}: داده کافی ({len(df_symbol)} روز) برای محاسبه ویژگی‌ها وجود ندارد.")
                 continue
-
-            features_df = _perform_feature_engineering(df_symbol, symbol_id_for_logging=symbol_id)
-            
+            features_df = _perform_feature_engineering(df_symbol, symbol_id)
             if features_df.empty:
-                skipped_symbols.append(f"{symbol_id}: پس از مهندسی ویژگی، هیچ داده معتبری باقی نماند.")
                 continue
-
             features_df['symbol_id'] = symbol_id
             features_df['jdate'] = df_symbol.set_index('gregorian_date').loc[features_df.index, 'jdate']
-            features_df['close_hist'] = df_symbol.set_index('gregorian_date').loc[features_df.index, 'close'] 
-
+            features_df['close_hist'] = df_symbol.set_index('gregorian_date').loc[features_df.index, 'close']
             all_features_df = pd.concat([all_features_df, features_df], ignore_index=False)
-        
-        if skipped_symbols:
-            logger.warning("نمادهای زیر به دلیل داده ناکافی یا نامعتبر پرش شدند:")
-            for msg in skipped_symbols:
-                logger.warning(f"پرش از نماد {msg}")
-
-        logger.info(f"تعداد کل نقاط داده پس از مهندسی ویژگی و حذف NaN/Inf: {len(all_features_df)}")
 
         if all_features_df.empty:
-            logger.error("پس از مهندسی ویژگی، هیچ داده‌ای برای آموزش مدل باقی نماند. فرآیند آموزش متوقف شد.")
+            logger.error("داده‌ای برای آموزش باقی نمانده.")
             return
 
-        logger.info("در حال تعریف برچسب‌ها (متغیر هدف)...")
         all_features_df.sort_values(by=['symbol_id', 'gregorian_date'], inplace=True)
-        
         all_features_df['future_close'] = all_features_df.groupby('symbol_id')['close_hist'].shift(-7)
         all_features_df['percentage_change'] = ((all_features_df['future_close'] - all_features_df['close_hist']) / all_features_df['close_hist']) * 100
         
-        initial_rows_after_features = len(all_features_df)
+        # اصلاح: حذف ردیف‌های دارای NaN پس از مهندسی ویژگی و برچسب‌گذاری
+        initial_count = len(all_features_df)
         all_features_df.dropna(subset=['percentage_change'], inplace=True)
-        logger.info(f"تعداد کل نقاط داده آموزشی پس از تعریف برچسب: {len(all_features_df)} (حذف شده: {initial_rows_after_features - len(all_features_df)})")
+        dropped_count = initial_count - len(all_features_df)
+        logger.info(f"تعداد کل نقاط داده آموزشی پس از تعریف برچسب: {len(all_features_df)} (حذف شده: {dropped_count})")
 
         if all_features_df.empty:
-            logger.error("پس از تعریف برچسب‌ها، هیچ داده‌ای برای آموزش مدل باقی نماند. فرآیند آموزش متوقف شد.")
+            logger.error("داده‌ای برای آموزش باقی نمانده.")
             return
 
         lower_bound = all_features_df['percentage_change'].quantile(0.33)
         upper_bound = all_features_df['percentage_change'].quantile(0.66)
-
-        logger.info(f"آستانه نزولی (Quantile 33%): {lower_bound:.2f}%")
-        logger.info(f"آستانه صعودی (Quantile 66%): {upper_bound:.2f}%")
-
         def get_trend(change):
             if change > upper_bound:
                 return 'Uptrend'
@@ -236,142 +248,120 @@ def train_model():
                 return 'Downtrend'
             else:
                 return 'Sideways'
-
         all_features_df['trend'] = all_features_df['percentage_change'].apply(get_trend)
 
+        logger.info(f"آستانه نزولی (Quantile 33%): {lower_bound:.2f}%")
+        logger.info(f"آستانه صعودی (Quantile 66%): {upper_bound:.2f}%")
         logger.info("توزیع کلاس‌ها در داده‌های آموزشی (پس از برچسب‌گذاری با کوانتایل):")
         logger.info(all_features_df['trend'].value_counts(normalize=True))
 
         X = all_features_df.drop(columns=['symbol_id', 'jdate', 'close_hist', 'future_close', 'percentage_change', 'trend'])
         y = all_features_df['trend']
 
+        # ترکیب X و y
+        # اصلاح: نام دیتافریم را به df_combined تغییر دادم تا با لاگ‌های قبلی مطابقت نداشته باشد و سردرگمی ایجاد نشود.
+        df_combined = X.copy()
+        df_combined["target"] = y
+        unique_dates = df_combined.index.unique().sort_values()
+
+        initial_train_window_days = getattr(Config, "ML_INITIAL_TRAIN_DAYS", 252)
+        test_window_days = getattr(Config, "ML_TEST_DAYS", 21)
+        step_window_days = getattr(Config, "ML_STEP_DAYS", 21)
+
+        fold_reports, fold_accuracies = [], []
+        latest_model_path = os.path.join(MODELS_DIR, 'latest_model.joblib')
+        latest_scaler_path = os.path.join(MODELS_DIR, 'latest_scaler.joblib')
+        latest_feature_names_path = os.path.join(MODELS_DIR, 'latest_feature_names.joblib')
+        latest_class_labels_path = os.path.join(MODELS_DIR, 'latest_class_labels.joblib')
+
         logger.info("در حال شروع آموزش مدل ML با اعتبارسنجی Walk-Forward...")
 
-        initial_train_window_days = 252 
-        test_window_days = 21 
-        step_window_days = 21 
-
-        fold_reports = []
-        fold_accuracies = []
-        
-        X.index = all_features_df.index 
-        y.index = all_features_df.index
-
-        unique_dates = X.index.unique().sort_values()
-        
         if len(unique_dates) < initial_train_window_days + test_window_days:
-            logger.warning(f"داده تاریخی کافی برای اجرای اعتبارسنجی Walk-Forward وجود ندارد. حداقل {initial_train_window_days + test_window_days} روز منحصر به فرد نیاز است. یافت شده: {len(unique_dates)} روز.")
-            logger.info("آموزش مدل نهایی روی کل داده‌های موجود (بدون Walk-Forward) به دلیل داده ناکافی برای اعتبارسنجی.")
-            
+            logger.info("داده کافی برای اعتبارسنجی Walk-Forward وجود ندارد. آموزش بر روی کل مجموعه داده...")
             scaler = StandardScaler()
             X_scaled = scaler.fit_transform(X)
-            X_scaled_df = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
-
-            model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced', n_jobs=-1)
-            model.fit(X_scaled_df, y)
-            
-            y_pred = model.predict(X_scaled_df)
-            report = classification_report(y, y_pred, output_dict=True, zero_division=0)
-            accuracy = accuracy_score(y, y_pred)
-            
-            logger.info("\nگزارش ارزیابی مدل نهایی (روی کل داده‌های موجود):")
-            logger.info(pd.DataFrame(report).transpose())
-            logger.info(f"دقت کلی: {accuracy:.2f}")
-
-            final_model = model
-            final_scaler = scaler
-
+            model = RandomForestClassifier(n_estimators=200, random_state=42, class_weight='balanced', n_jobs=-1)
+            model.fit(X_scaled, y)
+            final_model, final_scaler = model, scaler
         else:
             start_idx_for_test_window = initial_train_window_days
-            
             while start_idx_for_test_window + test_window_days <= len(unique_dates):
                 train_end_date = unique_dates[start_idx_for_test_window - 1]
                 test_start_date = unique_dates[start_idx_for_test_window]
                 test_end_date = unique_dates[min(start_idx_for_test_window + test_window_days - 1, len(unique_dates) - 1)]
 
-                X_train_fold = X.loc[X.index <= train_end_date].copy()
-                y_train_fold = y.loc[y.index <= train_end_date].copy()
-                X_test_fold = X.loc[(X.index >= test_start_date) & (X.index <= test_end_date)].copy()
-                y_test_fold = y.loc[(y.index >= test_start_date) & (y.index <= test_end_date)].copy()
+                # اصلاح برای رفع خطای ناهمگامی داده‌ها
+                # استفاده از loc برای انتخاب داده‌ها بر اساس تاریخ
+                train_data = df_combined.loc[df_combined.index <= train_end_date].copy()
+                test_data = df_combined.loc[(df_combined.index >= test_start_date) & (df_combined.index <= test_end_date)].copy()
+                
+                # اصلاح: مطمئن می‌شویم که داده‌های آموزشی و تست خالی نباشند.
+                if train_data.empty or test_data.empty:
+                    logger.warning(f"داده آموزشی یا تست برای بازه {train_end_date} تا {test_end_date} خالی است. پرش به مرحله بعد.")
+                    start_idx_for_test_window += step_window_days
+                    continue
 
-                X_train_fold.fillna(0, inplace=True) 
-                y_train_fold = y_train_fold.loc[X_train_fold.index] 
+                X_train_fold = train_data.drop(columns=["target"])
+                y_train_fold = train_data["target"]
+                X_test_fold = test_data.drop(columns=["target"])
+                y_test_fold = test_data["target"]
 
-                X_test_fold.fillna(0, inplace=True) 
-                y_test_fold = y_test_fold.loc[X_test_fold.index] 
+                # اصلاح برای رفع خطای ناهمگامی داده‌ها:
+                # اطمینان از اینکه X و y در هر fold همگام هستند
+                combined_train_fold = pd.concat([X_train_fold, y_train_fold], axis=1).dropna()
+                X_train_fold_clean = combined_train_fold.drop(columns=["target"])
+                y_train_fold_clean = combined_train_fold["target"]
 
-                if X_train_fold.empty or X_test_fold.empty:
-                    logger.warning(f"فولد با تاریخ آموزش تا {train_end_date} و تست از {test_start_date} تا {test_end_date} به دلیل داده خالی پرش شد.")
+                combined_test_fold = pd.concat([X_test_fold, y_test_fold], axis=1).dropna()
+                X_test_fold_clean = combined_test_fold.drop(columns=["target"])
+                y_test_fold_clean = combined_test_fold["target"]
+
+                # اطمینان از اینکه داده‌های تمیز شده خالی نیستند
+                if X_train_fold_clean.empty or X_test_fold_clean.empty:
+                    logger.warning(f"داده تمیز شده برای بازه {train_end_date} تا {test_end_date} خالی است. پرش به مرحله بعد.")
                     start_idx_for_test_window += step_window_days
                     continue
 
                 scaler = StandardScaler()
-                X_train_scaled = scaler.fit_transform(X_train_fold)
-                X_test_scaled = scaler.transform(X_test_fold)
+                X_train_scaled = scaler.fit_transform(X_train_fold_clean)
+                X_test_scaled = scaler.transform(X_test_fold_clean)
 
-                X_train_scaled_df = pd.DataFrame(X_train_scaled, columns=X_train_fold.columns, index=X_train_fold.index)
-                X_test_scaled_df = pd.DataFrame(X_test_scaled, columns=X_test_fold.columns, index=X_test_fold.index)
-
-                model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced', n_jobs=-1)
-                model.fit(X_train_scaled_df, y_train_fold)
-
-                y_pred_fold = model.predict(X_test_scaled_df)
-                report = classification_report(y_test_fold, y_pred_fold, output_dict=True, zero_division=0)
-                fold_reports.append(report)
-                fold_accuracies.append(accuracy_score(y_test_fold, y_pred_fold))
+                model = RandomForestClassifier(n_estimators=200, random_state=42, class_weight='balanced', n_jobs=-1)
                 
-                logger.info(f"فولد کامل شد: آموزش تا {train_end_date}, تست از {test_start_date} تا {test_end_date}. دقت: {accuracy_score(y_test_fold, y_pred_fold):.2f}")
-
+                # اصلاح: استفاده از داده‌های تمیز شده برای fit
+                model.fit(X_train_scaled, y_train_fold_clean)
+                
+                # اصلاح: استفاده از داده‌های تمیز شده برای predict
+                y_pred_fold = model.predict(X_test_scaled)
+                
+                fold_reports.append(classification_report(y_test_fold_clean, y_pred_fold, output_dict=True, zero_division=0))
+                fold_accuracies.append(accuracy_score(y_test_fold_clean, y_pred_fold))
+                
+                logger.info(f"✅ آموزش و ارزیابی برای بازه تست {test_start_date.strftime('%Y-%m-%d')} تا {test_end_date.strftime('%Y-%m-%d')} با موفقیت انجام شد.")
+                logger.info(f"دقت: {fold_accuracies[-1]:.2%}")
+                
                 start_idx_for_test_window += step_window_days
+            
+            # مدل نهایی از آخرین Fold
+            final_model, final_scaler = model, scaler
 
-            if not fold_reports:
-                logger.error("هیچ فولدی برای ارزیابی Walk-Forward کامل نشد. فرآیند آموزش متوقف شد.")
-                return
+        # ذخیره‌سازی
+        joblib.dump(final_model, latest_model_path)
+        joblib.dump(X.columns.tolist(), latest_feature_names_path)
+        joblib.dump(final_model.classes_.tolist(), latest_class_labels_path)
+        joblib.dump(final_scaler, latest_scaler_path)
+        logger.info("✅ مدل و فایل‌های جانبی ذخیره شدند.")
 
-            avg_precision = {cls: np.mean([f['precision'][cls] for f in fold_reports]) for cls in ['Uptrend', 'Downtrend', 'Sideways']}
-            avg_recall = {cls: np.mean([f['recall'][cls] for f in fold_reports]) for cls in ['Uptrend', 'Downtrend', 'Sideways']}
-            avg_f1_score = {cls: np.mean([f['f1-score'][cls] for f in fold_reports]) for cls in ['Uptrend', 'Downtrend', 'Sideways']}
-            avg_accuracy = np.mean(fold_accuracies)
-
-            logger.info("\nمیانگین گزارش ارزیابی (اعتبارسنجی Walk-Forward):")
-            avg_report_df = pd.DataFrame({
-                'precision': avg_precision,
-                'recall': avg_recall,
-                'f1-score': avg_f1_score
-            }).transpose()
-            logger.info(avg_report_df)
-            logger.info(f"میانگین دقت: {avg_accuracy:.2f}")
-
-            final_model = model 
-            final_scaler = scaler 
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_save_path = os.path.join(MODELS_DIR, f'trained_ml_model_{timestamp}.pkl')
-        feature_names_save_path = os.path.join(MODELS_DIR, f'feature_names_{timestamp}.pkl')
-        class_labels_map_save_path = os.path.join(MODELS_DIR, f'class_labels_map_{timestamp}.pkl')
-        scaler_save_path = os.path.join(MODELS_DIR, f'scaler_{timestamp}.pkl') 
-
-        joblib.dump(final_model, model_save_path)
-        joblib.dump(X.columns.tolist(), feature_names_save_path) 
-        joblib.dump(final_model.classes_.tolist(), class_labels_map_save_path) 
-        joblib.dump(final_scaler, scaler_save_path) 
-
-        logger.info(f"مدل در مسیر {model_save_path} ذخیره شد.")
-        logger.info(f"نام ویژگی‌ها در مسیر {feature_names_save_path} ذخیره شد.")
-        logger.info(f"نگاشت برچسب‌های کلاس در مسیر {class_labels_map_save_path} ذخیره شد.")
-        logger.info(f"Scaler در مسیر {scaler_save_path} ذخیره شد.")
-
-        snapshot_path = os.path.join(PROJECT_ROOT, f'training_dataset_snapshot_{timestamp}.csv')
-        all_features_df.to_csv(snapshot_path, index=True)
-        logger.info(f"Snapshot داده‌های آموزشی در {snapshot_path} ذخیره شد.")
-
-        logger.info("فرآیند آموزش و ذخیره‌سازی مدل ML با موفقیت کامل شد!")
+        # لاگ فیچر ایمپورتنس
+        try:
+            importances = pd.Series(final_model.feature_importances_, index=X.columns)
+            logger.info("ویژگی‌های مهم مدل:")
+            logger.info(importances.sort_values(ascending=False).head(20))
+        except Exception:
+            pass
 
     except Exception as e:
-        logger.error(f"خطای کلی در فرآیند آموزش مدل: {e}", exc_info=True)
-    finally:
-        if 'session' in locals() and session:
-            session.close()
+        logger.error(f"خطای کلی در فرآیند آموزش: {e}", exc_info=True)
 
 if __name__ == "__main__":
     train_model()
