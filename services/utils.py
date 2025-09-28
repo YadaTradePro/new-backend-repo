@@ -80,142 +80,67 @@ def normalize_value(val: Any) -> Optional[Union[float, int]]:
 
 @lru_cache(maxsize=128)
 def calculate_rsi(series: pd.Series, window: int = 14) -> pd.Series:
-    """
-    محاسبه شاخص قدرت نسبی (RSI).
-    Args:
-        series (pd.Series): سری قیمت‌های بسته شدن.
-        window (int): دوره بازبینی.
-    Returns:
-        pd.Series: سری مقادیر RSI.
-    """
     series = pd.to_numeric(series, errors='coerce')
-    series_cleaned = series.dropna()
-    if series.isnull().all() or len(series_cleaned) < window:
+    if series.isnull().all() or len(series.dropna()) < window:
         return pd.Series([np.nan] * len(series), index=series.index)
-
-    delta = series_cleaned.diff().dropna()
-    gain = (delta.where(delta > 0, 0)).fillna(0)
-    loss = (-delta.where(delta < 0, 0)).fillna(0)
-
-    avg_gain = gain.ewm(span=window, adjust=False).mean()
-    avg_loss = loss.ewm(span=window, adjust=False).mean()
-
+    delta = series.diff(1)
+    gain = delta.where(delta > 0, 0).fillna(0)
+    loss = -delta.where(delta < 0, 0).fillna(0)
+    avg_gain = gain.ewm(com=window - 1, min_periods=window).mean()
+    avg_loss = loss.ewm(com=window - 1, min_periods=window).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    rs = rs.replace([np.inf, -np.inf], np.nan).fillna(0)
-
     rsi = 100 - (100 / (1 + rs))
-    final_rsi = rsi.replace([np.inf, -np.inf], np.nan)
-
-    return final_rsi.reindex(series.index)
+    return rsi.reindex(series.index)
 
 @lru_cache(maxsize=128)
 def calculate_macd(series: pd.Series, short_window: int = 12, long_window: int = 26, signal_window: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """
-    محاسبه MACD، خط سیگنال MACD و هیستوگرام MACD.
-    Args:
-        series (pd.Series): سری قیمت‌های بسته شدن.
-    Returns:
-        Tuple[pd.Series, pd.Series, pd.Series]: (MACD, MACD Signal, MACD Histogram)
-    """
     series = pd.to_numeric(series, errors='coerce')
-    series_cleaned = series.dropna()
-    if series.isnull().all() or len(series_cleaned) < long_window:
+    if series.isnull().all() or len(series.dropna()) < long_window:
         nan_series = pd.Series([np.nan] * len(series), index=series.index)
         return nan_series, nan_series, nan_series
-
-    exp1 = series_cleaned.ewm(span=short_window, adjust=False).mean()
-    exp2 = series_cleaned.ewm(span=long_window, adjust=False).mean()
+    exp1 = series.ewm(span=short_window, adjust=False).mean()
+    exp2 = series.ewm(span=long_window, adjust=False).mean()
     macd = exp1 - exp2
     macd_signal = macd.ewm(span=signal_window, adjust=False).mean()
     macd_hist = macd - macd_signal
-
     return (macd.reindex(series.index), macd_signal.reindex(series.index), macd_hist.reindex(series.index))
 
 @lru_cache(maxsize=128)
 def calculate_sma(series: pd.Series, window: int) -> pd.Series:
-    """
-    محاسبه میانگین متحرک ساده (SMA).
-    Args:
-        series (pd.Series): سری قیمت‌ها.
-        window (int): دوره بازبینی.
-    Returns:
-        pd.Series: سری مقادیر SMA.
-    """
     series = pd.to_numeric(series, errors='coerce')
-    series_cleaned = series.dropna()
-    if series.isnull().all() or len(series_cleaned) < window:
+    if series.isnull().all() or len(series.dropna()) < window:
         return pd.Series([np.nan] * len(series), index=series.index)
-
-    sma = series_cleaned.rolling(window=window).mean()
-    return sma.reindex(series.index)
+    return series.rolling(window=window).mean().reindex(series.index)
 
 @lru_cache(maxsize=128)
 def calculate_bollinger_bands(series: pd.Series, window: int = 20, num_std_dev: int = 2) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """
-    محاسبه باندهای بولینگر.
-    Args:
-        series (pd.Series): سری قیمت‌ها.
-        window (int): دوره بازبینی.
-        num_std_dev (int): تعداد انحراف معیار.
-    Returns:
-        Tuple[pd.Series, pd.Series, pd.Series]: (میانگین متحرک, باند بالا, باند پایین)
-    """
     series = pd.to_numeric(series, errors='coerce')
-    series_cleaned = series.dropna()
-    if series.isnull().all() or len(series_cleaned) < window:
+    if series.isnull().all() or len(series.dropna()) < window:
         nan_series = pd.Series([np.nan] * len(series), index=series.index)
         return nan_series, nan_series, nan_series
-
-    ma = series_cleaned.rolling(window=window).mean()
-    std = series_cleaned.rolling(window=window).std()
-
+    ma = series.rolling(window=window).mean()
+    std = series.rolling(window=window).std()
     upper_band = ma + (std * num_std_dev)
     lower_band = ma - (std * num_std_dev)
-
     return (ma.reindex(series.index), upper_band.reindex(series.index), lower_band.reindex(series.index))
 
 @lru_cache(maxsize=128)
 def calculate_volume_ma(series: pd.Series, window: int = 20) -> pd.Series:
-    """
-    محاسبه میانگین متحرک حجم.
-    Args:
-        series (pd.Series): سری حجم معاملات.
-        window (int): دوره بازبینی.
-    Returns:
-        pd.Series: سری مقادیر میانگین متحرک حجم.
-    """
     series = pd.to_numeric(series, errors='coerce')
-    series_cleaned = series.dropna()
-    if series.isnull().all() or len(series_cleaned) < window:
+    if series.isnull().all() or len(series.dropna()) < window:
         return pd.Series([np.nan] * len(series), index=series.index)
-
-    volume_ma = series_cleaned.rolling(window=window).mean()
-    return volume_ma.reindex(series.index)
+    return series.rolling(window=window).mean().reindex(series.index)
 
 @lru_cache(maxsize=128)
 def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-    """
-    محاسبه Average True Range (ATR).
-    Args:
-        high (pd.Series): سری قیمت‌های بالا.
-        low (pd.Series): سری قیمت‌های پایین.
-        close (pd.Series): سری قیمت‌های بسته شدن.
-        window (int): دوره بازبینی.
-    Returns:
-        pd.Series: سری مقادیر ATR.
-    """
-    combined_df = pd.DataFrame({'high': high, 'low': low, 'close': close})
-    if combined_df.empty or len(combined_df.dropna()) < window + 1:
+    df = pd.DataFrame({'high': high, 'low': low, 'close': close}).apply(pd.to_numeric, errors='coerce')
+    if df.isnull().all().all() or len(df.dropna()) < window:
         return pd.Series([np.nan] * len(high), index=high.index)
-
-    tr1 = combined_df['high'] - combined_df['low']
-    tr2 = np.abs(combined_df['high'] - combined_df['close'].shift(1))
-    tr3 = np.abs(combined_df['low'] - combined_df['close'].shift(1))
-    
-    true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
-    
-    atr = true_range.ewm(span=window, adjust=False, min_periods=window).mean()
-    
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/window, adjust=False).mean()
     return atr.reindex(high.index)
 
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
@@ -337,14 +262,14 @@ def check_candlestick_patterns(today_candle_data: Dict[str, Union[float, int]],
         return detected_patterns
 
     is_in_downtrend = False
-    if 'close_price' in historical_data.columns and len(historical_data) >= 10:
-        recent_closes = historical_data['close_price'].iloc[-10:]
+    if 'close' in historical_data.columns and len(historical_data) >= 10:
+        recent_closes = historical_data['close'].iloc[-10:]
         if not recent_closes.empty and recent_closes.iloc[0] > recent_closes.iloc[-1]:
             is_in_downtrend = True
             
     is_in_uptrend = False
-    if 'close_price' in historical_data.columns and len(historical_data) >= 10:
-        recent_closes = historical_data['close_price'].iloc[-10:]
+    if 'close' in historical_data.columns and len(historical_data) >= 10:
+        recent_closes = historical_data['close'].iloc[-10:]
         if not recent_closes.empty and recent_closes.iloc[0] < recent_closes.iloc[-1]:
             is_in_uptrend = True
             
@@ -376,10 +301,10 @@ def check_candlestick_patterns(today_candle_data: Dict[str, Union[float, int]],
         day2 = historical_data.iloc[-2]
         day3 = historical_data.iloc[-1]
         
-        if day1['close_price'] < day1['open_price']:
-            if abs(day2['close_price'] - day2['open_price']) < (day2['high_price'] - day2['low_price']) * 0.2:
-                if (day3['close_price'] > day3['open_price'] and
-                    day3['close_price'] > (day1['open_price'] + day1['close_price']) / 2):
+        if day1['close'] < day1['open']:
+            if abs(day2['close'] - day2['open']) < (day2['high'] - day2['low']) * 0.2:
+                if (day3['close'] > day3['open'] and
+                    day3['close'] > (day1['open'] + day1['close']) / 2):
                     if is_in_downtrend:
                         detected_patterns.append("Morning Star")
                         
@@ -389,10 +314,10 @@ def check_candlestick_patterns(today_candle_data: Dict[str, Union[float, int]],
         day2 = historical_data.iloc[-2]
         day3 = historical_data.iloc[-1]
         
-        if day1['close_price'] > day1['open_price']:
-            if abs(day2['close_price'] - day2['open_price']) < (day2['high_price'] - day2['low_price']) * 0.2:
-                if (day3['close_price'] < day3['open_price'] and
-                    day3['close_price'] < (day1['open_price'] + day1['close_price']) / 2):
+        if day1['close'] > day1['open']:
+            if abs(day2['close'] - day2['open']) < (day2['high'] - day2['low']) * 0.2:
+                if (day3['close'] < day3['open'] and
+                    day3['close'] < (day1['open'] + day1['close']) / 2):
                     if is_in_uptrend:
                         detected_patterns.append("Evening Star")
 
@@ -434,3 +359,160 @@ def calculate_z_score(series: pd.Series) -> Optional[float]:
         
     z_score = (series_cleaned.iloc[-1] - mean) / std
     return float(z_score)
+
+
+
+
+# --- NEW: توابع محاسبه اندیکاتورهای جدید ---
+
+
+def calculate_stochastic(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> Tuple[pd.Series, pd.Series]:
+    """محاسبه Stochastic Oscillator (%K و %D)."""
+    # 🛠️ اعمال .squeeze() در ورودی‌ها (برای امنیت کامل)
+    high = high.squeeze()
+    low = low.squeeze()
+    close = close.squeeze()
+    
+    df = pd.DataFrame({'high': high, 'low': low, 'close': close}).apply(pd.to_numeric, errors='coerce')
+    if df.isnull().all().all() or len(df.dropna()) < window:
+        nan_series = pd.Series([np.nan] * len(close), index=close.index)
+        return nan_series, nan_series
+
+    low_min = df['low'].rolling(window=window).min()
+    high_max = df['high'].rolling(window=window).max()
+    
+    k = 100 * ((df['close'] - low_min) / (high_max - low_min).replace(0, np.nan))
+    k = k.fillna(50) 
+    
+    d = k.rolling(window=smooth_k).mean()
+    
+    # 🛠️ اطمینان از خروجی float
+    return k.astype(float).reindex(close.index), d.astype(float).reindex(close.index)
+
+
+def calculate_squeeze_momentum(df: pd.DataFrame, bb_window=20, bb_std=2, kc_window=20, kc_mult=1.5) -> Tuple[pd.Series, pd.Series]:
+    """محاسبه Squeeze Momentum Indicator."""
+    # 🛠️ اعمال .squeeze() در فراخوانی ستون‌ها برای جلوگیری از DataFrame تک‌ستونی
+    close = pd.to_numeric(df['close_price'].squeeze(), errors='coerce')
+    high = pd.to_numeric(df['high_price'].squeeze(), errors='coerce')
+    low = pd.to_numeric(df['low_price'].squeeze(), errors='coerce')
+    
+    # Bollinger Bands
+    bb_ma = close.rolling(window=bb_window).mean()
+    bb_std_dev = close.rolling(window=bb_window).std()
+    bb_upper = bb_ma + (bb_std_dev * bb_std)
+    bb_lower = bb_ma - (bb_std_dev * bb_std)
+
+    # Keltner Channels
+    tr = pd.concat([(high - low), abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
+    atr = tr.rolling(window=kc_window).mean()
+    kc_ma = close.rolling(window=kc_window).mean()
+    kc_upper = kc_ma + (atr * kc_mult)
+    kc_lower = kc_ma - (atr * kc_mult)
+    
+    # Squeeze condition (خروجی Boolean)
+    squeeze_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
+
+    # Momentum
+    highest_high = high.rolling(window=bb_window).max()
+    lowest_low = low.rolling(window=bb_window).min()
+    avg_hl = (highest_high + lowest_low) / 2
+    avg_close = close.rolling(window=bb_window).mean()
+    momentum = (close - (avg_hl + avg_close) / 2)
+    
+    # 💥 FIX: raw=True برای پایداری np.polyfit (اصلاح اصلی)
+    momentum_smoothed = momentum.rolling(window=bb_window).apply(lambda x: np.polyfit(np.arange(len(x)), x, 1)[0], raw=True)
+
+    # 🛠️ تبدیل صریح Boolean به Integer
+    return squeeze_on.astype(int).reindex(df.index), momentum_smoothed.reindex(df.index)
+
+
+def calculate_halftrend(df: pd.DataFrame, amplitude=2, channel_deviation=2) -> Tuple[pd.Series, pd.Series]:
+    """
+    محاسبه اندیکاتور HalfTrend.
+    💥 نسخه نهایی و کاملاً مستقل برای حل قطعی خطای unhashable type 💥
+    تمام فراخوانی‌های توابع کمکی (atr, sma) حذف و منطق آنها مستقیماً پیاده‌سازی شده است.
+    """
+    
+    try:
+        # 🛠️ اعمال .squeeze() در فراخوانی ستون‌ها
+        high = pd.to_numeric(df['high_price'].squeeze(), errors='coerce')
+        low = pd.to_numeric(df['low_price'].squeeze(), errors='coerce')
+        close = pd.to_numeric(df['close_price'].squeeze(), errors='coerce')
+
+        # ===> FIX 1: منطق calculate_atr مستقیماً پیاده‌سازی شده <===
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=100).mean() / 2
+
+        high_price = high.rolling(window=amplitude).max()
+        low_price = low.rolling(window=amplitude).min()
+        
+        # ===> FIX 2: منطق calculate_sma مستقیماً پیاده‌سازی شده <===
+        highma = high_price.rolling(window=amplitude).mean()
+        lowma = low_price.rolling(window=amplitude).mean()
+
+        # اطمینان از اینکه ستون‌های موقت از قبل وجود ندارند
+        if 'trend' in df.columns: df.drop('trend', axis=1, inplace=True)
+        if 'next_trend' in df.columns: df.drop('next_trend', axis=1, inplace=True)
+            
+        df['trend'] = 0
+        df['next_trend'] = 0
+        
+        close_list = close.to_list()
+        lowma_list = lowma.squeeze().to_list()
+        highma_list = highma.squeeze().to_list()
+        
+        trend_list = df['trend'].to_list()
+        next_trend_list = df['next_trend'].to_list()
+        
+        close_list = [v.item() if isinstance(v, pd.Series) else v for v in close_list]
+        highma_list = [v.item() if isinstance(v, pd.Series) else v for v in highma_list]
+        lowma_list = [v.item() if isinstance(v, pd.Series) else v for v in lowma_list]
+        
+        for i in range(1, len(df)):
+            if next_trend_list[i-1] == 1:
+                if close_list[i] < lowma_list[i-1]:
+                    trend_list[i] = -1
+                else:
+                    trend_list[i] = 1
+            else:
+                if close_list[i] > highma_list[i-1]:
+                    trend_list[i] = 1
+                else:
+                    trend_list[i] = -1
+
+            if trend_list[i] == trend_list[i-1]:
+                next_trend_list[i] = trend_list[i-1]
+            else:
+                next_trend_list[i] = trend_list[i]
+
+        df['trend'] = pd.Series(trend_list, index=df.index, dtype=int)
+        
+        buy_signal = (df['trend'] == 1) & (df['trend'].shift(1) == -1)
+        
+        return buy_signal.astype(int).reindex(df.index), df['trend'].reindex(df.index)
+
+    except Exception as e:
+        logger.error(f"خطای بحرانی در پردازش HalfTrend برای یک نماد: {e}", exc_info=True)
+        nan_series = pd.Series([np.nan] * len(df), index=df.index)
+        return nan_series, nan_series
+
+
+def calculate_support_resistance_break(df: pd.DataFrame, window=50) -> Tuple[pd.Series, pd.Series]:
+    """محاسبه ساده شکست مقاومت."""
+    # 🛠️ اعمال .squeeze() در فراخوانی ستون‌ها
+    close = pd.to_numeric(df['close_price'].squeeze(), errors='coerce')
+    high = pd.to_numeric(df['high_price'].squeeze(), errors='coerce')
+    
+    resistance = high.shift(1).rolling(window=window).max()
+    
+    # شکست زمانی رخ می‌دهد که قیمت پایانی امروز بالاتر از مقاومت دیروز باشد (خروجی Boolean)
+    resistance_broken = close > resistance
+    
+    # 🛠️ تبدیل صریح Boolean به Integer و اطمینان از خروجی float برای resistance
+    resistance_broken_int = resistance_broken.astype(int)
+    
+    return resistance.astype(float).reindex(df.index), resistance_broken_int.reindex(df.index)

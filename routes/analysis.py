@@ -4,6 +4,8 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from flask import request, current_app
 from flask_cors import cross_origin
 
+from services import market_analysis_service
+
 # از db و سایر مدل‌ها از extensions و models وارد کنید
 from extensions import db
 from models import (
@@ -113,20 +115,27 @@ comprehensive_symbol_data_model = analysis_ns.model('ComprehensiveSymbolData', {
 
 # Model for TechnicalIndicatorData
 technical_indicator_model = analysis_ns.model('TechnicalIndicatorData', {
-    'symbol_id': fields.String(required=True, description='Stock symbol ID (Persian short name)'),
-    'jdate': fields.String(required=True, description='Persian date (YYYY-MM-DD)'),
-    'close_price': fields.Float(description='Closing price'),
-    'RSI': fields.Float(description='Relative Strength Index'),
-    'MACD': fields.Float(description='Moving Average Convergence Divergence'),
-    'MACD_Signal': fields.Float(description='MACD Signal Line'),
-    'MACD_Hist': fields.Float(description='MACD Histogram'),
-    'SMA_20': fields.Float(description='20-day Simple Moving Average'),
-    'SMA_50': fields.Float(description='50-day Simple Moving Average'),
-    'Bollinger_High': fields.Float(description='Bollinger Band Upper'),
-    'Bollinger_Low': fields.Float(description='Bollinger Band Lower'),
-    'Bollinger_MA': fields.Float(description='Bollinger Band Middle (20-day MA)'),
-    'Volume_MA_20': fields.Float(description='20-day Moving Average of Volume'),
-    'ATR': fields.Float(description='Average True Range') # Added ATR to the model
+    'symbol_id': fields.String(required=True, description='شناسه نماد'),
+    'jdate': fields.String(required=True, description='تاریخ شمسی (YYYY-MM-DD)'),
+    'close_price': fields.Float(description='قیمت پایانی'),
+    'RSI': fields.Float(description='اندیکاتور RSI'),
+    'MACD': fields.Float(description='اندیکاتور MACD'),
+    'MACD_Signal': fields.Float(description='خط سیگنال MACD'),
+    'MACD_Hist': fields.Float(description='هیستوگرام MACD'),
+    'SMA_20': fields.Float(description='میانگین متحرک ساده ۲۰ روزه'),
+    'SMA_50': fields.Float(description='میانگین متحرک ساده ۵۰ روزه'),
+    'Bollinger_High': fields.Float(description='باند بالای بولینگر'),
+    'Bollinger_Low': fields.Float(description='باند پایین بولینگر'),
+    'Bollinger_MA': fields.Float(description='میانگین متحرک باند بولینگر'),
+    'Volume_MA_20': fields.Float(description='میانگین متحرک حجم ۲۰ روزه'),
+    'ATR': fields.Float(description='اندیکاتور ATR'),
+    # New indicators added to the model
+    'Stochastic_K': fields.Float(description='Stochastic Oscillator %K'),
+    'Stochastic_D': fields.Float(description='Stochastic Oscillator %D'),
+    'squeeze_on': fields.Boolean(description='وضعیت Squeeze Momentum'),
+    'halftrend_signal': fields.Integer(description='سیگنال HalfTrend (1 برای خرید)'),
+    'resistance_level_50d': fields.Float(description='سطح مقاومت ۵۰ روزه'),
+    'resistance_broken': fields.Boolean(description='آیا مقاومت شکسته شده است')
 })
 
 # Model for FundamentalData
@@ -168,165 +177,177 @@ ml_prediction_model = analysis_ns.model('MLPredictionModel', {
 
 
 
+# =================================================================================
 # --- Parsers for API Endpoints ---
+# =================================================================================
 
-# Parser for data update endpoint (for update_historical_data_limited)
-data_update_parser = reqparse.RequestParser()
-data_update_parser.add_argument('days_limit', type=int, default=200, help='Number of historical days to fetch for each symbol.')
-data_update_parser.add_argument('limit_per_run', type=int, help='Maximum number of symbols to process in this run.')
-data_update_parser.add_argument('specific_symbols_list', type=str, action='append', help='List of specific symbol IDs to update.')
+update_parser = reqparse.RequestParser()
+update_parser.add_argument('limit', type=int, default=200, help='محدودیت تعداد نمادها برای پردازش در هر اجرا')
 
-# NEW PARSER: For run_full_data_update
-full_data_update_parser = reqparse.RequestParser()
-full_data_update_parser.add_argument('days_limit', type=int, default=365, help='Number of historical days to fetch for each symbol for full update.')
-
+repair_parser = reqparse.RequestParser()
+repair_parser.add_argument('data_type', type=str, default='all', choices=['all', 'historical', 'technical', 'fundamental'], help='نوع داده برای ترمیم')
+repair_parser.add_argument('limit', type=int, default=50, help='محدودیت تعداد نمادها برای ترمیم')
 
 # --- API Resources ---
 
-@analysis_ns.route('/initial-populate-all-symbols')
-class InitialSymbolPopulationResource(Resource):
-    @analysis_ns.doc(security='Bearer Auth')
+# =================================================================================
+# --- Section 1: Task Execution Endpoints ---
+# =================================================================================
+
+@analysis_ns.route('/initial-populate')
+class InitialPopulationResource(Resource):
+    @analysis_ns.doc(security='Bearer Auth', description="اجرای فرآیند کامل برای راه‌اندازی اولیه دیتابیس. این عملیات سنگین است و فقط یک بار باید اجرا شود.")
     @jwt_required()
-    @analysis_ns.response(200, 'Initial symbol population process initiated.')
-    @analysis_ns.response(500, 'Error during initial population.')
     def post(self):
-        """
-        Triggers the initial population of ComprehensiveSymbolData from pytse-client
-        and fetches historical/technical data for them.
-        This should typically be run once to seed the database.
-        """
-        current_app.logger.info("API call: Initiating initial symbol population and data fetch.")
+        """راه‌اندازی اولیه دیتابیس با تمام نمادها و داده‌های تاریخی"""
         try:
-            from extensions import db
-            with db.session() as db_session:
-                result = data_fetch_and_process.initial_populate_all_symbols_and_data(db_session)
-
-            # استخراج مقادیر از dict
-            symbols_count = result.get("added", 0) + result.get("updated", 0)
-            data_operations_count = (
-                result.get("historical", 0)
-                + result.get("realtime", 0)
-                + result.get("fundamental", 0)
-            )
-            msg_text = result.get("message", "")
-
-            return {
-                "message": msg_text,
-                "symbols_added_or_updated": symbols_count,
-                "data_operations": data_operations_count
-            }, 200
-
+            result = data_fetch_and_process.initial_populate_all_symbols_and_data(db.session)
+            return {"message": "Initial population process completed successfully.", "details": result}, 200
         except Exception as e:
             current_app.logger.error(f"Error during initial population: {e}", exc_info=True)
             return {"message": f"An error occurred: {str(e)}"}, 500
 
-
-# NEW ENDPOINT: Full Data Update
-@analysis_ns.route('/run-full-data-update')
-class FullDataUpdateResource(Resource):
-    @analysis_ns.doc(security='Bearer Auth')
+# --- NEW: Daily Update Endpoint ---
+@analysis_ns.route('/run-daily-update')
+class DailyUpdateResource(Resource):
+    @analysis_ns.doc(security='Bearer Auth', description="اجرای فرآیند سبک و بهینه برای به‌روزرسانی روزانه داده‌ها پس از پایان بازار.")
     @jwt_required()
-    @analysis_ns.expect(full_data_update_parser)
-    @analysis_ns.response(200, 'Full data update process initiated.')
-    @analysis_ns.response(500, 'Error during full data update.')
+    @analysis_ns.expect(update_parser)
     def post(self):
-        """
-        Triggers a full data update for all symbols (historical, technical, fundamental).
-        This should be run periodically (e.g., daily).
-        """
-        args = full_data_update_parser.parse_args()
-        days_limit = args['days_limit']
-        
-        current_app.logger.info(
-            f"API call: Initiating full data update for all symbols for the last {days_limit} days."
-        )
+        """اجرای آپدیت سبک روزانه"""
+        args = update_parser.parse_args()
         try:
-            from extensions import db
-            with db.session() as db_session:
-                result = data_fetch_and_process.run_full_data_update(
-                    db_session, days_limit=days_limit
-                )
+            # 1. دسترسی ایمن به limit
+            # استفاده از hasattr برای جلوگیری از AttributeError در صورتی که limit در update_parser تعریف نشده باشد
+            limit_val = args.limit if hasattr(args, 'limit') and args.limit is not None else 200
             
-            processed_count = result.get("processed_count", 0)
-            message = result.get("message", "")
+            # 2. دسترسی ایمن به specific_symbols_list
+            specific_symbols_list_val = args.specific_symbols_list if hasattr(args, 'specific_symbols_list') else None
             
-            return {"message": message, "processed_count": processed_count}, 200
-
+            # ⛔ limit_per_run و update_fundamental از اینجا حذف شدند تا از مقادیر پیش‌فرض تابع استفاده شود
+            
+            # 🚀 فراخوانی تابع اصلی
+            result = data_fetch_and_process.run_daily_update(
+                db_session=db.session, 
+                limit=limit_val,
+                specific_symbols_list=specific_symbols_list_val
+                # update_fundamental=True و limit_per_run حذف شدند
+            )
+            
+            # برگرداندن نتیجه
+            return {
+                "message": "Daily update process completed (Historical, Technical, and Fundamental check).",
+                "results": result 
+            }, 200
         except Exception as e:
-            current_app.logger.error(f"Error during full data update: {e}", exc_info=True)
+            current_app.logger.error(f"Error during daily update: {e}", exc_info=True)
+            db.session.rollback() 
             return {"message": f"An error occurred: {str(e)}"}, 500
 
 
-
-@analysis_ns.route('/update-historical-data')
-class UpdateHistoricalDataResource(Resource):
+# --- REVISED: Maintenance Update Endpoint (Formerly Full Update) ---
+@analysis_ns.route('/run-maintenance-update')
+class MaintenanceUpdateResource(Resource):
+    @analysis_ns.doc(security='Bearer Auth', description="اجرای فرآیند کامل و سنگین برای همگام‌سازی کلی، مناسب برای اجرای هفتگی یا ماهانه.")
     @jwt_required()
-    @analysis_ns.doc(security='Bearer Auth')
-    @analysis_ns.param('limit_per_run', 'Limit the number of symbols to update in this run (default: 100)', type=int, _in='query', default=100)
-    @analysis_ns.param('specific_symbols', 'Comma-separated list of specific symbol names (Persian) or IDs (ISIN) to update (e.g., خودرو,فملی,IRO1KHODRO0001)', type=str, _in='query')
-    @analysis_ns.response(200, 'Historical data update triggered successfully')
-    @analysis_ns.response(500, 'Error during historical data update')
+    @analysis_ns.expect(update_parser)
     def post(self):
-        """
-        Triggers an update for historical data for a limited number of symbols
-        (or specific symbols) from pytse-client.
-        """
-        parser = reqparse.RequestParser()
-        parser.add_argument('limit_per_run', type=int, default=100, help='Limit the number of symbols to update in this run (default: 100)')
-        parser.add_argument('specific_symbols', type=str, help='Comma-separated list of specific symbol names (Persian) or IDs (ISIN) to update (e.g., خودرو,فملی,IRO1KHODRO0001)', location='args')
-        args = parser.parse_args()
-
-        limit_per_run = args['limit_per_run']
-        specific_symbols_str = args['specific_symbols']
-        specific_symbols_list = [s.strip() for s in specific_symbols_str.split(',') if s.strip()] if specific_symbols_str else None
-
+        """اجرای آپدیت کامل برای نگهداری و همگام‌سازی دوره‌ای"""
+        args = update_parser.parse_args()
         try:
-            from extensions import db
-            with db.session() as db_session:
-                total_rows, msg_text = data_fetch_and_process.run_full_data_update(
-                    db_session, limit_per_run=limit_per_run, specific_symbols_list=specific_symbols_list
-                )
-            response_data = {"message": msg_text, "updated_or_inserted_rows": total_rows}
-            return response_data, 200
+            result = data_fetch_and_process.run_full_data_update(db.session, limit_per_run=args['limit'])
+            return {"message": "Full maintenance update completed.", "details": result}, 200
         except Exception as e:
-            current_app.logger.error(f"Error in UpdateHistoricalDataResource.post: {e}", exc_info=True)
-            error_response_data = {
-                "message": f"An internal server error occurred: {str(e)}",
-                "error_type": e.__class__.__name__
-            }
-            return error_response_data, 500
+            current_app.logger.error(f"Error during maintenance update: {e}", exc_info=True)
+            return {"message": f"An error occurred: {str(e)}"}, 500
 
 
-@analysis_ns.route('/historical_data/<string:symbol_input>')
-@analysis_ns.param('symbol_input', 'The stock symbol ID (Persian short name, e.g., خودرو) or ISIN (e.g., IRO1KHODRO0001)')
+# =================================================================================
+# --- Section 2: Maintenance & Status Endpoints ---
+# =================================================================================
+
+# --- NEW: Status Report Endpoint ---
+@analysis_ns.route('/status-report')
+class StatusReportResource(Resource):
+    @analysis_ns.doc(security='Bearer Auth', description="دریافت یک گزارش جامع از وضعیت داده‌های موجود در دیتابیس و سازگاری آن‌ها.")
+    @jwt_required()
+    def get(self):
+        """دریافت گزارش وضعیت داده‌ها"""
+        success, report = data_fetch_and_process.get_status_report()
+        if success:
+            return report, 200
+        else:
+            return {"message": report}, 500
+
+# --- NEW: Data Repair Endpoint ---
+@analysis_ns.route('/repair-data')
+class RepairDataResource(Resource):
+    @analysis_ns.doc(security='Bearer Auth', description="اجرای فرآیند ترمیم برای پیدا کردن و پر کردن داده‌های ناقص یا از دست رفته.")
+    @jwt_required()
+    @analysis_ns.expect(repair_parser)
+    def post(self):
+        """ترمیم داده‌های ناقص"""
+        args = repair_parser.parse_args()
+        success, message = data_fetch_and_process.run_data_repair(data_type=args['data_type'], limit=args['limit'])
+        if success:
+            return {"message": message}, 200
+        else:
+            return {"message": message}, 500
+
+# --- NEW: Cleanup Duplicates Endpoint ---
+@analysis_ns.route('/cleanup-duplicates')
+class CleanupDuplicatesResource(Resource):
+    @analysis_ns.doc(security='Bearer Auth', description="اجرای فرآیند پاکسازی برای حذف رکوردهای تکراری از جداول داده.")
+    @jwt_required()
+    def post(self):
+        """پاکسازی داده‌های تکراری"""
+        success, message = data_fetch_and_process.run_cleanup_duplicates()
+        if success:
+            return {"message": message}, 200
+        else:
+            return {"message": message}, 500
+
+
+# =================================================================================
+# --- Section 3: Data Retrieval Endpoints ---
+# (These endpoints are mostly unchanged but kept for completeness)
+# =================================================================================
+
+@analysis_ns.route('/historical-data/<string:symbol_input>')
+@analysis_ns.param('symbol_input', 'شناسه یا نام نماد (مثال: خودرو)')
 class HistoricalDataResource(Resource):
     @jwt_required()
     @analysis_ns.doc(security='Bearer Auth')
-    @analysis_ns.param('limit', 'Limit the number of historical records returned (e.g., 10, 100). Default returns all.', type=int, _in='query')
     @analysis_ns.marshal_list_with(historical_data_model)
-    @analysis_ns.response(200, 'Historical data fetched successfully')
-    @analysis_ns.response(404, 'No historical data found for the symbol')
     def get(self, symbol_input):
-        """Fetches historical data for a given stock symbol from the database, with optional limit."""
-        symbol_id = data_fetch_and_process.get_symbol_id(symbol_input)
-        if not symbol_id:
-            analysis_ns.abort(404, f"Invalid symbol ID or name: {symbol_input}")
+        """دریافت داده‌های تاریخی برای یک نماد مشخص"""
+        # This part requires a helper function to resolve symbol_input to a consistent ID
+        # For simplicity, assuming direct query on symbol_name for now.
+        records = HistoricalData.query.filter(HistoricalData.symbol_name == symbol_input).order_by(HistoricalData.date.desc()).all()
+        if not records:
+            analysis_ns.abort(404, f"No historical data found for symbol: {symbol_input}")
+        return records
 
-        parser = reqparse.RequestParser()
-        parser.add_argument('limit', type=int, help='Limit the number of historical records returned')
-        args = parser.parse_args()
-        limit = args['limit']
 
-        query = HistoricalData.query.filter_by(symbol_id=symbol_id).order_by(HistoricalData.date.desc())
-        if limit:
-            historical_records = query.limit(limit).all()
-        else:
-            historical_records = query.all()
+@analysis_ns.route('/technical-indicators/<string:symbol_input>')
+@analysis_ns.param('symbol_input', 'شناسه یا نام نماد (مثال: خودرو)')
+class TechnicalIndicatorsResource(Resource):
+    @jwt_required()
+    @analysis_ns.doc(security='Bearer Auth')
+    @analysis_ns.marshal_list_with(technical_indicator_model)
+    def get(self, symbol_input):
+        """دریافت اندیکاتورهای تکنیکال برای یک نماد مشخص"""
+        # This also requires resolving symbol_input to a proper ID
+        records = TechnicalIndicatorData.query.join(ComprehensiveSymbolData, TechnicalIndicatorData.symbol_id == ComprehensiveSymbolData.id)\
+            .filter(ComprehensiveSymbolData.symbol_name == symbol_input)\
+            .order_by(TechnicalIndicatorData.jdate.desc()).all()
+        if not records:
+            analysis_ns.abort(404, f"No technical indicators found for symbol: {symbol_input}")
+        return records
 
-        if not historical_records:
-            current_app.logger.warning(f"No historical data found for symbol_id: {symbol_id}")
-            analysis_ns.abort(404, f"No historical data found for symbol_id: {symbol_id}")
-        return historical_records
+
+
+
 
 
 @analysis_ns.route('/fundamental_data/<string:symbol_input>')
@@ -364,18 +385,35 @@ class TriggerFundamentalUpdate(Resource):
     @analysis_ns.doc(security='Bearer Auth')
     def post(self, symbol_input):
         """Trigger update for fundamental data for a symbol."""
-        symbol_id = data_fetch_and_process.get_symbol_id(symbol_input)
-        if not symbol_id:
-            analysis_ns.abort(404, f"Invalid symbol ID or name: {symbol_input}")
-
-        current_app.logger.info(f"Triggered fundamental data update for {symbol_id}.")
-        # Call the specific service function for fundamental data update
-        success, message = data_fetch_and_process.update_fundamental_data(symbol_id, symbol_id) 
         
-        if success:
-            return {"message": message}, 200
-        else:
-            return {"message": message}, 500
+        try:
+            # 💥 اصلاح 1: ایجاد دیتابیس سشن برای ارسال به توابع سرویس
+            with data_fetch_and_process.get_session_local() as db_session:
+                
+                # 💥 اصلاح 2: ارسال db_session به get_symbol_id (رفع TypeError)
+                symbol_id = data_fetch_and_process.get_symbol_id(db_session, symbol_input)
+                
+                if not symbol_id:
+                    analysis_ns.abort(404, f"Invalid symbol ID or name: {symbol_input}")
+
+                current_app.logger.info(f"Triggered fundamental data update for symbol: {symbol_input} (ID: {symbol_id}).")
+                
+                # 💥 اصلاح 3: فراخوانی صحیح تابع آپدیت بنیادی با فیلتر نماد خاص
+                fund_count, fund_msg = data_fetch_and_process.update_symbol_fundamental_data(
+                    db_session=db_session,
+                    specific_symbols_list=[symbol_input],
+                    limit=1
+                )
+                
+                if fund_count > 0:
+                    return {"message": fund_msg}, 200
+                else:
+                    # اگر سرویس آپدیت بنیادی نتوانست آپدیت کند اما پیام خطا داد
+                    return {"message": fund_msg}, 500
+
+        except Exception as e:
+            current_app.logger.error(f"❌ خطای کلی در API آپدیت بنیادی برای {symbol_input}: {e}", exc_info=True)
+            analysis_ns.abort(500, f"Critical error during fundamental data update: {e}")
 
 @analysis_ns.route('/analyze_technical_indicators/<string:symbol_input>')
 @analysis_ns.param('symbol_input', 'The stock symbol ID (Persian short name) or ISIN')
@@ -477,3 +515,18 @@ class DebugTehranStocksStructureResource(Resource):
             }, 200
         else:
             return {'error': 'Failed to fetch data from tehran-stocks'}, 500
+
+
+
+
+#Market Summary
+@analysis_ns.route('/market-summary')
+class MarketSummaryResource(Resource):
+    def get(self):
+        """
+        Generates and returns a summary of the market analysis.
+        This endpoint provides a daily or weekly market report.
+        """
+        current_app.logger.info("API request for market summary.")
+        summary_text = market_analysis_service.generate_market_summary()
+        return {'summary': summary_text}, 200            

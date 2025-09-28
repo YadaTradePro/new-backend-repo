@@ -256,19 +256,30 @@ class TechnicalIndicatorData(db.Model):
     jdate = db.Column(db.String(10), nullable=False)
     close_price = db.Column(db.Float)
     
-
+    # --- اندیکاتورهای استاندارد ---
     RSI = db.Column(db.Float)
     MACD = db.Column(db.Float)
     MACD_Signal = db.Column(db.Float)
     MACD_Hist = db.Column(db.Float)
     SMA_20 = db.Column(db.Float)
     SMA_50 = db.Column(db.Float)
-    Bollinger_High = db.Column(db.Float)  # یا Bollinger_Upper
-    Bollinger_Low = db.Column(db.Float)   # یا Bollinger_Lower  
-    Bollinger_MA = db.Column(db.Float)    # یا Bollinger_Middle
+    Bollinger_High = db.Column(db.Float)
+    Bollinger_Low = db.Column(db.Float)
+    Bollinger_MA = db.Column(db.Float)
     Volume_MA_20 = db.Column(db.Float)
     ATR = db.Column(db.Float)
     
+    # --- NEW: ستون‌های جدید برای اندیکاتورهای پیشرفته ---
+    Stochastic_K = db.Column(db.Float)
+    Stochastic_D = db.Column(db.Float)
+    
+    squeeze_on = db.Column(db.Boolean) # آیا در حالت فشردگی است؟
+    
+    halftrend_signal = db.Column(db.Integer) # 1 برای خرید، -1 برای فروش، 0 برای هیچی
+    
+    resistance_level_50d = db.Column(db.Float) # سطح مقاومت ۵۰ روزه
+    resistance_broken = db.Column(db.Boolean) # آیا مقاومت شکسته شده؟
+
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 

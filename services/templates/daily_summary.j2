@@ -1,0 +1,14 @@
+**تحلیل روزانه بازار بورس تهران - {{ jdate }}**
+
+## نمای کلی بازار
+**شاخص کل:** با تغییر **{{ '%.2f'|format(indices_data.Total_Index.percent|default(0)) }}%**، امروز روندی {{ indices_data.Total_Index.status }} را تجربه کرد.
+**شاخص هم‌وزن:** عملکرد {{ indices_data.Equal_Weighted_Index.status }} آن با تغییر **{{ '%.2f'|format(indices_data.Equal_Weighted_Index.percent|default(0)) }}%** نشان‌دهنده وضعیت سهام کوچک و متوسط بود.
+{{ smart_money_flow_text }}
+
+## تحلیل نمادهای منتخب
+{% if all_symbols %}
+در ادامه سیگنال‌های جدیدی که امروز شناسایی شده‌اند، آمده است:
+{{ symbols_text }}
+{% else %}
+امروز نماد جدیدی در لیست‌های انتخابی سیگنال‌دهی نشده است.
+{% endif %}

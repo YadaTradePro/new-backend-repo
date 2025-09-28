@@ -148,7 +148,7 @@ def cleanup_database():
 def run_rebuild_steps(token):
     """اجرای مراحل بازسازی"""
     steps = [
-        ("پر کردن نمادها", "POST", "/analysis/initial-populate-all-symbols", None)
+        ("پر کردن نمادها", "POST", "/analysis/initial-populate", None)
     ]
     
     for step_name, method, endpoint, data in steps:

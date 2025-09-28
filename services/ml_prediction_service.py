@@ -26,10 +26,10 @@ MODELS_DIR = '/app/models' if os.path.exists('/app') else os.path.join(PROJECT_R
 # ایجاد پوشه اگر وجود ندارد
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-print("✅ محیط تشخیص داده شد:")
-print("📁 مسیر پروژه:", PROJECT_ROOT)
-print("🤖 مسیر مدل‌ها:", MODELS_DIR)
-print("🏠 محیط:", "Docker" if os.path.exists('/app') else "Local Machine")
+print(" محیط تشخیص داده شد:")
+print(" مسیر پروژه:", PROJECT_ROOT)
+print(" مسیر مدل‌ها:", MODELS_DIR)
+print(" محیط:", "Docker" if os.path.exists('/app') else "Local Machine")
 
 # --- مسیرهای دیگر پروژه ---
 SERVICES_PATH = os.path.join(PROJECT_ROOT, 'services')

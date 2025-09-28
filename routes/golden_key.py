@@ -22,9 +22,9 @@ technical_filter_definition_model = golden_key_ns.model('TechnicalFilterDefiniti
 # UPDATED: GoldenKeyResult model to match database and frontend needs
 golden_key_result_model = golden_key_ns.model('GoldenKeyResultModel', {
     'symbol_id': fields.String(description='Symbol ID'),
-    'symbol_name': fields.String(description='Symbol Name (Persian)'),
+    #'symbol_name': fields.String(description='Symbol Name (Persian)'),
     'symbol': fields.String(description='Symbol Name (for compatibility)'), 
-    'name': fields.String(description='Symbol Name (for compatibility)'),   
+    #'name': fields.String(description='Symbol Name (for compatibility)'),   
     'total_score': fields.Integer(description='Total score based on matched filters'),
     'matched_filters': fields.Integer(description='Number of matched filters'), # This is the count
     'reason': fields.String(description='Human-readable reason for the signal'),

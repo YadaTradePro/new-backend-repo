@@ -40,7 +40,7 @@ def create_app(test_config=None):
 
     logging.root.setLevel(logging.DEBUG)
     handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('%(asctime)ss - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     logging.root.addHandler(handler)
     
@@ -186,6 +186,38 @@ def create_app(test_config=None):
             else:
                 click.echo(f"خطا: {message}")
 
+
+
+
+
+
+    @app.cli.command('run-candlestick-detection')
+    @click.option('--limit', default=None, type=int, help='تعداد نمادهایی که باید پردازش شوند (اختیاری).')
+    def run_candlestick_detection_command(limit):
+        """
+        اجرای تشخیص و ذخیره الگوهای شمعی برای نمادها.
+        """
+        from services.data_fetch_and_process import run_candlestick_detection
+        
+        click.echo("🕯️ شروع تشخیص الگوهای شمعی...")
+        
+        with app.app_context():
+            db_session = db.session
+            try:
+                processed_count = run_candlestick_detection(
+                    db_session=db_session, 
+                    limit=limit
+                )
+                click.echo(f"✅ موفقیت: {processed_count} الگوی شمعی برای نمادها پردازش و ذخیره شد.")
+            except Exception as e:
+                click.echo(f"❌ خطای بحرانی در اجرای Candlestick Detection: {e}", err=True)
+                db_session.rollback()
+                sys.exit(1)
+
+
+                
+                            
+
     return app
 
 # --- اضافه کردن کد برای اجرای خودکار سرور پراکسی در زمان اجرای برنامه اصلی ---
@@ -196,55 +228,34 @@ def start_tgju_proxy_service():
     اجرای سرور پراکسی TGJU به عنوان یک فرآیند پس‌زمینه.
     """
     global tgju_proxy_process
-    # بررسی کنید که آیا فرآیند از قبل در حال اجرا است
     if tgju_proxy_process and tgju_proxy_process.poll() is None:
         return
 
     logger.info("در حال راه‌اندازی سرور پراکسی TGJU در پس‌زمینه...")
     try:
-        # Popen فرآیند را در پس‌زمینه اجرا می‌کند و بلافاصله برمی‌گردد
         tgju_proxy_process = subprocess.Popen(
             [sys.executable, 'services/tgju.py'],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
-        # یک تأخیر کوتاه برای اطمینان از راه‌اندازی سرور
         time.sleep(2)
         logger.info("سرور پراکسی TGJU با موفقیت راه‌اندازی شد.")
     except FileNotFoundError:
-        logger.error("خطا: فایل services/tgju.py پیدا نشد. لطفاً مطمئن شوید مسیر صحیح است.")
+        logger.error("خطا: فایل services/tgju.py پیدا نشد. مطمئن شوید مسیر صحیح است.")
     except Exception as e:
         logger.error(f"خطا در راه‌اندازی سرور پراکسی TGJU: {e}", exc_info=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = create_app()
-    
-    # --- تغییر: اضافه کردن فراخوانی تابع راه‌اندازی سرور در اینجا ---
-    start_tgju_proxy_service()
-    
-    # فقط در محیط توسعه (زمانی که با python main.py اجرا می‌شود)
-    if os.environ.get('FLASK_ENV') == 'development':
-      with app.app_context():
-          from services.data_fetch_and_process import initial_populate_all_symbols_and_data
-          from services.weekly_watchlist_service import run_weekly_watchlist_selection, evaluate_weekly_watchlist_performance
-          from services.golden_key_service import run_golden_key_analysis_and_save, calculate_golden_key_win_rate
-          from services.potential_buy_queues_service import run_potential_buy_queue_analysis_and_save
-          from services.ml_prediction_service import update_ml_prediction_outcomes
-          
-          scheduler.init_app(app)
-          scheduler.start()
-          
-          # Add jobs
-          scheduler.add_job(id='full_data_update_job', func=initial_populate_all_symbols_and_data, trigger='cron', hour=3, minute=0, timezone='Asia/Tehran', replace_existing=True)
-          scheduler.add_job(id='weekly_watchlist_selection_job', func=run_weekly_watchlist_selection, trigger='cron', day_of_week='thu', hour=18, minute=0, timezone='Asia/Tehran', replace_existing=True)
-          scheduler.add_job(id='run_golden_key_filters_job', func=run_golden_key_analysis_and_save, trigger='cron', day_of_week='thu', hour=19, minute=0, timezone='Asia/Tehran', replace_existing=True)
-          scheduler.add_job(id='calculate_golden_key_win_rate_job', func=calculate_golden_key_win_rate, trigger='cron', day_of_week='thu', hour=1, minute=0, timezone='Asia/Tehran', replace_existing=True)
-          scheduler.add_job(id='weekly_watchlist_performance_job', func=evaluate_weekly_watchlist_performance, trigger='cron', day_of_week='thu', hour=2, minute=00, timezone='Asia/Tehran', replace_existing=True)
-          scheduler.add_job(id='potential_buy_queues_job', func=run_potential_buy_queue_analysis_and_save, trigger='cron', hour=7, minute=30, timezone='Asia/Tehran', replace_existing=True)
-          scheduler.add_job(id='generate_ml_predictions_job', func=generate_and_save_predictions_for_watchlist, trigger='cron', day_of_week='thu', hour=3, minute=0, timezone='Asia/Tehran', replace_existing=True)
-          scheduler.add_job(id='update_ml_outcomes_job', func=update_ml_prediction_outcomes, trigger='cron', hour=8, minute=0, timezone='Asia/Tehran', replace_existing=True)
-          app.logger.info("APScheduler initialized and jobs added in development mode.")
 
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
+    # راه‌اندازی پراکسی TGJU (فقط در کانتینر API یا اجرا مستقیم)
+    start_tgju_proxy_service()
+
+    # فقط در حالت توسعه (نه در production و نه در scheduler)
+    if os.environ.get("FLASK_ENV") == "development":
+        with app.app_context():
+            app.logger.info("Scheduler باید در scheduler.py اجرا شود، نه در main.py")
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)

@@ -3,7 +3,7 @@
 # نسخه بازنویسی شده با توابع نسخه 10 جولای
 
 from extensions import db
-from models import HistoricalData, ComprehensiveSymbolData, TechnicalIndicatorData, FundamentalData
+from models import HistoricalData, ComprehensiveSymbolData, TechnicalIndicatorData, FundamentalData, CandlestickPatternDetection
 from flask import current_app
 from sqlalchemy import func, distinct, text
 from sqlalchemy.orm import sessionmaker, Session
@@ -28,7 +28,8 @@ import concurrent.futures
 import pytse_client
 import traceback
 
-
+from utils import calculate_stochastic, calculate_squeeze_momentum, calculate_halftrend, calculate_support_resistance_break, check_candlestick_patterns
+from sqlalchemy.orm import aliased
 
 
 # تنظیمات لاگینگ
@@ -95,6 +96,9 @@ def filter_symbols(symbols: List[Dict], exclude_list: List[str] = None) -> List[
     'بورس کالا',
     'بورس انرژی',
     'صندوق سرمایه گذاری',
+    'صندوق سرمایه گذاری قابل معامله',
+    'صندوق سرمایه گذاری در سهام',
+    'صندوق سرمایه گذاری در اوراق بهادار',
     'اوراق با درآمد ثابت',
     'پایه فرابورس',
     'اوراق تامین مالی'
@@ -773,11 +777,19 @@ def fetch_realtime_data_for_all_symbols(db_session: Session):
 # تابع fetch_and_process_historical_data (نسخه بازنویسی شده و جامع)
 # ----------------------------
 
+
+
 def fetch_and_process_historical_data(
     db_session: Session,
     limit: Optional[int] = None,
-    specific_symbols_list: Optional[List[str]] = None
+    specific_symbols_list: Optional[List[str]] = None,
+    limit_per_run: Optional[int] = None,
+    days_limit: Optional[int] = None  # compatibility alias
 ) -> Tuple[int, str]:
+    # normalize
+    if limit is None and limit_per_run is not None:
+        limit = limit_per_run
+    # days_limit فعلاً استفاده نمیشه، فقط برای جلوگیری از ارور
     """
     دریافت و پردازش داده‌های تاریخی جامع برای نمادهای مشخص یا تمام نمادها.
     این تابع داده‌های تاریخی، داده‌های حقیقی/حقوقی را در یک حلقه تجمیع می‌کند.
@@ -796,6 +808,9 @@ def fetch_and_process_historical_data(
                 else:
                     symbol_conditions.append(ComprehensiveSymbolData.symbol_name == symbol_identifier)
             query = query.filter(or_(*symbol_conditions))
+
+        if limit:
+            query = query.limit(limit)
         
         symbols_to_update = query.all()
         if not symbols_to_update:
@@ -804,13 +819,15 @@ def fetch_and_process_historical_data(
         for sym in symbols_to_update:
             logger.info(f"📊 آپدیت دیتای تاریخی جامع برای {sym.symbol_name} (ID: {sym.id})")
             
-            # دریافت آخرین تاریخ موجود در پایگاه داده
             last_db_date = db_session.query(
                 func.max(HistoricalData.date)
             ).filter(HistoricalData.symbol_id == sym.id).scalar()
             
             try:
-                ticker = tse.Ticker(symbol_name=sym.symbol_name, index=sym.tse_index)
+                if sym.tse_index:
+                    ticker = tse.Ticker("", index=str(sym.tse_index))
+                else:
+                    ticker = tse.Ticker(sym.symbol_name)
 
                 # 1. دریافت داده‌های اصلی تاریخی (شامل OHLCV)
                 df_history = ticker.history
@@ -820,12 +837,11 @@ def fetch_and_process_historical_data(
                 
                 # 2. دریافت داده‌های حقیقی/حقوقی
                 df_client_types = ticker.client_types
-                if df_client_types is None:
-                    # اگر داده‌ای یافت نشد، یک DataFrame خالی ایجاد می‌کنیم تا عملیات merge خطا ندهد
-                    df_client_types = pd.DataFrame(columns=['date', 'buy_count_i', 'buy_count_n', 'sell_count_i', 'sell_count_n', 
-                                                           'buy_i_volume', 'buy_n_volume', 'sell_i_volume', 'sell_n_volume'])
+                if df_client_types is None or df_client_types.empty:
+                    # ===> بهینه‌سازی: ایجاد DataFrame خالی فقط با ستون date برای merge موفق
+                    df_client_types = pd.DataFrame(columns=['date'])
                 else:
-                    # 📌 اصلاح: تغییر نام ستون‌ها برای تطابق با مدل دیتابیس
+                    # تغییر نام ستون‌ها برای تطابق با مدل دیتابیس
                     df_client_types = df_client_types.rename(columns={
                         "individual_buy_count": "buy_count_i",
                         "corporate_buy_count": "buy_count_n",
@@ -835,28 +851,18 @@ def fetch_and_process_historical_data(
                         "corporate_buy_vol": "buy_n_volume",
                         "individual_sell_vol": "sell_i_volume",
                         "corporate_sell_vol": "sell_n_volume"
-                    })                                           
+                    })                                             
 
-                # 3. دریافت داده‌های آماری (برای price_change و market_value)
-                # توجه: این داده‌ها فقط برای آخرین روز در دسترس هستند و به‌صورت تاریخی نیستند.
-                # برای این منظور، می‌توان از یک تابع جداگانه استفاده کرد که در پایان روز اجرا می‌شود.
-                # برای یکپارچگی، ما فرض می‌کنیم که این داده‌ها به صورت تاریخی از طریق یک تابع دیگر جمع‌آوری شده‌اند،
-                # یا از فیلدهای موجود در history استفاده می‌کنیم.
-                
-                # برای مثال، `final` و `yesterday_price` در تاریخچه اصلی وجود ندارند،
-                # اما `pytse_client` در برخی نسخه‌ها آنها را برمی‌گرداند.
-                # ما از متد .get() برای دسترسی امن به این فیلدها استفاده می‌کنیم.
-
-                # 4. ادغام داده‌ها
+                # 3. ادغام داده‌ها (کامنت‌های توضیحی شما حذف شد چون منطق در کد پیاده‌سازی می‌شود)
                 df_history['date'] = pd.to_datetime(df_history['date'])
-                df_client_types['date'] = pd.to_datetime(df_client_types['date'])
+                if 'date' in df_client_types.columns:
+                    df_client_types['date'] = pd.to_datetime(df_client_types['date'])
                 
-                # ادغام بر اساس ستون 'date'
                 df_merged = pd.merge(df_history, df_client_types, on='date', how='left')
 
                 # فیلتر کردن داده‌های جدید
                 if last_db_date:
-                    new_data = df_merged[df_merged['date'] > last_db_date]
+                    new_data = df_merged[df_merged['date'] > pd.to_datetime(last_db_date)].copy()
                 else:
                     new_data = df_merged.copy()
 
@@ -864,15 +870,38 @@ def fetch_and_process_historical_data(
                     logger.info(f"ℹ️ دیتای تاریخی جدیدی برای نماد {sym.symbol_name} یافت نشد.")
                     continue
                 
+                # ===> CHANGE START: بخش اصلی اضافه شده برای محاسبه ستون‌های جدید
+                # اطمینان از مرتب‌سازی بر اساس تاریخ برای محاسبات صحیح
+                new_data.sort_values(by='date', inplace=True)
+                
+                # محاسبه ستون‌های قیمت
+                new_data['final'] = new_data['close']
+                new_data['yesterday_price'] = new_data['close'].shift(1)
+                
+                # محاسبه تغییرات قیمت (Price Changes)
+                new_data['plc'] = new_data['close'] - new_data['yesterday_price']
+                new_data['plp'] = (new_data['plc'] / new_data['yesterday_price']) * 100
+                new_data['pcc'] = new_data['final'] - new_data['yesterday_price']
+                new_data['pcp'] = (new_data['pcc'] / new_data['yesterday_price']) * 100
+                
+                # بهترین تقریب برای ارزش بازار تاریخی، ارزش معاملات همان روز است
+                new_data['mv'] = new_data['value']
+
+                # جایگزینی مقادیر بی‌نهایت (inf) با None تا در دیتابیس خطا ایجاد نکند
+                new_data.replace([np.inf, -np.inf], None, inplace=True)
+                # ===> CHANGE END
+
                 # تبدیل تاریخ میلادی به شمسی
                 new_data['jdate'] = new_data['date'].apply(
                     lambda x: jdatetime.date.fromgregorian(date=x.date()).strftime("%Y-%m-%d")
                 )
                 
-                records = new_data.to_dict('records')
+                # تبدیل NaN به None و سپس به دیکشنری
+                records = new_data.where(pd.notnull(new_data), None).to_dict('records')
+            
                 historical_records = [
                     HistoricalData(
-                        symbol_id=sym.id,
+                        symbol_id=sym.symbol_id,
                         symbol_name=sym.symbol_name,
                         date=rec['date'].date(),
                         jdate=rec['jdate'],
@@ -880,16 +909,20 @@ def fetch_and_process_historical_data(
                         high=rec.get('high'),
                         low=rec.get('low'),
                         close=rec.get('close'),
-                        final=rec.get('final'),
-                        yesterday_price=rec.get('yesterday_price'),
                         volume=rec.get('volume'),
                         value=rec.get('value'),
-                        num_trades=rec.get('count'), # در pytse_client، تعداد معاملات با 'count' نامگذاری شده است
-                        plc=rec.get('price_change_close'),
-                        plp=rec.get('price_percent_change_close'),
-                        pcc=rec.get('price_change_final'),
-                        pcp=rec.get('price_percent_change_final'),
-                        mv=rec.get('market_value'),
+                        num_trades=rec.get('count'),
+                        
+                        # ===> CHANGE START: اصلاح کلیدها برای خواندن از ستون‌های محاسبه‌شده
+                        final=rec.get('final'),
+                        yesterday_price=rec.get('yesterday_price'),
+                        plc=rec.get('plc'),
+                        plp=rec.get('plp'),
+                        pcc=rec.get('pcc'),
+                        pcp=rec.get('pcp'),
+                        mv=rec.get('mv'),
+                        # ===> CHANGE END
+                        
                         buy_count_i=rec.get('buy_count_i'),
                         buy_count_n=rec.get('buy_count_n'),
                         sell_count_i=rec.get('sell_count_i'),
@@ -898,8 +931,8 @@ def fetch_and_process_historical_data(
                         buy_n_volume=rec.get('buy_n_volume'),
                         sell_i_volume=rec.get('sell_i_volume'),
                         sell_n_volume=rec.get('sell_n_volume'),
-                        # توجه: داده‌های عمق بازار (مانند qd1, pd1, zd1) فقط برای اطلاعات لحظه‌ای در دسترس هستند
-                        # و به صورت تاریخی توسط pytse-client ارائه نمی‌شوند.
+                        
+                        # داده‌های عمق بازار در تاریخچه وجود ندارند و به درستی None باقی می‌مانند
                         zd1=None, qd1=None, pd1=None,
                         zo1=None, qo1=None, po1=None,
                         zd2=None, qd2=None, pd2=None,
@@ -918,10 +951,12 @@ def fetch_and_process_historical_data(
                     updated_count += len(historical_records)
                     logger.info(f"✅ {len(historical_records)} رکورد جدید برای {sym.symbol_name} اضافه شد.")
                     db_session.commit()
-                    safe_sleep(DEFAULT_PER_SYMBOL_DELAY)
+                
+                safe_sleep(DEFAULT_PER_SYMBOL_DELAY)
             
             except Exception as e:
                 logger.error(f"❌ خطا در پردازش داده‌های تاریخی برای نماد {sym.symbol_name}: {e}")
+                logger.error(traceback.format_exc()) # لاگ کردن کامل خطا برای دیباگ بهتر
                 db_session.rollback()
                 continue
     
@@ -943,99 +978,24 @@ def fetch_and_process_historical_data(
 # تابع update_historical_data_limited (نسخه اصلاح‌شده)
 # ----------------------------
 
-def update_historical_data_limited(
-    db_session: Session, 
-    limit: Optional[int] = None, 
-    specific_symbols_list: list = None,
-    days_limit: int = 365 # این پارامتر را اضافه کنید
-) -> Tuple[int, str]:
-    """
-    آپدیت داده‌های تاریخی برای نمادهایی که نیاز به به‌روزرسانی دارند.
-    این تابع به صورت هوشمند و بهینه، تنها داده‌های جدید را دانلود و ذخیره می‌کند.
-    """
-    logger.info("📈 آپدیت داده‌های تاریخی...")
-    updated_symbols_count = 0
-    message = "Historical data updated successfully."
+#def update_historical_data_limited(DELETED)
 
-    try:
-        query = db_session.query(ComprehensiveSymbolData)
-        if specific_symbols_list:
-            query = query.filter(ComprehensiveSymbolData.symbol_id.in_(specific_symbols_list))
-
-        symbols_to_update = query.order_by(ComprehensiveSymbolData.last_historical_update_date.asc()).limit(limit).all()
-
-        if not symbols_to_update:
-            return 0, "No symbols to update."
-
-        for sym in symbols_to_update:
-            logger.info(f"📊 آپدیت دیتای تاریخی برای {sym.symbol_name} (SymbolID: {sym.symbol_id})")
-
-            try:
-                # 1. گرفتن آخرین تاریخ موجود در پایگاه داده
-                last_date_record = db_session.query(func.max(HistoricalData.date)).filter_by(symbol_id=sym.symbol_id).scalar()
-
-                # 2. دریافت کل تاریخچه از Ticker با استفاده از symbol_name
-                ticker = tse.Ticker(symbol=sym.symbol_name)
-                df_history = ticker.history
-
-                if df_history is not None and not df_history.empty:
-                    # 3. فیلتر کردن تاریخچه برای دریافت فقط داده‌های جدید
-                    if last_date_record:
-                        # اضافه کردن یک روز به آخرین تاریخ موجود برای جلوگیری از تکرار
-                        start_date_to_filter = last_date_record + timedelta(days=1)
-                        # فیلتر کردن دیتافریم بر اساس تاریخ
-                        df_history = df_history[df_history['date'] >= pd.to_datetime(start_date_to_filter)]
-
-                    if not df_history.empty:
-                        # 4. آماده‌سازی داده‌ها برای bulk insert
-                        df_history['symbol_id'] = sym.symbol_id
-                        df_history['symbol_name'] = sym.symbol_name
-
-                        # تبدیل ستون تاریخ میلادی به شمسی
-                        df_history['jdate'] = df_history['date'].apply(
-                            lambda d: str(jdatetime.date.fromgregorian(date=d)) if d else None
-                        )
-
-                        # حذف ستون‌های اضافی و تغییر نام ستون‌ها
-                        df_history.rename(columns={'count': 'num_trades'}, inplace=True)
-                        #df_history = df_history.drop(columns=['final_price', 'yesterday_price', 'value_b'], errors='ignore')
-
-                        # تبدیل مقادیر NaN به None برای سازگاری با SQLAlchemy
-                        df_history = df_history.where(pd.notnull(df_history), None)
-                        records_to_insert = df_history.replace({np.nan: None}).to_dict('records')
-
-                        # 5. درج داده‌های جدید در پایگاه داده
-                        db_session.bulk_insert_mappings(HistoricalData, records_to_insert)
-
-                        # 6. به‌روزرسانی تاریخ آخرین آپدیت در ComprehensiveSymbolData
-                        sym.last_historical_update_date = date.today()
-                        updated_symbols_count += 1
-                    else:
-                        logger.info("➡️ نماد به روز است.")
-
-                db_session.commit()
-
-            except Exception as e:
-                db_session.rollback()
-                logger.error(f"❌ خطا در آپدیت دیتای تاریخی برای نماد {sym.symbol_name}: {e}")
-                continue
-
-    except Exception as e:
-        db_session.rollback()
-        logger.error(f"❌ خطا در آپدیت دیتای تاریخی: {e}")
-        message = str(e)
-
-    return updated_symbols_count, message
 
 
 # ----------------------------
 # تابع اجرای update_symbol_fundamental_data
 # ----------------------------
 def update_symbol_fundamental_data(
-    db_session: Session, 
-    limit: Optional[int] = None, 
-    specific_symbols_list: list = None
+    db_session: Session,
+    limit: Optional[int] = None,
+    specific_symbols_list: Optional[List[str]] = None,
+    limit_per_run: Optional[int] = None,
+    days_limit: Optional[int] = None  # compatibility alias
 ) -> Tuple[int, str]:
+    # normalize
+    if limit is None and limit_per_run is not None:
+        limit = limit_per_run
+    # days_limit فعلاً استفاده نمیشه، فقط برای جلوگیری از ارور
     """
     آپدیت اطلاعات بنیادی (Fundamental) نمادها.
     این تابع اطلاعاتی مانند EPS, P/E, و Market Cap را از Ticker دریافت می‌کند.
@@ -1070,36 +1030,60 @@ def update_symbol_fundamental_data(
             
             try:
                 ticker = tse.Ticker(sym.symbol_name, index=sym.tse_index)
+
                 
                 # دریافت یا ایجاد رکورد FundamentalData
-                fundamental_data = db_session.query(FundamentalData).filter_by(symbol_id=sym.id).first()
+                fundamental_data = db_session.query(FundamentalData).filter_by(symbol_id=sym.symbol_id).first()
                 if not fundamental_data:
-                    fundamental_data = FundamentalData(symbol_id=sym.id)
+                    fundamental_data = FundamentalData(symbol_id=sym.symbol_id)
                     db_session.add(fundamental_data)
                 
                 # بروزرسانی فیلدهای بنیادی
                 try:
                     fundamental_data.eps = ticker.eps
-                except ValueError:
+                # ===> بهینه‌سازی: مدیریت خطای TypeError
+                except (ValueError, TypeError):
                     fundamental_data.eps = None
                     logger.warning(f"⚠️ EPS برای {sym.symbol_name} معتبر نبود.")
                 
                 try:
-                    fundamental_data.p_e_ratio = ticker.p_e_ratio
-                except ValueError:
+                    p_e = ticker.p_e_ratio
+                    fundamental_data.p_e_ratio = p_e
+                    # ===> افزودن: پر کردن ستون pe اگر در مدل شما وجود دارد
+                    if hasattr(fundamental_data, 'pe'):
+                        fundamental_data.pe = p_e
+                # ===> بهینه‌سازی: مدیریت خطای TypeError
+                except (ValueError, TypeError):
                     fundamental_data.p_e_ratio = None
+                    if hasattr(fundamental_data, 'pe'):
+                        fundamental_data.pe = None
                     logger.warning(f"⚠️ P/E Ratio برای {sym.symbol_name} معتبر نبود.")
 
                 try:
                     fundamental_data.group_p_e_ratio = ticker.group_p_e_ratio
-                except ValueError:
+                # ===> بهینه‌سازی: مدیریت خطای TypeError
+                except (ValueError, TypeError):
                     fundamental_data.group_p_e_ratio = None
 
                 try:
-                    fundamental_data.p_s_ratio = ticker.p_s_ratio
-                except ValueError:
+                    p_s = ticker.p_s_ratio
+                    fundamental_data.p_s_ratio = p_s
+                    # ===> افزودن: پر کردن ستون psr اگر در مدل شما وجود دارد
+                    if hasattr(fundamental_data, 'psr'):
+                        fundamental_data.psr = p_s
+                # ===> بهینه‌سازی: مدیریت خطای TypeError
+                except (ValueError, TypeError):
                     fundamental_data.p_s_ratio = None
+                    if hasattr(fundamental_data, 'psr'):
+                        fundamental_data.psr = None
+                
+                # ===> افزودن: خواندن و ذخیره حجم مبنا (Base Volume)
+                try:
+                    fundamental_data.base_volume = ticker.base_volume
+                except (ValueError, TypeError):
+                    fundamental_data.base_volume = None
 
+                # این بخش بدون تغییر باقی مانده است
                 fundamental_data.total_shares = ticker.total_shares
                 fundamental_data.float_shares = ticker.float_shares
                 fundamental_data.market_cap = ticker.market_cap
@@ -1114,12 +1098,14 @@ def update_symbol_fundamental_data(
             
             except Exception as e:
                 db_session.rollback()
-                logger.error(f"❌ خطا در آپدیت دیتای بنیادی برای {sym.symbol_name}: {e}")
+                # ===> بهینه‌سازی: لاگ کردن کامل خطا برای دیباگ بهتر
+                logger.error(f"❌ خطا در آپدیت دیتای بنیادی برای {sym.symbol_name}: {e}", exc_info=True)
                 continue
 
     except Exception as e:
         db_session.rollback()
-        logger.error(f"❌ خطا در آپدیت دیتای بنیادی: {e}")
+        # ===> بهینه‌سازی: لاگ کردن کامل خطا برای دیباگ بهتر
+        logger.error(f"❌ خطا در آپدیت دیتای بنیادی: {e}", exc_info=True)
         message = str(e)
         
     return updated_symbols_count, message
@@ -1160,6 +1146,142 @@ def get_session_local():
         return sessionmaker(bind=db.get_engine())()
 
 
+
+def get_symbol_id(db_session: Session, symbol_identifier: str) -> Optional[int]:
+    """
+    ID داخلی (PK) یک نماد را بر اساس نام یا TSE Index آن پیدا می‌کند.
+    """
+    if not symbol_identifier:
+        return None
+
+    # فرض بر این است که ComprehensiveSymbolData در این فایل import شده است.
+    from models import ComprehensiveSymbolData 
+
+    # 1. جستجو بر اساس TSE Index (اگر ورودی عدد باشد)
+    try:
+        if str(symbol_identifier).isdigit():
+            # جستجو بر اساس tse_index (که در مدل ما str ذخیره می‌شود)
+            sym = db_session.query(ComprehensiveSymbolData.id).filter(
+                ComprehensiveSymbolData.tse_index == symbol_identifier
+            ).first()
+            if sym:
+                return sym[0]
+    except Exception:
+        pass # اگر تبدیل به عدد ناموفق بود، ادامه دهید.
+
+    # 2. جستجو بر اساس نام نماد
+    sym = db_session.query(ComprehensiveSymbolData.id).filter(
+        ComprehensiveSymbolData.symbol_name == symbol_identifier
+    ).first()
+
+    if sym:
+        return sym[0]
+    
+    return None
+
+
+
+# ----------------------------
+#این فانکشن برای هر نماد یک ردیف real-time می‌سازه و در HistoricalData یا یک جدول جدا ذخیره می‌کنه
+# ----------------------------
+def fetch_realtime_snapshot(db_session: Session, symbol_name: str, symbol_id: int):
+    try:
+        ticker = tse.Ticker(symbol_name)
+
+        # دیتای اصلی قیمت
+        final_price = ticker.last_price
+        yesterday_price = ticker.yesterday_price
+        adj_close = ticker.adj_close
+        mv = ticker.market_cap
+        eps = ticker.eps
+        pe = ticker.p_e_ratio
+
+        # تغییرات قیمتی
+        plc = final_price - yesterday_price if final_price and yesterday_price else None
+        plp = (plc / yesterday_price * 100) if plc and yesterday_price else None
+        pcc = adj_close - yesterday_price if adj_close and yesterday_price else None
+        pcp = (pcc / yesterday_price * 100) if pcc and yesterday_price else None
+
+        # حقیقی حقوقی
+        ct = ticker.client_types
+        buy_count_i = ct["individual_buy_count"].iloc[-1] if not ct.empty else None
+        buy_count_n = ct["corporate_buy_count"].iloc[-1] if not ct.empty else None
+        sell_count_i = ct["individual_sell_count"].iloc[-1] if not ct.empty else None
+        sell_count_n = ct["corporate_sell_count"].iloc[-1] if not ct.empty else None
+        buy_i_volume = ct["individual_buy_vol"].iloc[-1] if not ct.empty else None
+        buy_n_volume = ct["corporate_buy_vol"].iloc[-1] if not ct.empty else None
+        sell_i_volume = ct["individual_sell_vol"].iloc[-1] if not ct.empty else None
+        sell_n_volume = ct["corporate_sell_vol"].iloc[-1] if not ct.empty else None
+
+        # عمق بازار (سطح ۵)
+        orderbook = ticker.get_ticker_real_time_info_response()
+        buy_orders = orderbook.buy_orders
+        sell_orders = orderbook.sell_orders
+
+        dom_fields = {}
+        for i in range(5):
+            dom_fields[f"zd{i+1}"] = buy_orders[i].count if len(buy_orders) > i else None
+            dom_fields[f"qd{i+1}"] = buy_orders[i].volume if len(buy_orders) > i else None
+            dom_fields[f"pd{i+1}"] = buy_orders[i].price if len(buy_orders) > i else None
+            dom_fields[f"zo{i+1}"] = sell_orders[i].count if len(sell_orders) > i else None
+            dom_fields[f"qo{i+1}"] = sell_orders[i].volume if len(sell_orders) > i else None
+            dom_fields[f"po{i+1}"] = sell_orders[i].price if len(sell_orders) > i else None
+
+        # ساخت رکورد دیتابیس
+        snapshot = HistoricalData(
+            symbol_id=symbol_id,
+            symbol_name=symbol_name,
+            date=date.today(),
+            final=final_price,
+            yesterday_price=yesterday_price,
+            plc=plc,
+            plp=plp,
+            pcc=pcc,
+            pcp=pcp,
+            #mv=mv,
+            #eps=eps,
+            #pe=pe,
+            buy_count_i=buy_count_i,
+            buy_count_n=buy_count_n,
+            sell_count_i=sell_count_i,
+            sell_count_n=sell_count_n,
+            buy_i_volume=buy_i_volume,
+            buy_n_volume=buy_n_volume,
+            sell_i_volume=sell_i_volume,
+            sell_n_volume=sell_n_volume,
+            **dom_fields
+        )
+
+        db_session.add(snapshot)
+
+
+        fundamental = db_session.query(FundamentalData).filter_by(symbol_id=symbol_id).first()
+        if fundamental:
+            #fundamental.eps = eps
+            fundamental.pe = pe
+            #fundamental.market_cap = mv
+        else:
+            fundamental = FundamentalData(
+                symbol_id=symbol_id,
+                #eps=eps,
+                pe=pe
+                #market_cap=mv
+            )
+            db_session.add(fundamental)
+
+
+
+
+        db_session.commit()
+        return True, f"✅ Real-time snapshot stored for {symbol_name}"
+
+    except Exception as e:
+        db_session.rollback()
+        return False, f"❌ Error fetching snapshot for {symbol_name}: {e}"
+
+
+
+
 # ----------------------------
 # تابع اجرای آپدیت کامل
 # ----------------------------
@@ -1167,7 +1289,7 @@ def run_full_data_update(
     db_session: Session = None,
     limit_per_run: int = 100,
     specific_symbols_list: list = None,
-    days_limit: int = 365,
+
     update_fundamental: bool = True,
     update_realtime: bool = True,
     update_technical: bool = True
@@ -1185,7 +1307,8 @@ def run_full_data_update(
         "historical": {"count": 0, "message": ""},
         "technical": {"count": 0, "message": ""},
         "fundamental": {"count": 0, "message": ""},
-        "realtime": {"count": 0, "message": ""}
+        "realtime": {"count": 0, "message": ""},
+        "candlestick": {"count": 0, "message": ""}
     }
 
     # 1. ابتدا نمادها را از pytse-client دریافت و به‌روزرسانی کنیم
@@ -1199,11 +1322,11 @@ def run_full_data_update(
     # 2. آپدیت داده‌های تاریخی
     try:
         logger.info("📊 شروع آپدیت داده‌های تاریخی...")
-        processed_hist_count, hist_msg = update_historical_data_limited(
+        processed_hist_count, hist_msg = fetch_and_process_historical_data(
             db_session,
             limit=limit_per_run,
             specific_symbols_list=specific_symbols_list,
-            days_limit=days_limit
+
         )
         results["historical"]["count"] = processed_hist_count
         results["historical"]["message"] = hist_msg
@@ -1221,10 +1344,24 @@ def run_full_data_update(
             results["realtime"]["count"] = realtime_count
             results["realtime"]["message"] = f"✅ اطلاعات لحظه‌ای برای {realtime_count} نماد به‌روزرسانی شد"
             logger.info(results["realtime"]["message"])
+
+            # ✅ گرفتن snapshot کامل از همه نمادها
+            all_symbols = db_session.query(ComprehensiveSymbolData).all()
+            snapshot_count = 0
+            for sym in all_symbols:
+                success, msg = fetch_realtime_snapshot(db_session, sym.symbol_name, sym.id)
+                logger.info(msg)
+                if success:
+                    snapshot_count += 1
+
+            results["realtime"]["message"] += f" | ✅ snapshot برای {snapshot_count} نماد ذخیره شد"
+
         except Exception as e:
             error_msg = f"❌ خطا در اجرای آپدیت لحظه‌ای: {e}"
             results["realtime"]["message"] = error_msg
             logger.error(error_msg)
+
+
 
     # 4. آپدیت داده‌های بنیادی
     if update_fundamental:
@@ -1269,7 +1406,7 @@ def run_full_data_update(
             logger.error(error_msg)
             db_session.rollback()
 
-    # 5. آپدیت تحلیل تکنیکال
+    # 5. آپدیت تحلیل تکنیکال و 6. تشخیص الگوهای شمعی
     if update_technical:
         try:
             logger.info("📉 شروع تحلیل تکنیکال...")
@@ -1281,7 +1418,34 @@ def run_full_data_update(
             results["technical"]["count"] = technical_count
             results["technical"]["message"] = tech_msg
             logger.info(results["technical"]["message"])
+            
+            
+            # =======================================================
+            # 🕯️ گام 6: تشخیص و ذخیره الگوهای شمعی (جدید)
+            # این گام بلافاصله بعد از تحلیل تکنیکال و داخل همان بلوک try قرار می‌گیرد
+            # =======================================================
+            logger.info("🕯️ شروع تشخیص الگوهای شمعی...")
+            try:
+                # استفاده از همان لیست نمادها
+                candlestick_count = run_candlestick_detection(
+                    db_session, 
+                    limit=limit_per_run,
+                    symbols_list=specific_symbols_list
+                )
+                # ⚠️ اضافه کردن نتیجه به دیکشنری نتایج
+                results["candlestick"] = {
+                    "count": candlestick_count,
+                    "message": f"✅ تشخیص الگوهای شمعی برای {candlestick_count} نماد انجام شد"
+                }
+                logger.info(results["candlestick"]["message"])
+            except Exception as e:
+                error_msg = f"❌ خطا در اجرای تشخیص الگوهای شمعی: {e}"
+                results["candlestick"] = {"count": 0, "message": error_msg}
+                logger.error(error_msg)
+            
+
         except Exception as e:
+            # این بلوک catch، خطای اصلی تحلیل تکنیکال را می‌گیرد
             error_msg = f"❌ خطا در اجرای تحلیل تکنیکال: {e}"
             results["technical"]["message"] = error_msg
             logger.error(error_msg)
@@ -1296,11 +1460,199 @@ def run_full_data_update(
 • لحظه‌ای: {results['realtime']['count']} نماد - {results['realtime']['message']}
 • بنیادی: {results['fundamental']['count']} نماد - {results['fundamental']['message']}
 • تکنیکال: {results['technical']['count']} نماد - {results['technical']['message']}
+• شمعی: {results['candlestick']['count']} نماد - {results['candlestick']['message']}
     """
     logger.info(summary)
 
     # برای سازگاری با callerهای قدیمی، دو مقدار return می‌کنیم
     return results
+
+
+
+
+# ----------------------------
+# تابع اجرای آپدیت روزانه
+# ----------------------------
+def run_daily_update(
+    db_session: Session,
+    limit: int = 200,  # limit now acts as BATCH_SIZE
+    update_fundamental: bool = True,
+    specific_symbols_list: Optional[List[str]] = None,
+    # limit_per_run is deprecated by the new batch logic
+):
+    """
+    اجرای آپدیت روزانه به صورت دسته‌ای (batch) برای تضمین پردازش تمام نمادها.
+    این تابع تا زمانی که نماد آپدیت‌نشده‌ای وجود داشته باشد، در یک حلقه اجرا می‌شود.
+    """
+    logger.info("🚀 شروع آپدیت کامل روزانه به صورت دسته‌ای...")
+
+    # FIX: Initialize all keys to prevent KeyError
+    results = {
+        "historical": {"total_count": 0},
+        "technical": {"total_count": 0},
+        "candlestick": {"total_count": 0, "message": ""},
+        "fundamental": {"count": 0, "message": ""}
+    }
+    
+    run_count = 0
+    
+    # ===============================
+    # حلقه اصلی برای پردازش دسته‌ای
+    # ===============================
+    while True:
+        run_count += 1
+        logger.info(f"--- شروع پردازش دسته شماره {run_count} ---")
+
+        today = date.today()
+        
+        # گام ۱: شناسایی یک دسته از نمادهایی که امروز آپدیت نشده‌اند
+        symbols_to_update_query = db_session.query(ComprehensiveSymbolData).filter(
+            or_(
+                ComprehensiveSymbolData.last_historical_update_date.is_(None),
+                ComprehensiveSymbolData.last_historical_update_date < today
+            )
+        )
+        
+        # اگر لیست خاصی از نمادها مشخص شده بود، فقط آنها را در نظر بگیر
+        if specific_symbols_list:
+            symbols_to_update_query = symbols_to_update_query.filter(
+                ComprehensiveSymbolData.symbol_name.in_(specific_symbols_list)
+            )
+
+        # اعمال محدودیت به عنوان اندازه دسته
+        symbols_in_batch = symbols_to_update_query.limit(limit).all()
+
+        if not symbols_in_batch:
+            logger.info("✅ تمام نمادها برای امروز به‌روز هستند. پایان عملیات.")
+            break  # شرط خروج از حلقه while
+
+        symbol_ids_to_process = [s.tse_index for s in symbols_in_batch]
+        logger.info(f"📊 یافت شد {len(symbol_ids_to_process)} نماد در این دسته برای آپدیت.")
+
+        # گام ۲: دریافت داده‌های تاریخی برای این دسته
+        hist_count, hist_msg = fetch_and_process_historical_data(
+            db_session,
+            specific_symbols_list=symbol_ids_to_process
+        )
+        results["historical"]["total_count"] += hist_count
+        logger.info(hist_msg)
+
+        # گام ۳ و ۴ فقط در صورت وجود داده جدید اجرا می‌شوند
+        if hist_count > 0:
+            # گام ۳: اجرای تحلیل تکنیکال
+            tech_count, tech_msg = run_technical_analysis(
+                db_session,
+                symbols_list=symbol_ids_to_process
+            )
+            results["technical"]["total_count"] += tech_count
+            logger.info(tech_msg)
+
+            # گام ۴: تشخیص الگوهای شمعی
+            try:
+                candlestick_count = run_candlestick_detection(
+                    db_session, 
+                    symbols_list=symbol_ids_to_process
+                )
+                results["candlestick"]["total_count"] += candlestick_count
+                logger.info(f"✅ تشخیص الگوهای شمعی برای {candlestick_count} نماد در این دسته انجام شد.")
+            except Exception as e:
+                logger.error(f"❌ خطا در اجرای تشخیص الگوهای شمعی برای این دسته: {e}")
+        else:
+            logger.warning("داده تاریخی جدیدی برای این دسته دریافت نشد، گام‌های تحلیل Skip شد.")
+        
+        # IMPROVEMENT: Commit changes after each successful batch
+        try:
+            db_session.commit()
+            logger.info(f"✅ تغییرات دسته {run_count} با موفقیت در دیتابیس ثبت شد.")
+        except Exception as e:
+            logger.error(f"❌ خطا در ثبت تغییرات دسته {run_count}: {e}")
+            db_session.rollback()
+            # Decide if you want to break or continue on commit error
+            break
+            
+    # ===============================
+    # گام ۵: آپدیت داده‌های بنیادی (خارج از حلقه اصلی)
+    # ===============================
+    if update_fundamental:
+        logger.info("شروع آپدیت داده‌های بنیادی برای تمام نمادها...")
+        # Assuming you have a function to update fundamentals
+        fund_count, fund_msg = update_all_fundamental_data(db_session)
+        results["fundamental"]["count"] = fund_count
+        results["fundamental"]["message"] = fund_msg
+        logger.info(fund_msg)
+    else:
+        results["fundamental"]["message"] = "آپدیت داده‌های بنیادی Skip شد."
+        logger.info(results["fundamental"]["message"])
+
+    final_message = (
+        f"🏁 آپدیت روزانه تکمیل شد. "
+        f"Historical: {results['historical']['total_count']}, "
+        f"Technical: {results['technical']['total_count']}, "
+        f"Candlestick: {results['candlestick']['total_count']}."
+    )
+    logger.info(final_message)
+    return results
+
+    # ===============================
+    # گام 5: آپدیت داده‌های بنیادی
+    # ===============================
+    if update_fundamental:
+        try:
+            logger.info("📈 شروع آپدیت داده‌های بنیادی...")
+
+            if limit_per_run is None:
+                limit_per_run = limit  # استفاده از limit کلی در صورت نبودن limit_per_run
+
+            query = db_session.query(ComprehensiveSymbolData)
+            if specific_symbols_list:
+                symbol_conditions = [
+                    or_(
+                        ComprehensiveSymbolData.symbol_name == s,
+                        ComprehensiveSymbolData.tse_index == s
+                    )
+                    for s in specific_symbols_list
+                ]
+                query = query.filter(or_(*symbol_conditions))
+
+            symbols_to_update = query.filter(
+                (ComprehensiveSymbolData.last_fundamental_update_date.is_(None)) |
+                (ComprehensiveSymbolData.last_fundamental_update_date < (date.today() - timedelta(days=3)))
+            ).order_by(
+                ComprehensiveSymbolData.last_fundamental_update_date.asc()
+            ).limit(limit_per_run).all()
+
+            fundamental_count = 0
+            for symbol in symbols_to_update:
+                try:
+                    updated_count, msg = update_symbol_fundamental_data(
+                        db_session,
+                        specific_symbols_list=[symbol.tse_index]
+                    )
+                    if updated_count > 0:
+                        fundamental_count += updated_count
+                        symbol.last_fundamental_update_date = date.today()
+                        db_session.add(symbol)
+                        db_session.commit()
+                    time.sleep(0.1)
+                except Exception as e:
+                    logger.warning(f"⚠️ خطا در به‌روزرسانی بنیادی {symbol.symbol_name}: {e}")
+                    db_session.rollback()
+                    continue
+
+            results["fundamental"]["count"] = fundamental_count
+            results["fundamental"]["message"] = f"✅ اطلاعات بنیادی برای {fundamental_count} نماد به‌روزرسانی شد"
+            logger.info(results["fundamental"]["message"])
+
+        except Exception as e:
+            error_msg = f"❌ خطا در اجرای آپدیت بنیادی: {e}"
+            results["fundamental"]["message"] = error_msg
+            logger.error(error_msg)
+            db_session.rollback()
+
+    return results
+
+
+
 
 
 # ----------------------------
@@ -1326,7 +1678,7 @@ def initial_populate_all_symbols_and_data(db_session, limit: int = None):
             
             # 2. آپدیت داده‌های تاریخی
             logger.info("📈 آپدیت داده‌های تاریخی...")
-            processed_count, msg = update_historical_data_limited(
+            processed_count, msg = fetch_and_process_historical_data(
                 db_session, 
                 limit=limit
             )
@@ -1340,19 +1692,25 @@ def initial_populate_all_symbols_and_data(db_session, limit: int = None):
             # 4. آپدیت داده‌های بنیادی
             logger.info("📊 آپدیت داده‌های بنیادی...")
 
-            # ⚠️ اصلاح: استفاده از tse_index به جای symbol_name
+            # ⚠️ کوئری گرفتن از tse_index نمادها (با اعمال limit در صورت وجود)
             symbols_to_update = db_session.query(ComprehensiveSymbolData.tse_index).limit(limit).all()
             symbols_to_update = [symbol[0] for symbol in symbols_to_update]
 
             fundamental_count = 0
             for tse_index in symbols_to_update:
                 try:
+                    # فراخوانی تابع آپدیت بنیادی. فرض می‌کنیم این تابع خودش commit می‌کند.
                     updated_count, msg = update_symbol_fundamental_data(db_session, specific_symbols_list=[tse_index])
                     fundamental_count += updated_count
-                    time.sleep(0.2)
+        
+                    # 💡 نکته: 'time.sleep(0.2)' به منظور افزایش کارایی و سرعت فرآیند حذف شد.
+        
                 except Exception as e:
-                    logger.warning(f"⚠️ خطا در به‌روزرسانی بنیادی {tse_index}: {e}")
-                    continue
+                    # 🛠️ اصلاح: در صورت بروز خطا در دریافت/ذخیره یک نماد، تغییرات ناقص را Rollback کنید.
+                    # این کار از تداخل این تراکنش با تراکنش‌های موفق نمادهای دیگر جلوگیری می‌کند.
+                    db_session.rollback()
+                    logger.warning(f"⚠️ خطا در به‌روزرسانی بنیادی نماد {tse_index}: {e}")
+                    continue # ادامه فرآیند برای نماد بعدی
 
             logger.info(f"✅ اطلاعات بنیادی برای {fundamental_count} نماد به‌روزرسانی شد")
 
@@ -1491,7 +1849,7 @@ def run_technical_analysis(db_session: Session, limit: int = None, symbols_list:
         for symbol_id, group_df in grouped:
             processed_count += 1
             try:
-                calculate_technical_indicators(db_session, symbol_id, group_df)
+                calculate_all_indicators(db_session, symbol_id, group_df)
                 success_count += 1
                 
                 if processed_count % 10 == 0:
@@ -1568,6 +1926,7 @@ def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int
 def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     محاسبه تمام اندیکاتورهای تکنیکال مورد نیاز و اضافه کردن آنها به DataFrame.
+    💥 نسخه بازنویسی شده برای جلوگیری از خطای unhashable type: 'Series' 💥
     """
     
     # اطمینان از اینکه دیتافریم خالی نیست و دارای ستون‌های ضروری است
@@ -1586,113 +1945,190 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             logger.warning("پس از تبدیل و پاکسازی، دیتای معتبری برای محاسبه اندیکاتورها باقی نماند.")
             return df
         
-        # محاسبه RSI
+        # --- محاسبات اندیکاتورهای استاندارد (بدون تغییر) ---
         df['RSI'] = calculate_rsi(df['close'])
         
-        # محاسبه MACD
         macd, signal, histogram = calculate_macd(df['close'])
         df['MACD'] = macd
         df['MACD_Signal'] = signal
         df['MACD_Histogram'] = histogram
         
-        # محاسبه میانگین متحرک ساده (SMA)
         df['SMA_20'] = calculate_sma(df['close'], 20)
         df['SMA_50'] = calculate_sma(df['close'], 50)
         
-        # محاسبه نوارهای بولینگر (Bollinger Bands)
         upper, middle, lower = calculate_bollinger_bands(df['close'])
         df['Bollinger_Upper'] = upper
         df['Bollinger_Middle'] = middle
         df['Bollinger_Lower'] = lower
         
-        # محاسبه میانگین متحرک حجم (Volume Moving Average)
         df['Volume_MA_20'] = calculate_volume_ma(df['volume'], 20)
-        
-        # محاسبه ATR (Average True Range)
         df['ATR'] = calculate_atr(df['high'], df['low'], df['close'])
+
+        # ===> FIX START: بازنویسی کامل منطق محاسبه اندیکاتورهای جدید <===
+
+        # 1. محاسبه Stochastic (این تابع از نام‌های استاندارد استفاده می‌کند و نیازی به تغییر نام ندارد)
+        stochastic_k, stochastic_d = calculate_stochastic(df['high'], df['low'], df['close'])
+        df['Stochastic_K'] = stochastic_k
+        df['Stochastic_D'] = stochastic_d
+        
+        # 2. آماده‌سازی برای توابعی که به نام‌های 'high_price', 'low_price', 'close_price' نیاز دارند
+        # به جای ساخت کپی، نام ستون‌های df اصلی را موقتاً تغییر می‌دهیم
+        column_rename_map = {
+            'high': 'high_price',
+            'low': 'low_price',
+            'close': 'close_price'
+        }
+        df.rename(columns=column_rename_map, inplace=True)
+
+        # 3. محاسبه اندیکاتورهای جدید بر روی همان DataFrame با ستون‌های تغییرنام‌یافته
+        try:
+            squeeze_on, _ = calculate_squeeze_momentum(df)
+            df['squeeze_on'] = squeeze_on
+            
+            halftrend_signal, _ = calculate_halftrend(df)
+            df['halftrend_signal'] = halftrend_signal
+            
+            resistance_level, resistance_broken = calculate_support_resistance_break(df)
+            df['resistance_level_50d'] = resistance_level
+            df['resistance_broken'] = resistance_broken
+        
+        finally:
+            # 4. بازگرداندن نام ستون‌ها به حالت اولیه (چه محاسبات موفق بود چه نبود)
+            reverse_rename_map = {v: k for k, v in column_rename_map.items()}
+            df.rename(columns=reverse_rename_map, inplace=True)
+            
+        # ===> FIX END <===
         
     except Exception as e:
-        logger.error(f"❌ خطا در محاسبه اندیکاتورها در تابع calculate_all_indicators: {e}")
+        # اگر خطایی رخ داد، لاگ می‌کنیم و df را در هر حالتی که هست برمی‌گردانیم
+        logger.error(f"❌ خطا در محاسبه اندیکاتورها در تابع calculate_all_indicators: {e}", exc_info=True)
+        # اگر نام ستون‌ها تغییر کرده بود، آن‌ها را به حالت اول برمی‌گردانیم
+        if 'close_price' in df.columns:
+             reverse_rename_map = {'high_price': 'high', 'low_price': 'low', 'close_price': 'close'}
+             df.rename(columns=reverse_rename_map, inplace=True)
         return df
 
     return df
 
-# ----------------------------
-# تابع calculate_technical_indicators (نسخه بازنویسی شده نهایی)
-# ----------------------------
 
-def calculate_technical_indicators(db_session: Session, symbol_id: int, df: pd.DataFrame):
+# ----------------------------
+# تابع CandlestickPatternDetection
+# ----------------------------
+def run_candlestick_detection(db_session: Session, limit: int = None, symbols_list: list = None):
     """
-    محاسبه و ذخیره اندیکاتورهای تکنیکال برای یک نماد با استفاده از DataFrame ورودی.
-    
-    Args:
-        db_session: جلسه پایگاه داده SQLAlchemy.
-        symbol_id: شناسه نماد.
-        df: DataFrame حاوی داده‌های تاریخی کامل نماد.
+    اجرای تشخیص الگوهای شمعی برای نمادها با استفاده از داده‌های تاریخی و ذخیره نتایج.
+    از استراتژی حذف و درج (Delete & Insert) برای جلوگیری از تکرار استفاده می‌کند.
     """
     try:
-        if df.empty:
-            logger.warning(f"⚠️ DataFrame ورودی برای نماد با ID {symbol_id} خالی است.")
-            return
+        logger.info("🕯️ شروع تشخیص الگوهای شمعی...")
+
+        # 1. دریافت داده‌های مورد نیاز
+        query = db_session.query(HistoricalData).order_by(HistoricalData.symbol_id, HistoricalData.jdate)
+        
+        if symbols_list:
+            # فرض می‌کنیم symbols_list حاوی tse_index است (symbol_id صحیح)
+            query = query.filter(HistoricalData.symbol_id.in_(symbols_list)) 
+        
+        historical_data = query.all()
+
+        if not historical_data:
+            logger.warning("⚠️ هیچ داده تاریخی برای تشخیص الگوهای شمعی یافت نشد.")
+            return 0
+
+        # تبدیل به DataFrame
+        # '__dict__' برای بازیابی فیلدهای ORM استفاده می‌شود، اگرچه می‌توانید مستقیماً فیلدها را نیز کوئری بگیرید.
+        df = pd.DataFrame([row.__dict__ for row in historical_data])
+        
+        grouped = df.groupby('symbol_id')
+        success_count = 0
+        records_to_insert = []
+        
+        logger.info(f"🔍 یافت شد {len(grouped)} نماد برای تشخیص الگوهای شمعی")
+
+        # 2. پردازش نمادها و تشخیص الگو
+        for symbol_id, group_df in grouped:
+            # اکنون باید برای iloc[-4] حداقل 5 کندل وجود داشته باشد
+            if len(group_df) < 5: 
+                continue 
+                
+            try:
+                # ❌ اصلاح کلیدی: حذف عملیات تغییر نام موقت ستون‌ها
+                # column_rename_map = {'close': 'close_price', 'open': 'open_price', 
+                #                      'high': 'high_price', 'low': 'low_price'}
+                # group_df.rename(columns=column_rename_map, inplace=True) 
+                
+                # استخراج داده‌های لازم:
+                # اکنون today_record_dict دارای کلیدهای اصلی ('open', 'close', ...) است.
+                today_record_dict = group_df.iloc[-1].to_dict()
+                yesterday_record_dict = group_df.iloc[-2].to_dict()
+                
+                # فراخوانی تابع تشخیص الگو:
+                patterns = check_candlestick_patterns(
+                    today_record_dict, 
+                    yesterday_record_dict, 
+                    # ⚠️ توجه: DataFrame ارسالی هنوز نام‌های اصلی (open, close,...) را دارد. 
+                    group_df 
+                )
+                
+                # ❌ اصلاح کلیدی: حذف عملیات بازگرداندن نام‌ها
+                # reverse_rename_map = {v: k for k, v in column_rename_map.items()}
+                # group_df.rename(columns=reverse_rename_map, inplace=True)
+                
+                # ذخیره الگوهای یافت‌شده
+                if patterns:
+                    now = datetime.now()
+                    current_jdate = today_record_dict['jdate']
+                    for pattern in patterns:
+                        records_to_insert.append({
+                            'symbol_id': symbol_id,
+                            'jdate': current_jdate,
+                            'pattern_name': pattern,
+                            'created_at': now, 
+                            'updated_at': now
+                        })
+                    success_count += 1
+                    
+            except Exception as e:
+                # این خطا دیگر نباید 'open' باشد، مگر اینکه نام ستون‌های اصلی دیتابیس چیز دیگری باشد.
+                logger.error(f"❌ خطا در تشخیص الگوهای شمعی برای نماد {symbol_id}: {e}")
+                
+        # 3. ذخیره نتایج در دیتابیس (استراتژی Delete & Insert)
+        if records_to_insert:
+            # الف) استخراج تاریخ و لیست نمادهای پردازش شده
+            # فرض می‌کنیم تمام رکوردها برای یک تاریخ هستند (آخرین روز)
+            last_jdate = records_to_insert[0]['jdate'] 
+            processed_symbol_ids = list({record['symbol_id'] for record in records_to_insert})
             
-        # 1. آماده‌سازی داده‌ها
-        # 🛠️ اصلاح: از ستون 'date' که یک datetime معتبر است استفاده می‌کنیم و آن را به عنوان ایندکس قرار می‌دهیم.
-        df.set_index('date', inplace=True)
-        
-        # 2. محاسبه اندیکاتورها
-        df = calculate_all_indicators(df)
-        
-        # 3. آماده‌سازی داده‌ها برای bulk insert
-        df.replace({np.nan: None}, inplace=True)
-        df.reset_index(inplace=True) # بازگرداندن date از ایندکس به ستون
-        
-        # تنها ستون‌هایی که می‌خواهید ذخیره کنید را انتخاب کنید
-        # ⚠️ اطمینان حاصل کنید که ستون‌های 'date' و 'jdate' از قبل در DataFrame وجود دارند.
-        # ستون date برای کوئری به دیتابیس نیاز است.
-        records_to_insert = df.filter(items=[
-            'date', 'jdate', 'close', 'RSI', 'MACD', 'MACD_Signal', 'MACD_Histogram', 
-            'SMA_20', 'SMA_50', 'Bollinger_Upper', 'Bollinger_Lower', 
-            'Bollinger_Middle', 'Volume_MA_20', 'ATR'
-        ]).to_dict('records')
+            # ب) حذف رکوردهای قدیمی برای نمادها و روز جاری (برای جلوگیری از IntegrityError)
+            try:
+                db_session.query(CandlestickPatternDetection).filter(
+                    CandlestickPatternDetection.symbol_id.in_(processed_symbol_ids),
+                    CandlestickPatternDetection.jdate == last_jdate
+                ).delete(synchronize_session='fetch')
+                
+                db_session.commit() # commit حذف‌ها 
+                logger.info(f"🗑️ الگوهای شمعی قبلی ({len(processed_symbol_ids)} نماد) برای {last_jdate} حذف شدند.")
+                
+            except Exception as e:
+                db_session.rollback()
+                logger.error(f"❌ خطا در حذف رکوردهای قدیمی الگوهای شمعی: {e}")
+                return 0 
+                
+            # ج) درج رکوردهای جدید
+            db_session.bulk_insert_mappings(CandlestickPatternDetection, records_to_insert)
+            db_session.commit()
+            logger.info(f"✅ {len(records_to_insert)} الگوی شمعی با موفقیت درج شد.")
+        else:
+            logger.info("ℹ️ هیچ الگوی شمعی جدیدی یافت نشد.")
 
-        # افزودن symbol_id به هر رکورد و تغییر نام ستون‌ها
-        for record in records_to_insert:
-            record['symbol_id'] = symbol_id
-            record['close_price'] = record.pop('close', None)
-            record['MACD_Hist'] = record.pop('MACD_Histogram', None)
-            record['Bollinger_High'] = record.pop('Bollinger_Upper', None)
-            record['Bollinger_Low'] = record.pop('Bollinger_Lower', None)
-            record['Bollinger_MA'] = record.pop('Bollinger_Middle', None)
-            record['Volume_MA_20'] = record.pop('Volume_MA_20', None)
-            
-        # 4. شناسایی رکوردهای جدید برای جلوگیری از تکرار
-        # 🛠️ اصلاح: استفاده از 'jdate' برای کوئری به دیتابیس که در مدل شما وجود دارد.
-        existing_dates = db_session.query(TechnicalIndicatorData.jdate)\
-                                    .filter(TechnicalIndicatorData.symbol_id == symbol_id)\
-                                    .all()
-        # تبدیل تاریخ‌های موجود به یک مجموعه (Set) از تاریخ‌های شمسی
-        existing_dates_set = {str(d[0]) for d in existing_dates}
-        
-        # فیلتر کردن رکوردهای جدید
-        new_records_to_add = [
-            record for record in records_to_insert 
-            # 🛠️ اصلاح: مقایسه با تاریخ شمسی
-            if str(record['jdate']) not in existing_dates_set
-        ]
+        return success_count
 
-        if not new_records_to_add:
-            logger.info(f"ℹ️ تحلیل تکنیکال برای نماد {symbol_id} به‌روز بود و نیازی به درج رکورد جدید نبود.")
-            return
-
-        # 5. استفاده از bulk_insert_mappings برای عملکرد بهتر
-        db_session.bulk_insert_mappings(TechnicalIndicatorData, new_records_to_add)
-        db_session.commit()
-        logger.info(f"✅ {len(new_records_to_add)} رکورد تحلیل تکنیکال برای نماد {symbol_id} با موفقیت درج شد.")
-        
     except Exception as e:
-        logger.error(f"❌ خطا در محاسبه اندیکاتورهای تکنیکال برای نماد {symbol_id}: {e}")
+        logger.error(f"❌ خطای کلی در اجرای تشخیص الگوهای شمعی: {e}")
         db_session.rollback()
-        return 0, f"خطا در تحلیل تکنیکال: {e}"
+        return 0
+
+
 
 # ----------------------------
 # توابع آپدیت داده‌های بنیادی (برای سازگاری)
@@ -1959,7 +2395,7 @@ def repair_missing_data(db_session: Session, data_type: str = 'all', limit: int 
             if symbols_missing_historical:
                 # استفاده از idهای ComprehensiveSymbolData
                 symbol_ids = [s.id for s in symbols_missing_historical]
-                processed_count, msg = update_historical_data_limited(
+                processed_count, msg = fetch_and_process_historical_data(
                     db_session,
                     limit_per_run=limit,
                     specific_symbols_list=symbol_ids
@@ -2079,7 +2515,7 @@ def run_historical_update_only(limit_per_run: int = 100, days_limit: int = 365):
     try:
         session = get_session_local()
         try:
-            processed_count, msg = update_historical_data_limited(
+            processed_count, msg = fetch_and_process_historical_data(
                 session,
                 limit_per_run=limit_per_run,
                 days_limit=days_limit
@@ -2242,7 +2678,7 @@ def add_single_symbol(db_session: Session, symbol_name: str) -> Tuple[bool, str]
         logger.info(f"📊 دیتای بنیادی برای {symbol_name}: {fund_updated_count} رکورد به‌روزرسانی شد. {fund_msg}")
         
         # گام ۴: اجرای تحلیل تکنیکال با استفاده از شناسه صحیح
-        calculate_technical_indicators(db_session, specific_symbols_list=[new_symbol.symbol_name])
+        calculate_all_indicators(db_session, specific_symbols_list=[new_symbol.symbol_name])
         logger.info(f"📈 تحلیل تکنیکال برای نماد {symbol_name} اجرا شد.")
         
         return True, f"✅ نماد {symbol_name} و داده‌های اولیه آن با موفقیت اضافه شدند."
@@ -2770,7 +3206,7 @@ __all__ = [
     # توابع اصلی
     'fetch_symbols_from_pytse_client',
     'fetch_and_process_historical_data',
-    'update_historical_data_limited',
+    #'update_historical_data_limited',(DELETED)
     'run_full_data_update',
     'run_technical_analysis',
     'update_comprehensive_symbol_data',
@@ -2808,5 +3244,6 @@ __all__ = [
     
     # utility
     'get_session_local',
-    'cleanup_memory'
+    'cleanup_memory',
+    'get_symbol_id'
 ]                        

@@ -701,11 +701,11 @@ def run_golden_key_analysis_and_save(top_n_symbols=8):
                 existing.score = r['score']
                 existing.satisfied_filters = r['satisfied_filters']
                 existing.reason = final_reason_str
-                existing.profit_loss_percentage = r['profit_loss_percentage']
+                #existing.profit_loss_percentage = r['profit_loss_percentage']
                 existing.recommendation_price = r['recommendation_price']
                 existing.recommendation_jdate = r['recommendation_jdate']
-                existing.final_price = r['final_price']
-                existing.status = r['signal_status']
+                #existing.final_price = r['final_price']
+                #existing.status = r['signal_status']
                 existing.probability_percent = r['probability_percent']
                 existing.is_golden_key = r['is_golden_key']
                 existing.timestamp = datetime.now()
@@ -822,14 +822,109 @@ def get_golden_key_filter_definitions():
     ]
 
 
+
+
+
+# ---------------------------------------------------------
+# Performance calculation
+# ---------------------------------------------------------
+
+def _update_golden_key_performance(all_results, days_to_evaluate=5):
+    """
+    Updates the final_price and profit_loss_percentage for GoldenKey signals 
+    by fetching the closing price on the LAST AVAILABLE day, provided at least 3 records are found.
+    Uses symbol_id lookup for robust data retrieval.
+    """
+    evaluated_results = []
+    updated_count = 0
+    
+    MAX_RECORDS_TO_FETCH = days_to_evaluate + 1 # هدف: 6 رکورد (روز 0 تا روز 5)
+    MIN_RECORDS_REQUIRED = 3  # حداقل 3 رکورد برای ارزیابی (روز 0 + دو روز بعد)
+    
+    for res in all_results:
+        # فقط سیگنال‌هایی که هنوز نهایی نشده‌اند (profit_loss_percentage صفر است) و جزو GoldenKey بوده‌اند، ارزیابی شوند.
+        if res.is_golden_key and (res.profit_loss_percentage is None or res.profit_loss_percentage == 0.0):
+            try:
+                symbol_name_to_search = res.symbol_name.strip()
+                
+                # 💡 گام ۱: پیدا کردن symbol_id از جدول اصلی ComprehensiveSymbolData
+                # استفاده از strip() برای حذف فضای خالی احتمالی در نام نماد
+                symbol_record = db.session.query(ComprehensiveSymbolData.id).filter(
+                    ComprehensiveSymbolData.symbol_name == symbol_name_to_search
+                ).first()
+
+                if not symbol_record:
+                    logger.warning(f"❌ نماد {res.symbol_name} در ComprehensiveSymbolData یافت نشد. Skipping.")
+                    continue
+                    
+                target_symbol_id = symbol_record[0] # استخراج ID
+                
+                # 2. جستجو برای داده‌های تاریخی بر اساس symbol_id (کلید یکتا)
+                historical_data = HistoricalData.query.filter(
+                    # 💡 CHANGE: فیلتر بر اساس کلید عددی یکتا (symbol_id) به جای symbol_name
+                    HistoricalData.symbol_id == target_symbol_id,
+                    HistoricalData.jdate >= res.jdate # فیلتر بر اساس تاریخ شمسی موجود
+                ).order_by(HistoricalData.jdate.asc()).limit(MAX_RECORDS_TO_FETCH).all() # محدودیت 6 رکورد
+                
+                
+                # 3. چک کردن حداقل داده (حداقل 3 رکورد موجود باشد)
+                if len(historical_data) >= MIN_RECORDS_REQUIRED: 
+                    
+                    # 💡 انتخاب قیمت نهایی: از آخرین رکورد موجود استفاده می‌شود
+                    exit_data = historical_data[-1] 
+
+                    # 💡 استخراج قیمت با اولویت 'close' و Fallback به 'final'
+                    exit_price = getattr(exit_data, 'close', getattr(exit_data, 'final', None))
+                    
+                    if exit_price is None:
+                         logger.error(f"Could not find a valid exit price ('close' or 'final') for {res.symbol_name} on {exit_data.jdate}.")
+                         continue
+                         
+                    entry_price = res.recommendation_price # قیمت ورودی
+                    
+                    # 4. محاسبه درصد سود/زیان
+                    profit_loss_percent = ((exit_price - entry_price) / entry_price) * 100
+                    
+                    # 5. به‌روزرسانی رکورد در دیتابیس
+                    num_days_evaluated = len(historical_data) - 1 # تعداد روزهای کاری پس از سیگنال
+                    res.final_price = exit_price
+                    res.profit_loss_percentage = profit_loss_percent
+                    # 💡 به‌روزرسانی وضعیت برای نشان دادن تعداد روز ارزیابی شده
+                    res.status = f"✅ ارزیابی ({num_days_evaluated} روز) (سود)" if profit_loss_percent > 0 else f"❌ ارزیابی ({num_days_evaluated} روز) (زیان)"
+                    res.timestamp = datetime.now()
+                    db.session.add(res)
+                    updated_count += 1
+                else:
+                    logger.debug(f"Insufficient data (found {len(historical_data)} records, less than {MIN_RECORDS_REQUIRED} required) for {res.symbol_name} ({res.jdate}). Skipping final price update.")
+
+
+            except Exception as e:
+                # خطا اینجا log می‌شود، اما به commit کردن در انتها اجازه می‌دهد
+                logger.error(f"Error updating performance for {res.symbol_name} ({res.jdate}): {e}", exc_info=True)
+                
+        evaluated_results.append(res) 
+
+    # commit کردن تغییرات
+    try:
+        db.session.commit()
+        logger.info(f"Successfully updated final_price for {updated_count} GoldenKey results.")
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"DB commit error during performance update: {e}", exc_info=True)
+        
+    return evaluated_results
+
+
+
+
 # ---------------------------------------------------------
 # Performance & Win-rate helpers (simplified / safe)
 # ---------------------------------------------------------
 
 def _calculate_performance_metrics(all_results, start_date):
     successful = 0
-    total_profit = 0.0
-    total_loss = 0.0
+    total_profit = 0.0 # جمع درصد سودهای واقعی
+    total_loss = 0.0   # جمع درصد زیان‌های واقعی
     total = 0
 
     try:
@@ -839,18 +934,31 @@ def _calculate_performance_metrics(all_results, start_date):
 
     for res in all_results:
         try:
+            # از jdate استفاده می‌کنیم که تاریخ صدور سیگنال است
             res_date = jdatetime.datetime.strptime(res.jdate, '%Y-%m-%d').togregorian().date()
         except Exception:
             continue
+            
+        # فقط سیگنال‌های Golden Key و در بازه زمانی مورد نظر
         if res.is_golden_key and (start_gregorian is None or res_date >= start_gregorian):
-            total += 1
-            if res.score and res.score > 10:
-                successful += 1
-                total_profit += res.score * 0.5
-            else:
-                total_loss += 5.0
+            
+            # ✅ شرط کلیدی: فقط سیگنال‌هایی که final_price در آن‌ها محاسبه شده را در ارزیابی دخیل کن
+            if res.profit_loss_percentage is not None and res.profit_loss_percentage != 0.0:
+                total += 1
+                
+                profit_percent = res.profit_loss_percentage
+                
+                if profit_percent > 0:
+                    successful += 1
+                    total_profit += profit_percent # جمع درصد سودها
+                else:
+                    total_loss += profit_percent * -1 # جمع درصد زیان‌ها (به صورت مثبت)
+            # else:
+                # سیگنال‌هایی که هنوز ارزیابی نهایی نشده‌اند (کمتر از 5 روز گذشته است) نادیده گرفته می‌شوند.
+
 
     win_rate = (successful / total * 100) if total > 0 else 0.0
+    # درصد سود و زیان تجمعی باید به عنوان جمع درصدها برگردانده شود.
     return total, successful, win_rate, total_profit, total_loss
 
 
@@ -886,24 +994,36 @@ def _save_performance_metrics(today_jdate_str, period_type, signal_source, total
         logger.error(f"Error saving aggregated performance: {e}", exc_info=True)
 
 
-def update_and_save_performance_metrics():
+def calculate_golden_key_win_rate():
     logger.info("Starting performance metrics update and save process.")
     today_jdate_str = get_today_jdate_str()
+    # 1. بازیابی تمام نتایج برای ارزیابی
     all_results = GoldenKeyResult.query.all()
+    
     if not all_results:
         logger.warning("No GoldenKeyResult rows found for performance computation.")
-        return
+        return False, "Performance computation skipped: No Golden Key results found." 
+        
+    # 2. ✅ گام جدید: به‌روزرسانی final_price و profit_loss_percentage در دیتابیس
+    # این گام باید انجام شود تا _calculate_performance_metrics داده‌ی ارزیابی شده داشته باشد.
+    evaluated_results = _update_golden_key_performance(all_results, days_to_evaluate=5)
 
-    week_ago = (jdatetime.datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+    # 3. تعریف بازه‌های زمانی
+    # ✅ اصلاح بازه‌ی هفتگی به ۶ روز
+    week_ago = (jdatetime.datetime.now() - timedelta(days=6)).strftime('%Y-%m-%d')
     month_ago = (jdatetime.datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
 
-    w_total, w_success, w_win, w_profit, w_loss = _calculate_performance_metrics(all_results, week_ago)
+    # 4. محاسبه و ذخیره هفتگی (از evaluated_results استفاده می‌کند)
+    w_total, w_success, w_win, w_profit, w_loss = _calculate_performance_metrics(evaluated_results, week_ago)
     _save_performance_metrics(today_jdate_str, 'weekly', 'GoldenKeyService', w_total, w_success, w_win, w_profit, w_loss)
 
-    m_total, m_success, m_win, m_profit, m_loss = _calculate_performance_metrics(all_results, month_ago)
+    # 5. محاسبه و ذخیره ماهانه (از evaluated_results استفاده می‌کند)
+    m_total, m_success, m_win, m_profit, m_loss = _calculate_performance_metrics(evaluated_results, month_ago)
     _save_performance_metrics(today_jdate_str, 'monthly', 'GoldenKeyService', m_total, m_success, m_win, m_profit, m_loss)
 
     logger.info("Performance metrics update done.")
+    # ✅ بازگرداندن مقادیر موفقیت‌آمیز برای کنترلر
+    return True, "Golden Key Win-Rate calculation completed successfully after performance update."
 
 
 # End of file
