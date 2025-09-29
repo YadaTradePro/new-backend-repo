@@ -197,39 +197,79 @@ def _generate_daily_summary() -> str:
         raw_indices_data = fetch_iran_market_indices()
         indices_data = _prepare_indices_data(raw_indices_data)
         
-        # 2. دریافت داده‌های تاریخی مورد نیاز برای محاسبه جریان پول
-        today_jdate_str = jdatetime.date.today().strftime('%Y-%m-%d')
-        yesterday_jdate_str = (jdatetime.date.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+        # --- [شروع منطق جدید: یافتن آخرین روز معاملاتی] ---
+        
+        # 1.1. پیدا کردن آخرین تاریخ معاملاتی موجود در دیتابیس
+        last_trading_day_data = HistoricalData.query.filter(
+            HistoricalData.symbol_name.isnot(None)
+        ).order_by(HistoricalData.jdate.desc()).first()
+        
+        if not last_trading_day_data:
+            logger.error("❌ هیچ داده تاریخی در دیتابیس یافت نشد.")
+            return "❌ هیچ داده‌ای برای تحلیل روزانه موجود نیست."
+            
+        analysis_date_jdate_str = last_trading_day_data.jdate
+        
+        current_jdate_str = jdatetime.date.today().strftime('%Y-%m-%d')
 
+        if current_jdate_str != analysis_date_jdate_str:
+            logger.info("بازار امروز (%s) ممکن است بسته باشد یا داده‌ای دریافت نشده است. تحلیل بر اساس آخرین روز معاملاتی (%s) تولید می‌شود.", 
+                        current_jdate_str, analysis_date_jdate_str)
+        
+        # 2. تنظیم تاریخ برای کوئری‌های اصلی و تاریخ دیروز
+        
+        # توجه: برای محاسبه تغییرات روزانه، باید داده‌ی یک روز قبل از analysis_date_jdate_str را پیدا کنیم.
+        
+        # پیدا کردن تاریخ دیروز با استفاده از تاریخ گریگوری ذخیره شده یا محاسبه بر اساس جریانی
+        yesterday_data = HistoricalData.query.filter(
+            HistoricalData.jdate < analysis_date_jdate_str
+        ).order_by(HistoricalData.jdate.desc()).first()
+        
+        yesterday_jdate_str = yesterday_data.jdate if yesterday_data else None
+
+        # --- [پایان منطق جدید] ---
+
+        # 2. دریافت داده‌های تاریخی مورد نیاز برای محاسبه جریان پول
         historical_data_for_df = HistoricalData.query.filter(
-            HistoricalData.jdate == today_jdate_str,
+            HistoricalData.jdate == analysis_date_jdate_str, # استفاده از تاریخ آخرین معامله
             HistoricalData.symbol_name.isnot(None)
         ).all()
         
         # تبدیل داده‌ها به DataFrame و فراخوانی تابع با آرگومان صحیح
         df = pd.DataFrame([hd.__dict__ for hd in historical_data_for_df])
+        
+        # رفع FutureWarning: در اینجا، ستون‌های پول هوشمند کاملاً در مدل HistoricalData وجود دارند.
+        # df.replace([np.inf, -np.inf], np.nan, inplace=True) # این خط در اینجا نیازی نیست
+        # df = df.fillna(0).infer_objects(copy=False) # اگرچه برای df کوتاه است، اما برای ایمنی انجام شود
+        
         smart_money_flow = calculate_smart_money_flow(df)
         
         # 3. دریافت سیگنال‌های جدید همان روز از پایگاه داده
-        golden_key_results = GoldenKeyResult.query.filter(GoldenKeyResult.jdate == today_jdate_str).all()
-        weekly_watchlist_results = WeeklyWatchlistResult.query.filter(WeeklyWatchlistResult.jentry_date == today_jdate_str).all()
+        golden_key_results = GoldenKeyResult.query.filter(GoldenKeyResult.jdate == analysis_date_jdate_str).all() # تغییر
+        weekly_watchlist_results = WeeklyWatchlistResult.query.filter(WeeklyWatchlistResult.jentry_date == analysis_date_jdate_str).all() # تغییر
         
         all_new_symbols = golden_key_results + weekly_watchlist_results
 
         # 4. محاسبه تغییرات روزانه برای هر نماد
         for symbol in all_new_symbols:
-            today_data = HistoricalData.query.filter_by(symbol_id=symbol.symbol_id, jdate=today_jdate_str).first()
-            yesterday_data = HistoricalData.query.filter_by(symbol_id=symbol.symbol_id, jdate=yesterday_jdate_str).first()
+            today_data = HistoricalData.query.filter_by(symbol_id=symbol.symbol_id, jdate=analysis_date_jdate_str).first() # تغییر
+            
+            # اگر yesterday_jdate_str وجود نداشت، از محاسبه تغییر روزانه صرف‌نظر شود.
+            if yesterday_jdate_str:
+                yesterday_data = HistoricalData.query.filter_by(symbol_id=symbol.symbol_id, jdate=yesterday_jdate_str).first()
 
-            if today_data and yesterday_data and yesterday_data.close_price != 0:
-                daily_change = ((today_data.close_price - yesterday_data.close_price) / yesterday_data.close_price) * 100
-                setattr(symbol, 'daily_change_percent', round(daily_change, 2))
+                if today_data and yesterday_data and yesterday_data.close != 0: # استفاده از 'close' به جای 'close_price'
+                    daily_change = ((today_data.close - yesterday_data.close) / yesterday_data.close) * 100
+                    setattr(symbol, 'daily_change_percent', round(daily_change, 2))
+                else:
+                    setattr(symbol, 'daily_change_percent', None)
             else:
                 setattr(symbol, 'daily_change_percent', None)
 
+
         # 5. آماده‌سازی داده‌ها برای ارسال به قالب
         data_for_template = {
-            'jdate': today_jdate_str,
+            'jdate': analysis_date_jdate_str, # استفاده از تاریخ آخرین معامله
             'indices_data': indices_data,
             'smart_money_flow_text': _get_formatted_smart_money_flow_text(smart_money_flow.get('net_real_money_flow', 0), is_weekly=False),
             'all_symbols': all_new_symbols,

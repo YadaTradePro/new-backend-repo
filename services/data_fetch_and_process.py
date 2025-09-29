@@ -1585,36 +1585,15 @@ def run_daily_update(
     # گام ۵: آپدیت داده‌های بنیادی (خارج از حلقه اصلی)
     # ===============================
     if update_fundamental:
-        logger.info("شروع آپدیت داده‌های بنیادی برای تمام نمادها...")
-        # Assuming you have a function to update fundamentals
-        fund_count, fund_msg = update_all_fundamental_data(db_session)
-        results["fundamental"]["count"] = fund_count
-        results["fundamental"]["message"] = fund_msg
-        logger.info(fund_msg)
-    else:
-        results["fundamental"]["message"] = "آپدیت داده‌های بنیادی Skip شد."
-        logger.info(results["fundamental"]["message"])
-
-    final_message = (
-        f"🏁 آپدیت روزانه تکمیل شد. "
-        f"Historical: {results['historical']['total_count']}, "
-        f"Technical: {results['technical']['total_count']}, "
-        f"Candlestick: {results['candlestick']['total_count']}."
-    )
-    logger.info(final_message)
-    return results
-
-    # ===============================
-    # گام 5: آپدیت داده‌های بنیادی
-    # ===============================
-    if update_fundamental:
         try:
             logger.info("📈 شروع آپدیت داده‌های بنیادی...")
 
-            if limit_per_run is None:
-                limit_per_run = limit  # استفاده از limit کلی در صورت نبودن limit_per_run
+            # limit_per_run در اینجا همان limit ورودی تابع است
+            limit_per_run = limit
 
             query = db_session.query(ComprehensiveSymbolData)
+            
+            # فیلتر بر اساس لیست خاصی از نمادها
             if specific_symbols_list:
                 symbol_conditions = [
                     or_(
@@ -1625,29 +1604,38 @@ def run_daily_update(
                 ]
                 query = query.filter(or_(*symbol_conditions))
 
-            symbols_to_update = query.filter(
+            # کوئری اصلی برای یافتن نمادهایی که آپدیت بنیادی قدیمی دارند
+            symbols_to_update_fund = query.filter(
                 (ComprehensiveSymbolData.last_fundamental_update_date.is_(None)) |
                 (ComprehensiveSymbolData.last_fundamental_update_date < (date.today() - timedelta(days=3)))
             ).order_by(
                 ComprehensiveSymbolData.last_fundamental_update_date.asc()
             ).limit(limit_per_run).all()
-
+            
             fundamental_count = 0
-            for symbol in symbols_to_update:
+            for symbol in symbols_to_update_fund:
                 try:
+                    # فراخوانی تابع آپدیت بنیادی (بر اساس tse_index)
                     updated_count, msg = update_symbol_fundamental_data(
                         db_session,
                         specific_symbols_list=[symbol.tse_index]
                     )
+                    
                     if updated_count > 0:
                         fundamental_count += updated_count
+                        # آپدیت تاریخ آخرین آپدیت بنیادی
                         symbol.last_fundamental_update_date = date.today()
                         db_session.add(symbol)
                         db_session.commit()
-                    time.sleep(0.1)
+                    
+                    # 💡 اضافه کردن یک تأخیر کوتاه برای جلوگیری از فشار بر API
+                    time.sleep(0.1) 
+                    
                 except Exception as e:
-                    logger.warning(f"⚠️ خطا در به‌روزرسانی بنیادی {symbol.symbol_name}: {e}")
                     db_session.rollback()
+                    logger.warning(
+                        f"⚠️ خطا در به‌روزرسانی بنیادی نماد {symbol.symbol_name} ({symbol.tse_index}): {e}"
+                    )
                     continue
 
             results["fundamental"]["count"] = fundamental_count
@@ -1657,9 +1645,24 @@ def run_daily_update(
         except Exception as e:
             error_msg = f"❌ خطا در اجرای آپدیت بنیادی: {e}"
             results["fundamental"]["message"] = error_msg
-            logger.error(error_msg)
+            logger.error(error_msg, exc_info=True)
             db_session.rollback()
+            
+    else:
+        results["fundamental"]["message"] = "آپدیت داده‌های بنیادی Skip شد."
+        logger.info(results["fundamental"]["message"])
 
+    # ===============================
+    # جمع‌بندی نهایی و بازگشت نتایج
+    # ===============================
+    final_message = (
+        f"🏁 آپدیت روزانه تکمیل شد. "
+        f"Historical: {results['historical']['total_count']}, "
+        f"Technical: {results['technical']['total_count']}, "
+        f"Candlestick: {results['candlestick']['total_count']}, "
+        f"Fundamental: {results['fundamental']['count']}."
+    )
+    logger.info(final_message)
     return results
 
 
@@ -2156,6 +2159,10 @@ def run_candlestick_detection(db_session: Session, limit: int = None, symbols_li
     اجرای تشخیص الگوهای شمعی برای نمادها با استفاده از داده‌های تاریخی و ذخیره نتایج.
     از استراتژی حذف و درج (Delete & Insert) برای جلوگیری از تکرار استفاده می‌کند.
     """
+    # ⚠️ توجه: نیازمند importهای datetime, pd, logger, CandlestickPatternDetection, HistoricalData
+    from datetime import datetime
+    import pandas as pd # فرض بر import بودن این ماژول‌ها است.
+    
     try:
         logger.info("🕯️ شروع تشخیص الگوهای شمعی...")
 
@@ -2173,9 +2180,13 @@ def run_candlestick_detection(db_session: Session, limit: int = None, symbols_li
             return 0
 
         # تبدیل به DataFrame
-        # '__dict__' برای بازیابی فیلدهای ORM استفاده می‌شود، اگرچه می‌توانید مستقیماً فیلدها را نیز کوئری بگیرید.
+        # '__dict__' برای بازیابی فیلدهای ORM استفاده می‌شود، اگرچه می‌توانید مستقیماً فیلدها را نیز کوئری بگیما
         df = pd.DataFrame([row.__dict__ for row in historical_data])
         
+        # حذف ستون‌های سیستمی احتمالی که در ORM هستند و در تحلیل مورد نیاز نیستند
+        if '_sa_instance_state' in df.columns:
+            df = df.drop(columns=['_sa_instance_state']) 
+            
         grouped = df.groupby('symbol_id')
         success_count = 0
         records_to_insert = []
@@ -2189,13 +2200,7 @@ def run_candlestick_detection(db_session: Session, limit: int = None, symbols_li
                 continue 
                 
             try:
-                # ❌ اصلاح کلیدی: حذف عملیات تغییر نام موقت ستون‌ها
-                # column_rename_map = {'close': 'close_price', 'open': 'open_price', 
-                #                      'high': 'high_price', 'low': 'low_price'}
-                # group_df.rename(columns=column_rename_map, inplace=True) 
-                
                 # استخراج داده‌های لازم:
-                # اکنون today_record_dict دارای کلیدهای اصلی ('open', 'close', ...) است.
                 today_record_dict = group_df.iloc[-1].to_dict()
                 yesterday_record_dict = group_df.iloc[-2].to_dict()
                 
@@ -2203,13 +2208,8 @@ def run_candlestick_detection(db_session: Session, limit: int = None, symbols_li
                 patterns = check_candlestick_patterns(
                     today_record_dict, 
                     yesterday_record_dict, 
-                    # ⚠️ توجه: DataFrame ارسالی هنوز نام‌های اصلی (open, close,...) را دارد. 
                     group_df 
                 )
-                
-                # ❌ اصلاح کلیدی: حذف عملیات بازگرداندن نام‌ها
-                # reverse_rename_map = {v: k for k, v in column_rename_map.items()}
-                # group_df.rename(columns=reverse_rename_map, inplace=True)
                 
                 # ذخیره الگوهای یافت‌شده
                 if patterns:
@@ -2226,13 +2226,11 @@ def run_candlestick_detection(db_session: Session, limit: int = None, symbols_li
                     success_count += 1
                     
             except Exception as e:
-                # این خطا دیگر نباید 'open' باشد، مگر اینکه نام ستون‌های اصلی دیتابیس چیز دیگری باشد.
-                logger.error(f"❌ خطا در تشخیص الگوهای شمعی برای نماد {symbol_id}: {e}")
+                logger.error(f"❌ خطا در تشخیص الگوهای شمعی برای نماد {symbol_id}: {e}", exc_info=True)
                 
         # 3. ذخیره نتایج در دیتابیس (استراتژی Delete & Insert)
         if records_to_insert:
             # الف) استخراج تاریخ و لیست نمادهای پردازش شده
-            # فرض می‌کنیم تمام رکوردها برای یک تاریخ هستند (آخرین روز)
             last_jdate = records_to_insert[0]['jdate'] 
             processed_symbol_ids = list({record['symbol_id'] for record in records_to_insert})
             
@@ -2241,14 +2239,15 @@ def run_candlestick_detection(db_session: Session, limit: int = None, symbols_li
                 db_session.query(CandlestickPatternDetection).filter(
                     CandlestickPatternDetection.symbol_id.in_(processed_symbol_ids),
                     CandlestickPatternDetection.jdate == last_jdate
-                ).delete(synchronize_session='fetch')
+                # 💥 اصلاح کلیدی: تغییر از 'fetch' به False برای حل خطای SQLAlchemy
+                ).delete(synchronize_session=False) 
                 
                 db_session.commit() # commit حذف‌ها 
                 logger.info(f"🗑️ الگوهای شمعی قبلی ({len(processed_symbol_ids)} نماد) برای {last_jdate} حذف شدند.")
                 
             except Exception as e:
                 db_session.rollback()
-                logger.error(f"❌ خطا در حذف رکوردهای قدیمی الگوهای شمعی: {e}")
+                logger.error(f"❌ خطا در حذف رکوردهای قدیمی الگوهای شمعی: {e}", exc_info=True)
                 return 0 
                 
             # ج) درج رکوردهای جدید
@@ -2261,7 +2260,7 @@ def run_candlestick_detection(db_session: Session, limit: int = None, symbols_li
         return success_count
 
     except Exception as e:
-        logger.error(f"❌ خطای کلی در اجرای تشخیص الگوهای شمعی: {e}")
+        logger.error(f"❌ خطای کلی در اجرای تشخیص الگوهای شمعی: {e}", exc_info=True)
         db_session.rollback()
         return 0
 
