@@ -237,16 +237,16 @@ def run_potential_buy_queue_analysis_and_save():
         if all(col in merged_df.columns for col in required_candle_cols) and len(merged_df) >= 3:
             # Correcting the issue by passing a new dictionary with the expected keys
             today_candle_data_for_fn = {
-                'open_price': get_numeric_value(merged_df.iloc[-1], 'open'),
-                'high_price': get_numeric_value(merged_df.iloc[-1], 'high'),
-                'low_price': get_numeric_value(merged_df.iloc[-1], 'low'),
-                'close_price': get_numeric_value(merged_df.iloc[-1], 'close')
+                'open': get_numeric_value(merged_df.iloc[-1], 'open'),
+                'high': get_numeric_value(merged_df.iloc[-1], 'high'),
+                'low': get_numeric_value(merged_df.iloc[-1], 'low'),
+                'close': get_numeric_value(merged_df.iloc[-1], 'close')
             }
             yesterday_candle_data_for_fn = {
-                'open_price': get_numeric_value(merged_df.iloc[-2], 'open'),
-                'high_price': get_numeric_value(merged_df.iloc[-2], 'high'),
-                'low_price': get_numeric_value(merged_df.iloc[-2], 'low'),
-                'close_price': get_numeric_value(merged_df.iloc[-2], 'close')
+                'open': get_numeric_value(merged_df.iloc[-2], 'open'),
+                'high': get_numeric_value(merged_df.iloc[-2], 'high'),
+                'low': get_numeric_value(merged_df.iloc[-2], 'low'),
+                'close': get_numeric_value(merged_df.iloc[-2], 'close')
             }
             
             # Check for NaNs in the relevant columns for the last 2 rows

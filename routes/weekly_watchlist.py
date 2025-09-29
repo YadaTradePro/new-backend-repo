@@ -13,7 +13,8 @@ from services import weekly_watchlist_service # Import the service
 weekly_watchlist_ns = Namespace('weekly_watchlist', description='Weekly Watchlist operations')
 weekly_watchlist_result_model = weekly_watchlist_ns.model('WeeklyWatchlistResultModel', {
     'signal_unique_id': fields.String(description='Unique ID for the signal'),
-    'symbol': fields.String(description='Symbol ID'), # Corrected to use 'symbol' directly from the object
+    #'symbol': fields.String(description='Symbol ID'), # Corrected to use 'symbol' directly from the object
+    'company_name': fields.String(description='Company Name'),
     'symbol_name': fields.String(description='Symbol Name'),
     'entry_price': fields.Float(description='Entry Price'),
     'jentry_date': fields.String(description='Jalali Entry Date'),

@@ -415,6 +415,9 @@ class TriggerFundamentalUpdate(Resource):
             current_app.logger.error(f"❌ خطای کلی در API آپدیت بنیادی برای {symbol_input}: {e}", exc_info=True)
             analysis_ns.abort(500, f"Critical error during fundamental data update: {e}")
 
+
+
+
 @analysis_ns.route('/analyze_technical_indicators/<string:symbol_input>')
 @analysis_ns.param('symbol_input', 'The stock symbol ID (Persian short name) or ISIN')
 @analysis_ns.param('days', 'Number of recent days to fetch and analyze (default: 365)')
@@ -433,22 +436,29 @@ class TechnicalIndicatorsResource(Resource):
         if not symbol_id:
             analysis_ns.abort(404, f"Invalid symbol ID or name: {symbol_input}")
 
+        # ✅ FIX: تبدیل symbol_id به رشته برای کوئری گرفتن از DB
+        # این کار مطابقت با نوع db.String در مدل TechnicalIndicatorData را تضمین می‌کند.
+        symbol_id_str = str(symbol_id)
+
         parser = reqparse.RequestParser()
         parser.add_argument('days', type=int, default=365, help='Number of recent days to fetch and analyze')
         args = parser.parse_args()
         days = args['days']
 
         # Call the service function to analyze and save technical data
+        # symbol_id (integer/original type) برای تابع سرویس فرستاده می‌شود.
         success, msg = data_fetch_and_process.analyze_technical_data_for_symbol(symbol_id, symbol_id, limit_days=days)
         if not success:
             analysis_ns.abort(404, f"Failed to analyze technical data for symbol_id: {symbol_id}. Reason: {msg}")
 
         # Fetch the newly saved technical data from the database
-        technical_data_records = TechnicalIndicatorData.query.filter_by(symbol_id=symbol_id)\
-                                                        .order_by(TechnicalIndicatorData.jdate.desc())\
-                                                        .limit(days).all()
+        # ✅ استفاده از symbol_id_str (مقدار رشته‌ای) در فیلتر
+        technical_data_records = TechnicalIndicatorData.query.filter_by(symbol_id=symbol_id_str)\
+                                                     .order_by(TechnicalIndicatorData.jdate.desc())\
+                                                     .limit(days).all()
+        
         if not technical_data_records:
-            analysis_ns.abort(404, f"No technical indicator data found for symbol_id: {symbol_id} after calculation.")
+            analysis_ns.abort(404, f"No technical indicator data found for symbol_id: {symbol_id}. This might indicate a saving issue.")
 
         # Convert records to a list of dictionaries for marshalling
         return [rec.__dict__ for rec in technical_data_records]

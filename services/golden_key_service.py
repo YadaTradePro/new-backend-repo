@@ -486,10 +486,10 @@ def run_golden_key_analysis_and_save(top_n_symbols=8):
 
 
         hist_df_for_patterns = pd.DataFrame({
-            "open_price": df["open"],
-            "high_price": df["high"],
-            "low_price": df["low"],
-            "close_price": df["close"],
+            "open": df["open"],
+            "high": df["high"],
+            "low": df["low"],
+            "close": df["close"],
             "volume": df["volume"],
         })    
 
@@ -570,11 +570,11 @@ def run_golden_key_analysis_and_save(top_n_symbols=8):
                 "score": 15, "category": "میانگین‌ها", "reason": "تقاطع طلایی میانگین‌های متحرک ۲۰ و ۵۰ روزه"
             },
             "کندل چکشی یا دوجی با حجم بالا در کف": {
-                "func": lambda: (check_candlestick_patterns(today_candle_data, yesterday_candle_data, df['close'].values) is not None and
-                                 ("Hammer" in check_candlestick_patterns(today_candle_data, yesterday_candle_data, df['close'].values) or "Doji" in check_candlestick_patterns(today_candle_data, yesterday_candle_data, df['close'].values))
-                                 and is_high_volume(current_volume, latest_vol_ma_5, 1.5)) if check_candlestick_patterns else False,
+                "func": lambda: (check_candlestick_patterns(today_candle_data, yesterday_candle_data, hist_df_for_patterns) is not None and ("Hammer" in check_candlestick_patterns(today_candle_data, yesterday_candle_data, hist_df_for_patterns) or "Doji" in check_candlestick_patterns(today_candle_data, yesterday_candle_data, hist_df_for_patterns)) and is_high_volume(current_volume, latest_vol_ma_5, 1.5)) if check_candlestick_patterns else False,
                 "score": 10, "category": "الگوهای کلاسیک", "reason": "تشکیل کندل چکشی یا دوجی با حجم بالا در کف"
             },
+
+
             "افزایش قدرت خریدار حقیقی + ورود پول": {
                 "func": lambda: pd.notna(latest_individual_buy_power) and latest_individual_buy_power > 2.0,
                 "score": 18, "category": "جریان وجوه", "reason": "افزایش قدرت خریدار حقیقی و ورود پول هوشمند"
@@ -606,19 +606,6 @@ def run_golden_key_analysis_and_save(top_n_symbols=8):
             "RSI اشباع خرید": {
                 "func": lambda: is_rsi_overbought(latest_rsi),
                 "score": -10, "category": "روند قیمت", "reason": "RSI بالاتر از 70"
-            },
-
-
-             "کندل چکشی یا دوجی با حجم بالا در کف": {
-                "score": 6,
-                "func": lambda: (
-                check_candlestick_patterns(today_candle_data, yesterday_candle_data, hist_df_for_patterns) is not None
-                and (
-                "Hammer" in check_candlestick_patterns(today_candle_data, yesterday_candle_data, hist_df_for_patterns)
-                or "Doji" in check_candlestick_patterns(today_candle_data, yesterday_candle_data, hist_df_for_patterns)
-                )
-                and is_high_volume(current_volume, latest_volume_ma_5_day, 1.5)
-                ) if check_candlestick_patterns else False,
             },
 
 

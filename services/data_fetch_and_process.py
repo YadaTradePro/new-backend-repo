@@ -110,7 +110,7 @@ def filter_symbols(symbols: List[Dict], exclude_list: List[str] = None) -> List[
         market_type_name = MARKET_TYPE_MAP.get(market_type_code)
         
         # گام ۱: بررسی بر اساس نوع بازار
-        is_good_market = market_type_name in good_markets
+        is_good_market = any( market_type_name and market_type_name.startswith(good) for good in good_markets)
         
         # گام ۲: بررسی بر اساس پسوندهای نام
         # از endswith() به جای regex استفاده می‌کنیم که دقیق‌تر و خواناتر است.
@@ -1146,38 +1146,35 @@ def get_session_local():
         return sessionmaker(bind=db.get_engine())()
 
 
-
-def get_symbol_id(db_session: Session, symbol_identifier: str) -> Optional[int]:
-    """
-    ID داخلی (PK) یک نماد را بر اساس نام یا TSE Index آن پیدا می‌کند.
-    """
+def get_symbol_id(symbol_identifier: str) -> Optional[int]:
     if not symbol_identifier:
         return None
 
-    # فرض بر این است که ComprehensiveSymbolData در این فایل import شده است.
+    session = db.session  # استفاده از session پیش‌فرض
+
     from models import ComprehensiveSymbolData 
 
-    # 1. جستجو بر اساس TSE Index (اگر ورودی عدد باشد)
     try:
         if str(symbol_identifier).isdigit():
-            # جستجو بر اساس tse_index (که در مدل ما str ذخیره می‌شود)
-            sym = db_session.query(ComprehensiveSymbolData.id).filter(
-                ComprehensiveSymbolData.tse_index == symbol_identifier
+            sym = session.query(ComprehensiveSymbolData.id).filter(
+                ComprehensiveSymbolData.tse_index == str(symbol_identifier)
             ).first()
             if sym:
                 return sym[0]
     except Exception:
-        pass # اگر تبدیل به عدد ناموفق بود، ادامه دهید.
+        pass
 
-    # 2. جستجو بر اساس نام نماد
-    sym = db_session.query(ComprehensiveSymbolData.id).filter(
+    sym = session.query(ComprehensiveSymbolData.id).filter(
         ComprehensiveSymbolData.symbol_name == symbol_identifier
     ).first()
 
     if sym:
+        logger.info(f"Symbol found. ID: {sym[0]}") # ✅ لاگ موفقیت
         return sym[0]
     
+    logger.warning(f"Symbol NOT found in DB with name: {symbol_identifier}") # ✅ لاگ عدم موفقیت
     return None
+
 
 
 
@@ -1475,18 +1472,17 @@ def run_full_data_update(
 # ----------------------------
 def run_daily_update(
     db_session: Session,
-    limit: int = 200,  # limit now acts as BATCH_SIZE
+    limit: int = 200, # limit now acts as BATCH_SIZE
     update_fundamental: bool = True,
     specific_symbols_list: Optional[List[str]] = None,
-    # limit_per_run is deprecated by the new batch logic
 ):
     """
     اجرای آپدیت روزانه به صورت دسته‌ای (batch) برای تضمین پردازش تمام نمادها.
     این تابع تا زمانی که نماد آپدیت‌نشده‌ای وجود داشته باشد، در یک حلقه اجرا می‌شود.
     """
+    # ⚠️ حتماً مطمئن شوید که importsهای مورد نیاز (date, timedelta, logger, or_) در بالای فایل موجود باشند.
     logger.info("🚀 شروع آپدیت کامل روزانه به صورت دسته‌ای...")
 
-    # FIX: Initialize all keys to prevent KeyError
     results = {
         "historical": {"total_count": 0},
         "technical": {"total_count": 0},
@@ -1513,18 +1509,24 @@ def run_daily_update(
             )
         )
         
-        # اگر لیست خاصی از نمادها مشخص شده بود، فقط آنها را در نظر بگیر
+        # اگر لیست خاصی از نمادها مشخص شده بود
         if specific_symbols_list:
-            symbols_to_update_query = symbols_to_update_query.filter(
-                ComprehensiveSymbolData.symbol_name.in_(specific_symbols_list)
-            )
+            symbol_conditions = [
+                or_(
+                    ComprehensiveSymbolData.symbol_name == s,
+                    ComprehensiveSymbolData.tse_index == s
+                )
+                for s in specific_symbols_list
+            ]
+            symbols_to_update_query = symbols_to_update_query.filter(or_(*symbol_conditions))
+
 
         # اعمال محدودیت به عنوان اندازه دسته
         symbols_in_batch = symbols_to_update_query.limit(limit).all()
 
         if not symbols_in_batch:
-            logger.info("✅ تمام نمادها برای امروز به‌روز هستند. پایان عملیات.")
-            break  # شرط خروج از حلقه while
+            logger.info("✅ تمام نمادها برای امروز به‌روز هستند. پایان عملیات Historical/Technical.")
+            break
 
         symbol_ids_to_process = [s.tse_index for s in symbols_in_batch]
         logger.info(f"📊 یافت شد {len(symbol_ids_to_process)} نماد در این دسته برای آپدیت.")
@@ -1560,6 +1562,16 @@ def run_daily_update(
         else:
             logger.warning("داده تاریخی جدیدی برای این دسته دریافت نشد، گام‌های تحلیل Skip شد.")
         
+
+        # ----------------------------------------------------
+        # 💥💥💥 FIX حلقه بی‌نهایت: به‌روزرسانی تاریخ آپدیت 💥💥💥
+        # این کار تضمین می‌کند که این نمادها در دور بعدی کوئری فیلتر شوند.
+        # این آپدیت باید انجام شود، حتی اگر داده جدیدی دریافت نشده باشد (hist_count=0).
+        # ----------------------------------------------------
+        for symbol in symbols_in_batch:
+            symbol.last_historical_update_date = today # تنظیم به امروز
+            db_session.add(symbol)
+        
         # IMPROVEMENT: Commit changes after each successful batch
         try:
             db_session.commit()
@@ -1567,7 +1579,6 @@ def run_daily_update(
         except Exception as e:
             logger.error(f"❌ خطا در ثبت تغییرات دسته {run_count}: {e}")
             db_session.rollback()
-            # Decide if you want to break or continue on commit error
             break
             
     # ===============================
@@ -1692,34 +1703,47 @@ def initial_populate_all_symbols_and_data(db_session, limit: int = None):
             # 4. آپدیت داده‌های بنیادی
             logger.info("📊 آپدیت داده‌های بنیادی...")
 
-            # ⚠️ کوئری گرفتن از tse_index نمادها (با اعمال limit در صورت وجود)
-            symbols_to_update = db_session.query(ComprehensiveSymbolData.tse_index).limit(limit).all()
-            symbols_to_update = [symbol[0] for symbol in symbols_to_update]
+            # ⚠️ کوئری گرفتن همزمان id و tse_index (با اعمال limit در صورت وجود)
+            symbols_to_update = db_session.query(
+                ComprehensiveSymbolData.id,
+                ComprehensiveSymbolData.tse_index
+            ).limit(limit).all()
 
             fundamental_count = 0
-            for tse_index in symbols_to_update:
+            for symbol_id, tse_index in symbols_to_update:
                 try:
-                    # فراخوانی تابع آپدیت بنیادی. فرض می‌کنیم این تابع خودش commit می‌کند.
-                    updated_count, msg = update_symbol_fundamental_data(db_session, specific_symbols_list=[tse_index])
+                    # فراخوانی تابع آپدیت بنیادی (بر اساس tse_index)
+                    updated_count, msg = update_symbol_fundamental_data(
+                        db_session,
+                        specific_symbols_list=[tse_index]
+                    )
                     fundamental_count += updated_count
-        
-                    # 💡 نکته: 'time.sleep(0.2)' به منظور افزایش کارایی و سرعت فرآیند حذف شد.
-        
+
+                    # 💡 نکته: 'time.sleep(0.2)' برای افزایش سرعت حذف شد.
+
                 except Exception as e:
-                    # 🛠️ اصلاح: در صورت بروز خطا در دریافت/ذخیره یک نماد، تغییرات ناقص را Rollback کنید.
-                    # این کار از تداخل این تراکنش با تراکنش‌های موفق نمادهای دیگر جلوگیری می‌کند.
+                    # 🛠️ در صورت خطا تراکنش Rollback شود تا دیتابیس قفل نشود
                     db_session.rollback()
-                    logger.warning(f"⚠️ خطا در به‌روزرسانی بنیادی نماد {tse_index}: {e}")
-                    continue # ادامه فرآیند برای نماد بعدی
+                    logger.warning(
+                        f"⚠️ خطا در به‌روزرسانی بنیادی نماد {tse_index} (ID={symbol_id}): {e}"
+                    )
+                    continue  # ادامه برای نماد بعدی
 
             logger.info(f"✅ اطلاعات بنیادی برای {fundamental_count} نماد به‌روزرسانی شد")
 
             # 5. اجرای تحلیل تکنیکال
             logger.info("📉 اجرای تحلیل تکنیکال...")
             try:
-                # ⚠️ فراخوانی با همان لیست نمادها که شامل tse_index است
-                run_technical_analysis(db_session, limit=limit, symbols_list=symbols_to_update)
+                # ⚠️ در تحلیل تکنیکال فقط به id نیاز داریم
+                symbol_ids = [sid for sid, _ in symbols_to_update]
+
+                run_technical_analysis(
+                    db_session,
+                    limit=limit,
+                    symbols_list=symbol_ids
+                )
                 logger.info("✅ تحلیل تکنیکال با موفقیت اجرا شد")
+
             except Exception as e:
                 logger.error(f"❌ خطا در اجرای تحلیل تکنیکال: {e}")
             
@@ -1780,48 +1804,25 @@ def initial_populate_all_symbols_and_data(db_session, limit: int = None):
 def run_technical_analysis(db_session: Session, limit: int = None, symbols_list: list = None):
     """
     اجرای تحلیل تکنیکال برای نمادها با استفاده از داده‌های تاریخی کامل.
-    این تابع از کلاس HistoricalData برای کوئری گرفتن از جدول 'stock_data' استفاده می‌کند.
     """
     try:
         logger.info("📈 شروع تحلیل تکنیکال...")
 
-        # 🛠️ توجه: در SQLAlchemy ORM، از نام کلاس (HistoricalData) استفاده می‌شود،
-        # و ORM آن را به نام جدول (stock_data) نگاشت می‌کند.
+        # کوئری برای دریافت داده‌های تاریخی (بدون تغییر)
         query = db_session.query(
-            HistoricalData.symbol_id,
-            HistoricalData.symbol_name,
-            HistoricalData.date,
-            HistoricalData.jdate,
-            HistoricalData.open,
-            HistoricalData.close,
-            HistoricalData.high,
-            HistoricalData.low,
-            HistoricalData.volume,
-            HistoricalData.final,
-            HistoricalData.yesterday_price,
-            HistoricalData.plc,
-            HistoricalData.plp,
-            HistoricalData.pcc,
-            HistoricalData.pcp,
-            HistoricalData.mv,
-            HistoricalData.buy_count_i,
-            HistoricalData.buy_count_n,
-            HistoricalData.sell_count_i,
-            HistoricalData.sell_count_n,
-            HistoricalData.buy_i_volume,
-            HistoricalData.buy_n_volume,
-            HistoricalData.sell_i_volume,
-            HistoricalData.sell_n_volume
+            HistoricalData.symbol_id, HistoricalData.symbol_name, HistoricalData.date, HistoricalData.jdate, 
+            HistoricalData.open, HistoricalData.close, HistoricalData.high, HistoricalData.low, 
+            HistoricalData.volume, HistoricalData.final, HistoricalData.yesterday_price, HistoricalData.plc, 
+            HistoricalData.plp, HistoricalData.pcc, HistoricalData.pcp, HistoricalData.mv, 
+            HistoricalData.buy_count_i, HistoricalData.buy_count_n, HistoricalData.sell_count_i, 
+            HistoricalData.sell_count_n, HistoricalData.buy_i_volume, HistoricalData.buy_n_volume, 
+            HistoricalData.sell_i_volume, HistoricalData.sell_n_volume
         )
         
         if symbols_list:
-            symbol_conditions = []
-            for symbol_identifier in symbols_list:
-                if str(symbol_identifier).isdigit():
-                    symbol_conditions.append(HistoricalData.symbol_id == symbol_identifier)
-                else:
-                    symbol_conditions.append(HistoricalData.symbol_name == symbol_identifier)
-            query = query.filter(or_(*symbol_conditions))
+            # تبدیل symbol_list به رشته برای فیلتر
+            symbols_list_str = [str(s) for s in symbols_list]
+            query = query.filter(HistoricalData.symbol_id.in_(symbols_list_str))
         
         query = query.order_by(HistoricalData.symbol_id, HistoricalData.date)
 
@@ -1829,7 +1830,7 @@ def run_technical_analysis(db_session: Session, limit: int = None, symbols_list:
 
         if not historical_data:
             logger.warning("⚠️ هیچ داده تاریخی برای تحلیل تکنیکال یافت نشد.")
-            return 0
+            return 0, "هیچ داده تاریخی برای تحلیل تکنیکال یافت نشد."
 
         columns = [
             'symbol_id', 'symbol_name', 'date', 'jdate', 'open', 'close', 'high', 'low', 'volume',
@@ -1847,9 +1848,19 @@ def run_technical_analysis(db_session: Session, limit: int = None, symbols_list:
         logger.info(f"🔍 یافت شد {len(grouped)} نماد برای تحلیل تکنیکال")
 
         for symbol_id, group_df in grouped:
+            if limit is not None and processed_count >= limit:
+                break
+                
             processed_count += 1
             try:
-                calculate_all_indicators(db_session, symbol_id, group_df)
+                df_indicators = calculate_all_indicators(group_df)
+                
+                # ✅ فراخوانی تابع ذخیره‌سازی
+                save_technical_indicators(db_session, symbol_id, df_indicators)
+                
+                # 💡 اگر commit در save_technical_indicators انجام شده باشد، اینجا نباید دوباره commit شود. 
+                # با توجه به اینکه commit در save_technical_indicators وجود دارد، این خط را حذف می‌کنیم.
+
                 success_count += 1
                 
                 if processed_count % 10 == 0:
@@ -1858,23 +1869,25 @@ def run_technical_analysis(db_session: Session, limit: int = None, symbols_list:
             except Exception as e:
                 error_count += 1
                 logger.error(f"❌ خطا در تحلیل تکنیکال برای نماد با ID {symbol_id}: {e}")
+                # ✅ FIX: اطمینان از Rollback برای آزاد سازی Session جهت پردازش نماد بعدی
+                db_session.rollback() 
                 
         logger.info(f"✅ تحلیل تکنیکال کامل شد. {success_count} نماد موفق، {error_count} خطا")
         return success_count, f"تحلیل تکنیکال کامل شد. {success_count} نماد موفق، {error_count} خطا"
 
     except Exception as e:
-        logger.error(f"❌ خطا در اجرای تحلیل تکنیکال: {e}")
-        # 🛠️ اصلاح: در صورت خطا، tuple برگردانید
-        return 0, f"خطا در اجرای تحلیل تکنیکال: {e}"
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
+        error_msg = f"خطا در اجرای تحلیل تکنیکال: {e}"
+        logger.error(f"❌ {error_msg}")
+        # اطمینان از Rollback در صورت بروز خطای کلی
+        db_session.rollback() 
+        return 0, error_msg
 
 
+
+# توابع کمکی برای محاسبه اندیکاتورها (با فرض import بودن pd, np, Tuple, logger)
 # ----------------------------
-# توابع کمکی برای محاسبه اندیکاتورها
-# ----------------------------
 
+# توابع استاندارد (بدون تغییر، چون از Series به عنوان ورودی استفاده می‌کنند):
 def calculate_sma(series: pd.Series, period: int) -> pd.Series:
     """محاسبه میانگین متحرک ساده (SMA)"""
     return series.rolling(window=period).mean()
@@ -1893,7 +1906,7 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
+def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """محاسبه MACD"""
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
@@ -1902,7 +1915,7 @@ def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: in
     macd_histogram = macd - macd_signal
     return macd, macd_signal, macd_histogram
 
-def calculate_bollinger_bands(series: pd.Series, period: int = 20, std_dev: int = 2) -> tuple:
+def calculate_bollinger_bands(series: pd.Series, period: int = 20, std_dev: int = 2) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """محاسبه Bollinger Bands"""
     middle = series.rolling(window=period).mean()
     std = series.rolling(window=period).std()
@@ -1919,14 +1932,154 @@ def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int
     atr = tr.rolling(window=period).mean()
     return atr
 
+def calculate_stochastic(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> Tuple[pd.Series, pd.Series]:
+    """محاسبه Stochastic Oscillator (%K و %D)."""
+    high = high.squeeze()
+    low = low.squeeze()
+    close = close.squeeze()
+    
+    # 💡 نکته: بهتر است در اینجا نیز از نام‌های اصلی استفاده شود یا سری‌ها به عنوان ورودی مستقیم باشند
+    df_stoch = pd.DataFrame({'high': high, 'low': low, 'close': close}).apply(pd.to_numeric, errors='coerce')
+    if df_stoch.isnull().all().all() or len(df_stoch.dropna()) < window:
+        nan_series = pd.Series([np.nan] * len(close), index=close.index)
+        return nan_series, nan_series
+
+    low_min = df_stoch['low'].rolling(window=window).min()
+    high_max = df_stoch['high'].rolling(window=window).max()
+    
+    k = 100 * ((df_stoch['close'] - low_min) / (high_max - low_min).replace(0, np.nan))
+    k = k.fillna(50) 
+    
+    d = k.rolling(window=smooth_k).mean()
+    
+    return k.astype(float).reindex(close.index), d.astype(float).reindex(close.index)
+
+# --- توابع پیشرفته با ستون‌های اصلاح شده ---
+
+def calculate_squeeze_momentum(df: pd.DataFrame, bb_window=20, bb_std=2, kc_window=20, kc_mult=1.5) -> Tuple[pd.Series, pd.Series]:
+    """محاسبه Squeeze Momentum Indicator."""
+    # ✅ اصلاح: استفاده از نام‌های اصلی ستون‌ها
+    close = pd.to_numeric(df['close'].squeeze(), errors='coerce')
+    high = pd.to_numeric(df['high'].squeeze(), errors='coerce')
+    low = pd.to_numeric(df['low'].squeeze(), errors='coerce')
+    
+    # Bollinger Bands
+    bb_ma = close.rolling(window=bb_window).mean()
+    bb_std_dev = close.rolling(window=bb_window).std()
+    bb_upper = bb_ma + (bb_std_dev * bb_std)
+    bb_lower = bb_ma - (bb_std_dev * bb_std)
+
+    # Keltner Channels
+    tr = pd.concat([(high - low), abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
+    atr = tr.rolling(window=kc_window).mean()
+    kc_ma = close.rolling(window=kc_window).mean()
+    kc_upper = kc_ma + (atr * kc_mult)
+    kc_lower = kc_ma - (atr * kc_mult)
+    
+    # Squeeze condition (خروجی Boolean)
+    # 💡 اصلاح عبارت اصلی: فرض بر این است که Squeeze زمانی روشن می‌شود که Bollinger Bands درون Keltner Channels قرار گیرد.
+    squeeze_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
+
+    # Momentum
+    highest_high = high.rolling(window=bb_window).max()
+    lowest_low = low.rolling(window=bb_window).min()
+    avg_hl = (highest_high + lowest_low) / 2
+    avg_close = close.rolling(window=bb_window).mean()
+    momentum = (close - (avg_hl + avg_close) / 2)
+    
+    momentum_smoothed = momentum.rolling(window=bb_window).apply(lambda x: np.polyfit(np.arange(len(x)), x, 1)[0], raw=True)
+
+    # تبدیل صریح Boolean به Integer و reindex برای حفظ تراز
+    return squeeze_on.astype(int).reindex(df.index), momentum_smoothed.reindex(df.index)
+
+def calculate_halftrend(df: pd.DataFrame, amplitude=2, channel_deviation=2) -> Tuple[pd.Series, pd.Series]:
+    """محاسبه اندیکاتور HalfTrend."""
+    try:
+        # ✅ اصلاح: استفاده از نام‌های اصلی ستون‌ها
+        high = pd.to_numeric(df['high'].squeeze(), errors='coerce')
+        low = pd.to_numeric(df['low'].squeeze(), errors='coerce')
+        close = pd.to_numeric(df['close'].squeeze(), errors='coerce')
+
+        # منطق calculate_atr
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        # استفاده از 100 به جای پریود پیش فرض (بر اساس کد اصلی شما)
+        atr = tr.rolling(window=100).mean() / 2 
+
+        high_price = high.rolling(window=amplitude).max()
+        low_price = low.rolling(window=amplitude).min()
+        
+        # منطق calculate_sma
+        highma = high_price.rolling(window=amplitude).mean()
+        lowma = low_price.rolling(window=amplitude).mean()
+
+        # آماده سازی ستون‌های موقت
+        trend_list = [0] * len(df)
+        next_trend_list = [0] * len(df)
+        
+        # FIX: اطمینان از تبدیل به لیست‌های ساده عددی (بدون Series)
+        close_list = close.to_list()
+        lowma_list = lowma.to_list()
+        highma_list = highma.to_list()
+        
+        for i in range(1, len(df)):
+            # مدیریت مقادیر NaN در MAها با استفاده از قیمت بسته‌شدن روز قبل (fallback)
+            prev_lowma = lowma_list[i-1] if i > 0 and not pd.isna(lowma_list[i-1]) else close_list[i-1] if i > 0 else close_list[i]
+            prev_highma = highma_list[i-1] if i > 0 and not pd.isna(highma_list[i-1]) else close_list[i-1] if i > 0 else close_list[i]
+            
+            if next_trend_list[i-1] == 1:
+                if close_list[i] < prev_lowma:
+                    trend_list[i] = -1
+                else:
+                    trend_list[i] = 1
+            else:
+                if close_list[i] > prev_highma:
+                    trend_list[i] = 1
+                else:
+                    trend_list[i] = -1
+
+            if trend_list[i] == trend_list[i-1]:
+                next_trend_list[i] = trend_list[i-1]
+            else:
+                next_trend_list[i] = trend_list[i]
+
+        df['trend'] = pd.Series(trend_list, index=df.index, dtype=int)
+        
+        halftrend_signal = df['trend'].reindex(df.index)
+        
+        # خروجی (سیگنال نهایی و روند کامل)
+        return halftrend_signal, halftrend_signal 
+
+    except Exception as e:
+        logger.error(f"خطای بحرانی در پردازش HalfTrend برای یک نماد: {e}", exc_info=True)
+        nan_series = pd.Series([np.nan] * len(df), index=df.index)
+        return nan_series, nan_series
+
+def calculate_support_resistance_break(df: pd.DataFrame, window=50) -> Tuple[pd.Series, pd.Series]:
+    """محاسبه ساده شکست مقاومت."""
+    # ✅ اصلاح: استفاده از نام‌های اصلی ستون‌ها
+    close = pd.to_numeric(df['close'].squeeze(), errors='coerce')
+    high = pd.to_numeric(df['high'].squeeze(), errors='coerce')
+    
+    resistance = high.shift(1).rolling(window=window).max()
+    
+    # شکست زمانی رخ می‌دهد که قیمت پایانی امروز بالاتر از مقاومت دیروز باشد (خروجی Boolean)
+    resistance_broken = close > resistance
+    
+    # تبدیل صریح Boolean به Integer و اطمینان از خروجی float برای resistance
+    resistance_broken_int = resistance_broken.astype(int)
+    
+    return resistance.astype(float).reindex(df.index), resistance_broken_int.reindex(df.index)
+
+
 # ----------------------------
 # توابع اصلی تحلیل تکنیکال
 # ----------------------------
-
 def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     محاسبه تمام اندیکاتورهای تکنیکال مورد نیاز و اضافه کردن آنها به DataFrame.
-    💥 نسخه بازنویسی شده برای جلوگیری از خطای unhashable type: 'Series' 💥
     """
     
     # اطمینان از اینکه دیتافریم خالی نیست و دارای ستون‌های ضروری است
@@ -1934,7 +2087,7 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         logger.warning("DataFrame خالی است یا ستون‌های لازم را ندارد.")
         return df
 
-    try:
+    try: # <--- شروع بلوک try اصلی
         # تبدیل ستون‌ها به نوع عددی و حذف مقادیر نامعتبر
         for col in ['open', 'high', 'low', 'close', 'volume']:
             if not pd.api.types.is_numeric_dtype(df[col]):
@@ -1945,7 +2098,7 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             logger.warning("پس از تبدیل و پاکسازی، دیتای معتبری برای محاسبه اندیکاتورها باقی نماند.")
             return df
         
-        # --- محاسبات اندیکاتورهای استاندارد (بدون تغییر) ---
+        # --- محاسبات اندیکاتورهای استاندارد ---
         df['RSI'] = calculate_rsi(df['close'])
         
         macd, signal, histogram = calculate_macd(df['close'])
@@ -1964,24 +2117,15 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['Volume_MA_20'] = calculate_volume_ma(df['volume'], 20)
         df['ATR'] = calculate_atr(df['high'], df['low'], df['close'])
 
-        # ===> FIX START: بازنویسی کامل منطق محاسبه اندیکاتورهای جدید <===
-
-        # 1. محاسبه Stochastic (این تابع از نام‌های استاندارد استفاده می‌کند و نیازی به تغییر نام ندارد)
+        # --- محاسبات اندیکاتورهای جدید ---
+        # 1. محاسبه Stochastic
         stochastic_k, stochastic_d = calculate_stochastic(df['high'], df['low'], df['close'])
         df['Stochastic_K'] = stochastic_k
         df['Stochastic_D'] = stochastic_d
         
-        # 2. آماده‌سازی برای توابعی که به نام‌های 'high_price', 'low_price', 'close_price' نیاز دارند
-        # به جای ساخت کپی، نام ستون‌های df اصلی را موقتاً تغییر می‌دهیم
-        column_rename_map = {
-            'high': 'high_price',
-            'low': 'low_price',
-            'close': 'close_price'
-        }
-        df.rename(columns=column_rename_map, inplace=True)
-
-        # 3. محاسبه اندیکاتورهای جدید بر روی همان DataFrame با ستون‌های تغییرنام‌یافته
-        try:
+        # 3. محاسبه اندیکاتورهای جدید با توابع اصلاح شده
+        try: # <--- بلوک try داخلی
+            # توابع اصلاح شده اکنون از نام‌های 'close', 'high', 'low' استفاده می‌کنند.
             squeeze_on, _ = calculate_squeeze_momentum(df)
             df['squeeze_on'] = squeeze_on
             
@@ -1992,23 +2136,16 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             df['resistance_level_50d'] = resistance_level
             df['resistance_broken'] = resistance_broken
         
-        finally:
-            # 4. بازگرداندن نام ستون‌ها به حالت اولیه (چه محاسبات موفق بود چه نبود)
-            reverse_rename_map = {v: k for k, v in column_rename_map.items()}
-            df.rename(columns=reverse_rename_map, inplace=True)
-            
-        # ===> FIX END <===
-        
-    except Exception as e:
-        # اگر خطایی رخ داد، لاگ می‌کنیم و df را در هر حالتی که هست برمی‌گردانیم
-        logger.error(f"❌ خطا در محاسبه اندیکاتورها در تابع calculate_all_indicators: {e}", exc_info=True)
-        # اگر نام ستون‌ها تغییر کرده بود، آن‌ها را به حالت اول برمی‌گردانیم
-        if 'close_price' in df.columns:
-             reverse_rename_map = {'high_price': 'high', 'low_price': 'low', 'close_price': 'close'}
-             df.rename(columns=reverse_rename_map, inplace=True)
-        return df
+        except Exception as e: # <--- بلوک except داخلی
+            logger.error(f"❌ خطا در محاسبه اندیکاتورها در تابع calculate_all_indicators (داخلی): {e}", exc_info=True)
+            # در اینجا ادامه کار با اندیکاتورهای استاندارد محاسبه شده مناسب‌تر است، پس df را برمی‌گردانیم.
+            pass # اجازه می‌دهیم تابع به مسیر اصلی خود ادامه دهد و df را برگرداند.
 
-    return df
+    except Exception as e: # <--- بلوک except اصلی که مورد نیاز بود!
+        logger.error(f"❌ خطای بحرانی در پردازش داده‌ها یا محاسبه اندیکاتورهای استاندارد: {e}", exc_info=True)
+        return df
+        
+    return df # <--- خروجی نهایی
 
 
 # ----------------------------
@@ -2246,6 +2383,102 @@ def save_fundamental_data(db_session: Session, symbol_id: int, fundamental_data:
     except Exception as e:
         logger.error(f"❌ خطا در ذخیره داده‌های بنیادی: {e}")
         db_session.rollback()
+
+
+def save_technical_indicators(db_session: Session, symbol_id: int, df: pd.DataFrame):
+    """
+    ذخیره (درج یا به‌روزرسانی) نتایج تحلیل تکنیکال محاسبه شده در جدول TechnicalIndicatorData.
+    """
+    # تبدیل symbol_id به رشته
+    symbol_id_str = str(symbol_id)
+
+    # تضمین وجود ستون symbol_id
+    if 'symbol_id' not in df.columns:
+        df['symbol_id'] = symbol_id_str
+
+    # حذف تکراری‌ها فقط داخل DataFrame (ضروری برای اطمینان از صحت داده‌ها)
+    # استفاده از .copy() برای جلوگیری از SettingWithCopyWarning
+    df_unique = df.drop_duplicates(subset=['symbol_id', 'jdate'], keep='last').copy()
+    df_to_save = df_unique.dropna(subset=['RSI', 'MACD'])
+
+    if df_to_save.empty:
+        logger.debug(f"⚠️ پس از پاکسازی، هیچ سطر معتبری برای ذخیره اندیکاتورهای نماد {symbol_id_str} وجود نداشت.")
+        return
+    
+    updates_count = 0
+    inserts_count = 0
+    
+    try: # بلوک try/except باید خارج از حلقه باشد تا commit یکپارچه انجام شود
+        for _, row in df_to_save.iterrows():
+            # 1. جستجو برای رکورد موجود
+            existing = db_session.query(TechnicalIndicatorData).filter_by(
+                symbol_id=symbol_id_str,
+                jdate=row['jdate']
+            ).first()
+
+            # 2. منطق درج یا به‌روزرسانی (Upsert)
+            if existing:
+                # ✅ Update رکورد موجود
+                existing.close_price = row.get('close')
+                existing.RSI = row.get('RSI')
+                existing.MACD = row.get('MACD')
+                existing.MACD_Signal = row.get('MACD_Signal')
+                existing.MACD_Hist = row.get('MACD_Histogram')
+                existing.SMA_20 = row.get('SMA_20')
+                existing.SMA_50 = row.get('SMA_50')
+                existing.Bollinger_High = row.get('Bollinger_Upper')
+                existing.Bollinger_Low = row.get('Bollinger_Lower')
+                existing.Bollinger_MA = row.get('Bollinger_Middle')
+                existing.Volume_MA_20 = row.get('Volume_MA_20')
+                existing.ATR = row.get('ATR')
+                existing.Stochastic_K = row.get('Stochastic_K')
+                existing.Stochastic_D = row.get('Stochastic_D')
+                existing.squeeze_on = bool(row.get('squeeze_on'))
+                existing.halftrend_signal = row.get('halftrend_signal')
+                existing.resistance_level_50d = row.get('resistance_level_50d')
+                existing.resistance_broken = bool(row.get('resistance_broken'))
+                
+                # توجه: اگر مدل شما `updated_at` را به صورت خودکار به‌روز نمی‌کند، باید آن را اینجا به‌روز کنید
+                # existing.updated_at = datetime.now() 
+                
+                updates_count += 1
+            else:
+                # ✅ Insert رکورد جدید
+                indicator = TechnicalIndicatorData(
+                    symbol_id=symbol_id_str,
+                    jdate=row['jdate'],
+                    close_price=row.get('close'),
+                    RSI=row.get('RSI'),
+                    MACD=row.get('MACD'),
+                    MACD_Signal=row.get('MACD_Signal'),
+                    MACD_Hist=row.get('MACD_Histogram'),
+                    SMA_20=row.get('SMA_20'),
+                    SMA_50=row.get('SMA_50'),
+                    Bollinger_High=row.get('Bollinger_Upper'),
+                    Bollinger_Low=row.get('Bollinger_Lower'),
+                    Bollinger_MA=row.get('Bollinger_Middle'),
+                    Volume_MA_20=row.get('Volume_MA_20'),
+                    ATR=row.get('ATR'),
+                    Stochastic_K=row.get('Stochastic_K'),
+                    Stochastic_D=row.get('Stochastic_D'),
+                    squeeze_on=bool(row.get('squeeze_on')),
+                    halftrend_signal=row.get('halftrend_signal'),
+                    resistance_level_50d=row.get('resistance_level_50d'),
+                    resistance_broken=bool(row.get('resistance_broken'))
+                )
+                db_session.add(indicator)
+                inserts_count += 1
+
+        # Commit کردن تراکنش پس از اتمام حلقه
+        db_session.commit()
+        logger.info(f"✅ اندیکاتورهای نماد {symbol_id_str} با موفقیت ذخیره/بروزرسانی شدند. (درج: {inserts_count}، بروزرسانی: {updates_count})")
+        
+    except Exception as e:
+        db_session.rollback()
+        # 💡 این خطا اکنون فقط در صورتی رخ می‌دهد که دو رشته همزمان (concurrent processes) بخواهند یک رکورد را درج کنند
+        logger.error(f"❌ خطا در ذخیره اندیکاتورها برای نماد {symbol_id_str}: {e}")
+
+
 
 # ----------------------------
 # توابع مدیریت حافظه و بهینه‌سازی

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # services/weekly_watchlist_service.py
 from extensions import db
-from models import HistoricalData, ComprehensiveSymbolData, TechnicalIndicatorData, FundamentalData, WeeklyWatchlistResult, SignalsPerformance, AggregatedPerformance, GoldenKeyResult
+from models import HistoricalData, ComprehensiveSymbolData, TechnicalIndicatorData, FundamentalData, WeeklyWatchlistResult, SignalsPerformance, AggregatedPerformance, GoldenKeyResult, CandlestickPatternDetection, MLPrediction, FinancialRatiosData
 from flask import current_app
 import pandas as pd
 from datetime import datetime, timedelta, date
@@ -48,18 +48,18 @@ FILTER_WEIGHTS = {
     "Price_Above_SMA50": 1,
 
     # --- Fundamental Quality Filters ---
-    "High_ROE": 2,
-    "Reasonable_PE": 1,
-    "Reasonable_PS": 1,
-    "Reasonable_PB": 1,
-    "Positive_EPS": 1,
+    #"High_ROE": 2,
+    "Reasonable_PE": 0.5,
+    "Reasonable_PS": 0.5,
+    #"Reasonable_PB": 1,
+    "Positive_EPS": 0.5,
 
 
     # --- candlestick filters Filters ---
     "Bullish_Engulfing_Detected": 3,
     "Hammer_Detected": 3,
     "Morning_Star_Detected": 4,
-    "ML_Predicts_Uptrend": 4,
+    "ML_Predicts_Uptrend": 2,
 
     # --- Penalties & Negative Scores (Crucial for avoiding peaks) ---
     "RSI_Is_Overbought": -4,
@@ -315,9 +315,9 @@ def _check_fundamental_filters(fundamental_rec):
     reason_parts = {"fundamental": []}
     if fundamental_rec:
         if fundamental_rec.pe is not None and 0 < fundamental_rec.pe < 20: satisfied_filters.append("Reasonable_PE")
-        if fundamental_rec.ps is not None and 0 < fundamental_rec.ps < 5: satisfied_filters.append("Reasonable_PS")
-        if fundamental_rec.pb is not None and 0 < fundamental_rec.pb < 2: satisfied_filters.append("Reasonable_PB")
-        if fundamental_rec.roe is not None and fundamental_rec.roe > 15: satisfied_filters.append("High_ROE")
+        if fundamental_rec.p_s_ratio is not None and 0 < fundamental_rec.p_s_ratio < 5: satisfied_filters.append("Reasonable_PS")
+        #if fundamental_rec.pb is not None and 0 < fundamental_rec.pb < 2: satisfied_filters.append("Reasonable_PB")
+        #if fundamental_rec.roe is not None and fundamental_rec.roe > 15: satisfied_filters.append("High_ROE")
         if fundamental_rec.eps is not None and fundamental_rec.eps > 0: satisfied_filters.append("Positive_EPS")
     return satisfied_filters, reason_parts
 
@@ -832,7 +832,7 @@ def evaluate_weekly_watchlist_performance():
 # ----------------------------
 def get_weekly_watchlist_results():
     """
-    Retrieves the latest weekly watchlist results from the database.
+    Retrieves the latest weekly watchlist results from the database, enriched with company names.
     This function now explicitly fetches results for the latest available date.
     Returns a dictionary with 'top_watchlist_stocks' and 'last_updated'.
     """
@@ -855,12 +855,31 @@ def get_weekly_watchlist_results():
     results = WeeklyWatchlistResult.query.filter_by(jentry_date=latest_jdate_str)\
                                          .order_by(WeeklyWatchlistResult.created_at.desc()).all() 
 
+    # --- NEW: Efficiently fetch company names for all symbols in the list ---
+    # 1. Collect all symbol_ids from the results
+    symbol_ids_in_watchlist = [r.symbol_id for r in results]
+
+    # 2. Fetch company names in a single query if the list is not empty
+    company_name_map = {}
+    if symbol_ids_in_watchlist:
+        company_name_records = ComprehensiveSymbolData.query.filter(
+            ComprehensiveSymbolData.symbol_id.in_(symbol_ids_in_watchlist)
+        ).with_entities(ComprehensiveSymbolData.symbol_id, ComprehensiveSymbolData.company_name).all()
+        # Create a fast lookup dictionary: {symbol_id: company_name}
+        company_name_map = {symbol_id: company_name for symbol_id, company_name in company_name_records}
+    # --- END NEW ---
+
     output_stocks = []
     for r in results:
+        # 3. Build the output, looking up the company name from the map
         output_stocks.append({
             'signal_unique_id': r.signal_unique_id, 
-            'symbol_id': r.symbol_id, # Use symbol_id instead of 'symbol'
+            'symbol_id': r.symbol_id,
             'symbol_name': r.symbol_name,
+            # --- NEW: Add the company_name to the output ---
+            # Use .get() for safety, defaulting to symbol_name if not found
+            'company_name': company_name_map.get(r.symbol_id, r.symbol_name),
+            # ------------------------------------------------
             'outlook': r.outlook,
             'reason': r.reason,
             'entry_price': r.entry_price,
@@ -872,7 +891,7 @@ def get_weekly_watchlist_results():
             'probability_percent': r.probability_percent
         })
     
-    logger.info(f"Retrieved {len(output_stocks)} weekly watchlist results.")
+    logger.info(f"Retrieved and enriched {len(output_stocks)} weekly watchlist results.")
     
     return {
         "top_watchlist_stocks": output_stocks,

@@ -161,7 +161,14 @@ def create_app(test_config=None):
         return jsonify({
             "message": "به API تحلیل بورس Flask خوش آمدید! مستندات API در /api/swagger-ui/ در دسترس است."
         })
-    
+
+
+
+
+# ----------------------------------------------------
+#  محل افزودن دستور جدید generate-ml-predictions
+# ----------------------------------------------------
+
     @app.cli.command('generate-ml-predictions')
     @click.option('--date', default=None, help='تاریخ پیش‌بینی به فرمت YYYY-MM-DD (اختیاری، پیش‌فرض: امروز).')
     @click.option('--period', default=7, type=int, help='افق پیش‌بینی بر حسب روز (پیش‌فرض: 7).')
@@ -190,7 +197,9 @@ def create_app(test_config=None):
 
 
 
-
+# ----------------------------------------------------
+#  محل افزودن دستور جدید run-candlestick
+# ----------------------------------------------------
     @app.cli.command('run-candlestick-detection')
     @click.option('--limit', default=None, type=int, help='تعداد نمادهایی که باید پردازش شوند (اختیاری).')
     def run_candlestick_detection_command(limit):
@@ -211,6 +220,42 @@ def create_app(test_config=None):
                 click.echo(f"✅ موفقیت: {processed_count} الگوی شمعی برای نمادها پردازش و ذخیره شد.")
             except Exception as e:
                 click.echo(f"❌ خطای بحرانی در اجرای Candlestick Detection: {e}", err=True)
+                db_session.rollback()
+                sys.exit(1)
+
+
+
+
+
+# ----------------------------------------------------
+#  محل افزودن دستور جدید run-technical-analysis
+# ----------------------------------------------------
+    @app.cli.command('run-technical-analysis')
+    @click.option('--limit', default=None, type=int, help='تعداد نمادهایی که باید پردازش شوند (اختیاری).')
+    @click.option('--symbols', default=None, help='لیست نمادها با جداکننده کاما (اختیاری).')
+    def run_technical_analysis_command(limit, symbols):
+        """
+        اجرای محاسبات و ذخیره اندیکاتورهای تکنیکال برای نمادها.
+        """
+        from services.data_fetch_and_process import run_technical_analysis
+        
+        click.echo("📊 شروع تحلیل تکنیکال و محاسبه اندیکاتورها...")
+        
+        symbols_list = None
+        if symbols:
+            symbols_list = [s.strip() for s in symbols.split(',') if s.strip()]
+        
+        with app.app_context():
+            db_session = db.session
+            try:
+                processed_count, message = run_technical_analysis(
+                    db_session=db_session, 
+                    limit=limit,
+                    symbols_list=symbols_list
+                )
+                click.echo(f"✅ موفقیت: {message}")
+            except Exception as e:
+                click.echo(f"❌ خطای بحرانی در اجرای Technical Analysis: {e}", err=True)
                 db_session.rollback()
                 sys.exit(1)
 
