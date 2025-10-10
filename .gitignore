@@ -128,6 +128,10 @@ ENV/
 env.bak/
 venv.bak/
 
+venv/
+new_venv_py11/
+venv_311/
+
 # Spyder project settings
 .spyderproject
 .spyproject
