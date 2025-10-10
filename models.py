@@ -419,15 +419,17 @@ class GoldenKeyResult(db.Model):
 
     recommendation_price = db.Column(db.Float)
     recommendation_jdate = db.Column(db.String(10))
-    final_price = db.Column(db.Float)
-    profit_loss_percentage = db.Column(db.Float)
+
+
+    #final_price = db.Column(db.Float)
+    #profit_loss_percentage = db.Column(db.Float)
     
-    weekly_growth = db.Column(db.Float, nullable=True)
+    #weekly_growth = db.Column(db.Float, nullable=True)
 
     status = db.Column(db.String(50), default='active', nullable=True)
-    probability_percent = db.Column(db.Float, nullable=True)
+    #probability_percent = db.Column(db.Float, nullable=True)
 
-    __table_args__ = (db.UniqueConstraint('symbol_id', 'jdate', name='_symbol_jdate_golden_key_uc'),)
+    #__table_args__ = (db.UniqueConstraint('symbol_id', 'jdate', name='_symbol_jdate_golden_key_uc'),)
 
     def __repr__(self):
         return f'<GoldenKeyResult {self.symbol_name} {self.jdate} (Score: {self.score})>'
@@ -490,6 +492,24 @@ class PotentialBuyQueueResult(db.Model):
 
     def __repr__(self):
         return f'<PotentialBuyQueueResult {self.symbol_name} {self.jdate}>'
+
+
+
+
+class DailySectorPerformance(db.Model):
+    __tablename__ = 'daily_sector_performance'
+    id = db.Column(db.Integer, primary_key=True)
+    jdate = db.Column(db.String(10), nullable=False, index=True)
+    sector_name = db.Column(db.String(255), nullable=False)
+    total_trade_value = db.Column(db.BigInteger) # مجموع ارزش معاملات
+    net_money_flow = db.Column(db.BigInteger) # مجموع ورود/خروج پول هوشمند
+    # می‌توانید معیارهای دیگری مانند بازدهی میانگین را هم اضافه کنید
+    rank = db.Column(db.Integer) # رتبه نهایی صنعت در آن روز
+
+    __table_args__ = (db.UniqueConstraint('jdate', 'sector_name', name='uq_jdate_sector'),)
+
+
+
 
 # حذف کلاس SymbolModel زیرا دیگر نیازی به آن نیست
 # class SymbolModel(db.Model):

@@ -226,12 +226,12 @@ def _load_model_and_artifacts(model_dir: str = MODELS_DIR):
 
 
 # اجرای بارگذاری در زمان import
-try:
-    _load_model_and_artifacts()
-except Exception as e:
+#try:
+    #_load_model_and_artifacts()
+#except Exception as e:
     # بالا بودن سطح لاگ باعث می‌شود پیام واضح‌تر دیده شود؛ اما ما این exception را بزرگتر throw نمی‌کنیم
     # تا کاربر بتواند ماژول را import کند و خودش تصمیم بگیرد. در صورت نیاز می‌توانیم raise کنیم.
-    logger.exception("بارگذاری مدل در import با خطا مواجه شد: %s", e)
+    #logger.exception("بارگذاری مدل در import با خطا مواجه شد: %s", e)
     # اگر نیاز به رفتار سخت‌گیرانه دارید، uncomment کنید:
     # raise
 

@@ -1,18 +1,27 @@
-# services/iran_market_data.py
-
 import logging
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import pandas as pd
+# --- افزودن کتابخانه requests برای API جدید ---
+import requests 
 
-# نکته: دیگر مستقیماً pytse_client را اینجا وارد نمی‌کنیم
-# و هیچ monkey-patch روی requests انجام نمی‌دهیم.
-# تمام ارتباط با TSETMC فقط از مسیر Wrapper انجام می‌شود.
+# --- تنظیمات API جدید BrsApi.ir ---
+# کلید API دریافتی از BrsApi.ir (لطفاً محرمانه نگه دارید)
+B_R_S_API_KEY = "BvhdYHBjqiyIQ7eTuQBKN17ZuLpHkQZ1"
+# آدرس اصلی API جدید (استفاده از روش GET)
+B_R_S_API_URL = "https://brsapi.ir/Api/Tsetmc/Index.php"
+API_TYPE_PARAM = 3 # پارامتر type=3 برای دریافت شاخص‌های اصلی
+
+# حذف وابستگی به pytse_client و wrapper
 try:
-    from services.pytse_wrapper import download_financial_indexes_safe
-    WRAPPER_AVAILABLE = True
+    # این خطوط دیگر نیازی نیستند و حذف شده‌اند تا Dependency های قدیمی حذف شوند.
+    # from services.pytse_wrapper import download_financial_indexes_safe
+    pass
 except Exception as _e:
-    WRAPPER_AVAILABLE = False
+    pass
+
+# متغیرهای مربوط به wrapper حذف شدند.
+# WRAPPER_AVAILABLE = False 
     
 try:
     from flask import current_app
@@ -21,6 +30,15 @@ except Exception:
     FLASK_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# --- نگاشت نام‌های شاخص به‌روز شده ---
+INDEX_NAME_MAPPING = {
+    # شاخص‌های موجود در خروجی API جدید که با ساختار قدیمی شما تطبیق دارند
+    "شاخص کل": "Total_Index",
+    "شاخص کل (هم وزن)": "Equal_Weighted_Index",
+    "شاخص قیمت (هم وزن)": "Price_Equal_Weighted_Index",
+    # شاخص صنعت در خروجی جدید نیست و با مقدار پیش‌فرض None باقی می‌ماند.
+}
 
 def _default_index_payload() -> Dict[str, Dict[str, Any]]:
     """
@@ -35,28 +53,25 @@ def _default_index_payload() -> Dict[str, Dict[str, Any]]:
 
 def _pytse_enabled_by_config() -> bool:
     """
-    اگر داخل App Context هستیم و کلید تنظیمات وجود دارد، از آن پیروی می‌کنیم.
-    در غیر این صورت، True برمی‌گردانیم تا رفتار پیش‌فرض، فعال بودن باشد.
+    این تابع به دلیل حذف pytse_client دیگر مورد نیاز نیست، اما برای جلوگیری از خطا در کدهای دیگر 
+    که ممکن است آن را صدا بزنند، به سادگی True برمی‌گرداند.
     """
-    if not FLASK_AVAILABLE:
-        return True
-    try:
-        # ممکن است خارج از app context صدا زده شود
-        return bool(getattr(current_app, "config", {}).get("PYTSE_CLIENT_AVAILABLE", True))
-    except Exception:
-        return True
+    return True # منطق مربوط به pytse حذف شد
 
-def _safe_to_float(x):
+def _safe_to_float(x) -> Optional[float]:
     """
     تبدیل ایمن مقدار به float.
     """
     try:
+        if x is None:
+            return None
+        # برای سازگاری، استفاده از pandas حفظ شد
         val = pd.to_numeric(x, errors="coerce")
         return float(val) if pd.notna(val) else None
     except Exception:
         return None
 
-def _format_date(d):
+def _format_date(d) -> Optional[str]:
     """
     فرمت‌دهی ایمن تاریخ.
     """
@@ -66,98 +81,69 @@ def _format_date(d):
 
 def fetch_iran_market_indices() -> Dict[str, Dict[str, Any]]:
     """
-    دریافت لحظه‌ای داده‌های شاخص بازار از طریق Wrapper ایمن (TSETMC).
-    - اگر Wrapper/کتابخانه در دسترس نباشد یا TSETMC پاسخ ندهد، خروجی پیش‌فرض می‌دهد.
+    دریافت لحظه‌ای داده‌های شاخص بازار از طریق API جدید BrsApi.ir (روش GET).
+    - شاخص‌های مورد نیاز را استخراج و در فرمت استاندارد خروجی می‌دهد.
     - هیچ Exception ی به بیرون نشت نمی‌کند.
     """
-    logger.info("در حال تلاش برای دریافت داده‌های شاخص بازار ایران از طریق Wrapper امن pytse-client.")
+    logger.info(f"در حال تلاش برای دریافت داده‌های شاخص بازار ایران از {B_R_S_API_URL}")
 
     result = _default_index_payload()
 
-    # اگر بر اساس تنظیمات پروژه، pytse غیرفعال شده باشد
-    if not _pytse_enabled_by_config():
-        logger.error("ماژول pytse_client بر اساس تنظیمات اپ غیرفعال است. بازگشت دادهٔ پیش‌فرض شاخص‌ها.")
-        return result
-
-    # اگر خود Wrapper در دسترس نباشد
-    if not WRAPPER_AVAILABLE:
-        logger.error("Wrapper خدمات TSETMC (pytse_wrapper) در دسترس نیست. بازگشت دادهٔ پیش‌فرض شاخص‌ها.")
-        return result
-
-    # اسامی شاخص‌ها به شکل مورد انتظار pytse
-    index_symbols_to_fetch = [
-        "شاخص كل",
-        "شاخص كل (هم وزن)",
-        "شاخص قيمت (هم وزن)",
-        "شاخص صنعت",
-    ]
-
-    # نگاشت فارسی -> کلید دوستانهٔ API
-    reverse_mapping = {
-        "شاخص كل": "Total_Index",
-        "شاخص كل (هم وزن)": "Equal_Weighted_Index",
-        "شاخص قيمت (هم وزن)": "Price_Equal_Weighted_Index",
-        "شاخص صنعت": "Industry_Index",
+    # تنظیم پارامترهای GET (کلید و نوع)
+    params = {
+        'key': B_R_S_API_KEY,
+        'type': API_TYPE_PARAM,
     }
 
     try:
-        financial_indexes = download_financial_indexes_safe(
-            symbols=index_symbols_to_fetch,
-        )
+        # ارسال درخواست GET به API
+        response = requests.get(B_R_S_API_URL, params=params, timeout=15)
+        response.raise_for_status() # برای تشخیص خطاهای HTTP
 
-        # ✅ بررسی‌های بیشتر برای اطمینان از ساختار داده
-        if financial_indexes is None:
-            logger.warning("تابع download_financial_indexes_safe None برگرداند")
+        data_list = response.json()
+        
+        if not isinstance(data_list, list) or not data_list:
+            logger.warning("پاسخ API خالی است یا ساختار صحیحی ندارد. بازگشت دادهٔ پیش‌فرض.")
             return result
-
-        if not financial_indexes:
-            logger.warning("Wrapper هیچ داده‌ای برای شاخص‌ها برنگرداند. بازگشت دادهٔ پیش‌فرض.")
-            return result
-
-        logger.info(f"ساختار داده‌های دریافتی: {type(financial_indexes)}")
-
-
-
-        for pytse_name, df in financial_indexes.items():
-            friendly_name = reverse_mapping.get(pytse_name)
+        
+        # --- تحلیل و پردازش داده‌های API جدید ---
+        for index_item in data_list:
+            # استفاده از کلید 'name' از خروجی JSON
+            index_name_raw = index_item.get("name")
+            
+            # تطبیق نام دریافتی با نام‌های داخلی مورد انتظار
+            friendly_name = INDEX_NAME_MAPPING.get(index_name_raw)
             if not friendly_name:
-                logger.debug(f"شاخص ناشناخته از pytse دریافت شد: {pytse_name}")
+                # این شامل شاخص‌هایی مثل 'شاخص بازار اول' می‌شود که نیاز به ذخیره ندارند.
+                logger.debug(f"شاخص ناشناخته/غیرضروری از API دریافت شد: {index_name_raw}")
                 continue
-
-            # DataFrame ممکن است خالی یا دارای داده نامعتبر باشد
-            if df is None or getattr(df, "empty", True):
-                logger.warning(f"DataFrame مربوط به '{pytse_name}' خالی است. مقدار پیش‌فرض برای '{friendly_name}'.")
-                continue
-
-            try:
-                latest = df.iloc[-1]
-            except Exception:
-                logger.warning(f"امکان دسترسی به سطر آخر DataFrame برای '{pytse_name}' نبود. مقدار پیش‌فرض برای '{friendly_name}'.")
-                continue
-
-            date_fmt = _format_date(latest.get("date"))
-            close_val = _safe_to_float(latest.get("close"))
-            open_val = _safe_to_float(latest.get("open"))
-
-            change_val = None
-            percent_val = None
-            if close_val is not None and open_val not in (None, 0):
-                try:
-                    change_val = close_val - open_val
-                    percent_val = round((change_val / open_val) * 100, 2)
-                except Exception:
-                    change_val, percent_val = None, None
+                
+            # استخراج مقادیر بر اساس نام ستون‌های جدید API
+            # کلیدهای JSON: index, index_change, index_change_percent
+            value = _safe_to_float(index_item.get("index"))
+            # index_change: مقدار تغییر شاخص
+            change = _safe_to_float(index_item.get("index_change")) 
+            # index_change_percent: درصد تغییر شاخص
+            percent = _safe_to_float(index_item.get("index_change_percent"))
+            
+            # API جدید تاریخ (date) را نمی‌دهد، لذا از تاریخ فعلی سیستم استفاده می‌کنیم.
+            date_fmt = datetime.now().strftime("%Y-%m-%d")
 
             result[friendly_name] = {
-                "value": close_val,
-                "change": change_val,
-                "percent": percent_val,
+                "value": value,
+                "change": change,
+                "percent": percent,
                 "date": date_fmt,
             }
 
+        logger.info("داده‌های شاخص بازار با موفقیت از BrsApi.ir دریافت و پردازش شد.")
+            
+    except requests.exceptions.Timeout:
+        logger.error("خطا: درخواست API به دلیل timeout (۱۵ ثانیه) لغو شد.")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"خطا در برقراری ارتباط با API BrsApi.ir: {e}", exc_info=True)
     except Exception as e:
-        # هر خطایی اینجا رخ بده، لاگ می‌کنیم و خروجی پیش‌فرض می‌دهیم.
-        logger.error(f"خطا در دریافت یا پردازش داده‌های شاخص بازار از Wrapper: {e}", exc_info=True)
-        return result
+        logger.error(f"خطای غیرمنتظره در پردازش داده‌ها: {e}", exc_info=True)
 
+    # اگر شاخص Industry_Index در API جدید وجود نداشت، مقدار پیش‌فرض آن (None) باقی می‌ماند.
     return result

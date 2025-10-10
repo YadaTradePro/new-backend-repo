@@ -260,8 +260,68 @@ def create_app(test_config=None):
                 sys.exit(1)
 
 
-                
-                            
+
+
+# ----------------------------------------------------
+#  محل افزودن دستور جدید run-historical-data
+# ----------------------------------------------------
+    @app.cli.command('run-historical-data')
+    @click.option('--limit', default=None, type=int, help='تعداد نمادهایی که باید پردازش شوند (اختیاری).')
+    @click.option('--symbols', default=None, help='لیست نمادها (symbol_name یا tse_index) با جداکننده کاما (اختیاری).')
+    @click.option('--limit-per-run', default=None, type=int, help='نام جایگزین برای limit.')
+    def fetch_historical_data_command(limit, symbols, limit_per_run):
+        """
+        اجرای دریافت و پردازش داده‌های تاریخی جامع برای نمادهای مشخص یا تمام نمادها.
+        """
+        from services.data_fetch_and_process import fetch_and_process_historical_data
+        
+        click.echo("📈 شروع دریافت داده‌های تاریخی و حقیقی/حقوقی...")
+        
+        # normalize limit
+        if limit is None and limit_per_run is not None:
+            limit = limit_per_run
+            
+        symbols_list = None
+        if symbols:
+            symbols_list = [s.strip() for s in symbols.split(',') if s.strip()]
+        
+        with app.app_context():
+            db_session = db.session
+            try:
+                processed_count, message = fetch_and_process_historical_data(
+                    db_session=db_session, 
+                    limit=limit,
+                    specific_symbols_list=symbols_list
+                )
+                click.echo(f"✅ موفقیت: {message}")
+            except Exception as e:
+                click.echo(f"❌ خطای بحرانی در اجرای Historical Data Fetch: {e}", err=True)
+                db_session.rollback()
+                sys.exit(1)
+
+
+# ----------------------------------------------------
+#  محل افزودن دستور جدید run-sector-analysis
+# ----------------------------------------------------
+    @app.cli.command('run-sector-analysis')
+    def run_sector_analysis_command():
+        """
+        اجرای تحلیل و رتبه‌بندی صنایع بر اساس ارزش معاملات و ورود پول هوشمند.
+        """
+        # ⚠️ مسیر وارد کردن (Import) تابع اصلاح شد 
+        from services.sector_analysis_service import run_daily_sector_analysis 
+        
+        click.echo("🏭 شروع تحلیل و رتبه‌بندی روزانه صنایع...")
+        
+        with app.app_context():
+            try:
+                run_daily_sector_analysis() # فراخوانی تابع تحلیل
+                click.echo("✅ موفقیت: تحلیل صنعت با موفقیت به پایان رسید و در دیتابیس ذخیره شد.")
+            except Exception as e:
+                click.echo(f"❌ خطای بحرانی در اجرای تحلیل صنعت: {e}", err=True)
+                db.session.rollback()
+                sys.exit(1)
+
 
     return app
 

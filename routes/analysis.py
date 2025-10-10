@@ -5,12 +5,21 @@ from flask import request, current_app
 from flask_cors import cross_origin
 
 from services import market_analysis_service
+from services.historical_data_service import get_historical_data_for_symbol
+from datetime import date
+import datetime
+import jdatetime
+
+from werkzeug.exceptions import HTTPException
+
+from services.fetch_latest_brsapi_eod import update_daily_eod_from_brsapi
+
 
 # از db و سایر مدل‌ها از extensions و models وارد کنید
 from extensions import db
 from models import (
     User, HistoricalData, ComprehensiveSymbolData, SignalsPerformance, FundamentalData,
-    TechnicalIndicatorData, MLPrediction # Removed models now in other route files
+    TechnicalIndicatorData, MLPrediction
 )
 
 
@@ -22,6 +31,8 @@ from services.symbol_initializer import populate_symbols_into_db
 
 # Import services relevant to analysis_ns only
 from services import data_fetch_and_process
+from services.data_fetch_and_process import run_technical_analysis, run_candlestick_detection
+
 from services.ml_prediction_service import get_ml_predictions_for_symbol, get_all_ml_predictions, generate_and_save_predictions_for_watchlist
 
 # Import func from sqlalchemy for database operations
@@ -29,6 +40,35 @@ from sqlalchemy import func
 from sqlalchemy import or_ 
 
 analysis_ns = Namespace('analysis', description='Stock data analysis and fetching operations')
+
+
+def parse_date(value):
+    """
+    تاریخ را از فرمت رشته (YYYY-MM-DD) به شیء datetime.date (میلادی) تبدیل می‌کند.
+    اگر فرمت شمسی باشد، آن را به میلادی تبدیل می‌کند.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+        
+    # 1. تلاش برای پارس کردن به عنوان تاریخ میلادی (ISO format)
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        pass # اگر پارس میلادی شکست خورد، ادامه می‌دهیم به پارس شمسی
+
+    # 2. تلاش برای پارس کردن به عنوان تاریخ شمسی و تبدیل به میلادی
+    try:
+        # فرض بر این است که فرمت شمسی (YYYY-MM-DD) است
+        j_year, j_month, j_day = map(int, value.split('-'))
+        # تبدیل تاریخ شمسی به میلادی
+        g_date = jdatetime.date(j_year, j_month, j_day).togregorian()
+        return g_date
+    except Exception:
+        # اگر پارس شمسی هم شکست خورد، None برمی‌گردانیم.
+        return None
+
+
+
 
 # --- API Models for Flask-RESTX Documentation ---
 # این مدل‌ها برای مستندسازی Swagger UI استفاده می‌شوند.
@@ -172,27 +212,86 @@ ml_prediction_model = analysis_ns.model('MLPredictionModel', {
     'updated_at': fields.String(description='Timestamp of last update'),
 })
 
-
-  
-
-
-
 # =================================================================================
 # --- Parsers for API Endpoints ---
 # =================================================================================
 
 update_parser = reqparse.RequestParser()
 update_parser.add_argument('limit', type=int, default=200, help='محدودیت تعداد نمادها برای پردازش در هر اجرا')
+# **توجه:** در صورت نیاز به پارامتر specific_symbols_list، آن را به این پارسر اضافه کنید.
 
 repair_parser = reqparse.RequestParser()
 repair_parser.add_argument('data_type', type=str, default='all', choices=['all', 'historical', 'technical', 'fundamental'], help='نوع داده برای ترمیم')
 repair_parser.add_argument('limit', type=int, default=50, help='محدودیت تعداد نمادها برای ترمیم')
+
+# ✅ FIX: این پارسر اکنون در جایگاه صحیح و قبل از اولین استفاده تعریف شده است.
+historical_data_parser = reqparse.RequestParser()
+historical_data_parser.add_argument('days', type=int, default=21, help='تعداد **رکوردهای تاریخی** (روزهای معاملاتی) اخیر برای واکشی. اگر start_date و end_date باشند، این پارامتر نادیده گرفته می‌شود.')
+historical_data_parser.add_argument('start_date', type=str, help='تاریخ میلادی شروع بازه (YYYY-MM-DD) شمسی یا میلادی') # ✅ جدید: اشاره به شمسی یا میلادی
+historical_data_parser.add_argument('end_date', type=str, help='تاریخ میلادی پایان بازه (YYYY-MM-DD) شمسی یا میلادی') # ✅ جدید: اشاره به شمسی یا میلادی
 
 # --- API Resources ---
 
 # =================================================================================
 # --- Section 1: Task Execution Endpoints ---
 # =================================================================================
+
+
+@analysis_ns.route('/stock-history/<string:symbol_input>') # تغییر نام متغیر به symbol_input
+@analysis_ns.param('symbol_input', 'شناسه یا نام نماد (مثال: خودرو)')
+class StockHistoryResource(Resource):
+    @analysis_ns.doc(security='Bearer Auth', parser=historical_data_parser)
+    @jwt_required()
+    @analysis_ns.response(200, 'Historical data fetched successfully')
+    @analysis_ns.response(400, 'Invalid date format')
+    @analysis_ns.response(404, 'No data found for symbol')
+    def get(self, symbol_input): # تغییر نام متغیر به symbol_input
+        """
+        واکشی سابقه معاملات (Historical Data) یک نماد مشخص با قابلیت فیلتر زمانی.
+        """
+        try:
+            args = historical_data_parser.parse_args()
+            days = args['days']
+            start_date_str = args['start_date']
+            end_date_str = args['end_date']
+            
+            start_date = parse_date(start_date_str)
+            end_date = parse_date(end_date_str)
+
+            if (start_date_str and start_date is None) or (end_date_str and end_date is None):
+                analysis_ns.abort(400, "Invalid date format. Please use YYYY-MM-DD (Gregorian or Jalali).")
+
+            # 🚀 فراخوانی تابع سرویس
+            history_data = get_historical_data_for_symbol(
+                symbol_input, # از symbol_input استفاده می‌شود.
+                start_date=start_date, 
+                end_date=end_date, 
+                days=days
+            )
+            
+            if history_data is None:
+                current_app.logger.error(f"Service returned None for {symbol_input}")
+                analysis_ns.abort(500, "Internal server error during data retrieval. Service returned None.")
+
+            if not history_data:
+                # این خط باعث ایجاد 404 می‌شود.
+                analysis_ns.abort(404, f"No historical data found for symbol: {symbol_input} in the specified range.")
+
+            return {"history": history_data}, 200
+            
+        except HTTPException as e:
+            # ✅ FIX: اگر خطا یک خطای HTTP (مثل 404 یا 400) باشد، آن را بدون تغییر بالا می‌اندازیم.
+            raise e
+            
+        except Exception as e:
+            # برای هر خطای غیرمنتظره دیگر (مثل خطای دیتابیس یا منطقی)
+            current_app.logger.error(f"An unexpected critical error occurred for {symbol_input}: {e}", exc_info=True)
+            analysis_ns.abort(500, f"An unexpected critical error occurred: {str(e)}")
+
+
+
+
+
 
 @analysis_ns.route('/initial-populate')
 class InitialPopulationResource(Resource):
@@ -206,6 +305,81 @@ class InitialPopulationResource(Resource):
         except Exception as e:
             current_app.logger.error(f"Error during initial population: {e}", exc_info=True)
             return {"message": f"An error occurred: {str(e)}"}, 500
+
+
+
+# --- NEW: BRSAPI EOD Update and Analysis Endpoint (The new daily flow) ---
+@analysis_ns.route('/run-brsapi-eod-flow')
+class BRSAPIEODFlowResource(Resource):
+    @analysis_ns.doc(security='Bearer Auth', 
+                     description="فرایند کامل EOD روزانه: فچ داده از BRSAPI، ذخیره، تحلیل تکنیکال و تشخیص الگوهای شمعی. این مسیر وظیفه به‌روزرسانی روزانه Historical/Technical را بر عهده دارد.")
+    @jwt_required()
+    def post(self):
+        """اجرای جریان کامل آپدیت EOD از BRSAPI"""
+        today = date.today()
+        results = {
+            "eod_brsapi": {"count": 0, "message": ""},
+            "technical_analysis": {"count": 0, "message": "N/A"},
+            "candlestick_detection": {"count": 0, "message": "N/A"},
+            "update_status": "Failed"
+        }
+
+        try:
+            # 1. 🚀 فچ و ذخیره داده‌های EOD از BRSAPI
+            # فرض بر این است که update_daily_eod_from_brsapi خروجی (count, message, list_of_updated_symbol_ids) دارد.
+            eod_count, eod_msg, updated_symbol_ids = update_daily_eod_from_brsapi(db.session)
+            results['eod_brsapi']['count'] = eod_count
+            results['eod_brsapi']['message'] = eod_msg
+            
+            # 2. ⚡️ اجرای مراحل بعدی فقط برای نمادهای به‌روز شده
+            if eod_count > 0:
+                # 2.1. اجرای تحلیل تکنیکال
+                tech_count, tech_msg = run_technical_analysis(
+                    db.session,
+                    symbols_list=updated_symbol_ids # استفاده از symbol_id داخلی
+                )
+                results['technical_analysis']['count'] = tech_count
+                results['technical_analysis']['message'] = tech_msg
+
+                # 2.2. تشخیص الگوهای شمعی
+                candlestick_count = run_candlestick_detection(
+                    db.session, 
+                    symbols_list=updated_symbol_ids # استفاده از symbol_id داخلی
+                )
+                results['candlestick_detection']['count'] = candlestick_count
+                results['candlestick_detection']['message'] = f"✅ تشخیص الگوهای شمعی برای {candlestick_count} نماد انجام شد."
+                
+                # 2.3. به‌روزرسانی تاریخ آپدیت در ComprehensiveSymbolData (برای جلوگیری از تکرار اجرا در run-daily-update)
+                symbols_to_update = db.session.query(ComprehensiveSymbolData).filter(
+                    ComprehensiveSymbolData.symbol_id.in_(updated_symbol_ids)
+                ).all()
+                
+                for symbol in symbols_to_update:
+                    symbol.last_historical_update_date = today # تنظیم به امروز
+                
+                db.session.commit()
+                results['update_status'] = f"Success: {len(updated_symbol_ids)} symbol status updated."
+
+            elif "قبلاً برای تمام نمادهای فچ‌شده ثبت شده است" in eod_msg:
+                results['update_status'] = "Already Updated"
+            
+            final_message = (
+                f"🏁 BRSAPI EOD Flow completed. "
+                f"EOD: {eod_count}, "
+                f"Technical: {results['technical_analysis']['count']}, "
+                f"Candlestick: {results['candlestick_detection']['count']}."
+            )
+            current_app.logger.info(final_message)
+            
+            return results, 200
+
+        except Exception as e:
+            current_app.logger.error(f"❌ Critical error during BRSAPI EOD Flow: {e}", exc_info=True)
+            db.session.rollback() 
+            results['update_status'] = "Failed due to critical error."
+            return {"message": f"An error occurred: {str(e)}", "results": results}, 500
+
+
 
 # --- NEW: Daily Update Endpoint ---
 @analysis_ns.route('/run-daily-update')
@@ -317,16 +491,40 @@ class CleanupDuplicatesResource(Resource):
 @analysis_ns.param('symbol_input', 'شناسه یا نام نماد (مثال: خودرو)')
 class HistoricalDataResource(Resource):
     @jwt_required()
-    @analysis_ns.doc(security='Bearer Auth')
+    @analysis_ns.doc(security='Bearer Auth', parser=historical_data_parser)
     @analysis_ns.marshal_list_with(historical_data_model)
     def get(self, symbol_input):
-        """دریافت داده‌های تاریخی برای یک نماد مشخص"""
-        # This part requires a helper function to resolve symbol_input to a consistent ID
-        # For simplicity, assuming direct query on symbol_name for now.
-        records = HistoricalData.query.filter(HistoricalData.symbol_name == symbol_input).order_by(HistoricalData.date.desc()).all()
-        if not records:
-            analysis_ns.abort(404, f"No historical data found for symbol: {symbol_input}")
-        return records
+        """دریافت داده‌های تاریخی برای یک نماد مشخص (استفاده از سرویس)"""
+        try:
+            args = historical_data_parser.parse_args()
+            days = args['days']
+            start_date_str = args['start_date']
+            end_date_str = args['end_date']
+            
+            start_date = parse_date(start_date_str)
+            end_date = parse_date(end_date_str)
+
+            if (start_date_str and start_date is None) or (end_date_str and end_date is None):
+                analysis_ns.abort(400, "Invalid date format. Please use YYYY-MM-DD (Gregorian or Jalali).")
+                
+            # 🚀 استفاده از سرویس جدید برای بازیابی داده‌ها
+            history_data = get_historical_data_for_symbol(
+                symbol_input, 
+                start_date=start_date, 
+                end_date=end_date, 
+                days=days
+            )
+            
+            if not history_data:
+                analysis_ns.abort(404, f"No historical data found for symbol: {symbol_input}")
+                
+            return history_data
+            
+        except HTTPException as e:
+            raise e
+        except Exception as e:
+            current_app.logger.error(f"An unexpected critical error occurred in HistoricalDataResource for {symbol_input}: {e}", exc_info=True)
+            analysis_ns.abort(500, f"An unexpected critical error occurred: {str(e)}")
 
 
 @analysis_ns.route('/technical-indicators/<string:symbol_input>')
@@ -337,7 +535,8 @@ class TechnicalIndicatorsResource(Resource):
     @analysis_ns.marshal_list_with(technical_indicator_model)
     def get(self, symbol_input):
         """دریافت اندیکاتورهای تکنیکال برای یک نماد مشخص"""
-        # This also requires resolving symbol_input to a proper ID
+        # این بخش مستقیماً اندیکاتورهای ذخیره‌شده را می‌خواند و نیاز به تغییر به get_historical_data_for_symbol ندارد.
+        # می‌توانید در آینده یک سرویس get_technical_data_for_symbol ایجاد کنید.
         records = TechnicalIndicatorData.query.join(ComprehensiveSymbolData, TechnicalIndicatorData.symbol_id == ComprehensiveSymbolData.id)\
             .filter(ComprehensiveSymbolData.symbol_name == symbol_input)\
             .order_by(TechnicalIndicatorData.jdate.desc()).all()

@@ -35,7 +35,9 @@ from sqlalchemy.orm import aliased
 # تنظیمات لاگینگ
 logger = logging.getLogger(__name__)
 
-# ایجاد sessionmaker برای مدیریت connection pooling
+# ----------------------------
+# Session maker
+# ----------------------------
 def get_session_local():
     """ایجاد session local با application context"""
     try:
@@ -46,7 +48,9 @@ def get_session_local():
         # اگر خارج از application context هستیم
         return sessionmaker(bind=db.get_engine())()
 
-# Global mapping for market types
+# ----------------------------
+# Market type mappings
+# ----------------------------
 MARKET_TYPE_MAP = {
     '1': 'بورس',
     '2': 'فرابورس',
@@ -58,7 +62,8 @@ MARKET_TYPE_MAP = {
     '8': 'عمومی',
     '9': 'پایه فرابورس',
     '10': 'اوراق تامین مالی',
-    '11': 'اوراق با درآمد ثابت'
+    '11': 'اوراق با درآمد ثابت',
+    '12': '-'
 }
 
 HTML_MARKET_TYPE_MAP = {
@@ -72,62 +77,76 @@ HTML_MARKET_TYPE_MAP = {
     'اوراق تامین مالی': 'اوراق تامین مالی'
 }
 
-# ⚠️ اصلاح: الگوی فیلتر دقیق‌تر و تخصصی‌تر برای پسوندهای نامناسب
-# این الگو به جای بررسی کلمات در متن، به انتهای نام نماد نگاه می‌کند.
-BAD_SUFFIXES = ('ح', 'ض', 'ص', 'و')
+# ----------------------------
+# Filter configuration
+# ----------------------------
+BAD_SUFFIXES = ('ح', 'ض', 'ص', 'و')  # حق تقدم و مشابه
 
-def filter_symbols(symbols: List[Dict], exclude_list: List[str] = None) -> List[Dict]:
+VALID_MARKET_KEYWORDS = [
+    'بورس',
+    'فرابورس',
+    '-'
+    'پایه',
+    'صندوق',   # شامل همه صندوق‌ها (سهام، طلا، اوراق بهادار)
+    'کالا',
+    'انرژی'
+]
+
+INVALID_MARKET_KEYWORDS = [
+    'اختیار',   # اختیار معامله
+    'آتی',      # قرارداد آتی
+    'مشتقه',    # بازار مشتقه
+    'تسهیلات'   # اوراق تسهیلات مسکن
+]
+
+# ----------------------------
+# Unified filter
+# ----------------------------
+def is_symbol_valid(symbol_name: str, market_type_name: str) -> bool:
     """
-    نمادها را بر اساس معیارهای حرفه‌ای فیلتر می‌کند.
-    این تابع دو روش اصلی را ترکیب می‌کند:
-    1. فیلتر کردن بر اساس نوع بازار (Market Type).
-    2. فیلتر کردن بر اساس پسوندهای رایج برای حق تقدم و ابزارهای مشابه.
+    بررسی اعتبار نماد (هم برای Ticker و هم برای dict).
     """
-    
+    try:
+        if not symbol_name or not market_type_name:
+            return False
+
+        # گام ۱: فیلتر حق تقدم‌ها (پسوند یا عبارت در نام)
+        if symbol_name.endswith(BAD_SUFFIXES) or re.search(r"(ح$|ح\s|حق\s?تقدم)", symbol_name):
+            return False
+
+        # گام ۲: بررسی بازار معتبر (whitelist)
+        if not any(keyword in market_type_name for keyword in VALID_MARKET_KEYWORDS):
+            return False
+
+        # گام ۳: بررسی بازار نامعتبر (blacklist)
+        if any(keyword in market_type_name for keyword in INVALID_MARKET_KEYWORDS):
+            return False
+
+        return True
+
+    except Exception as e:
+        logger.error(f"خطا در فیلتر نماد {symbol_name}: {e}")
+        return False
+
+# ----------------------------
+# نسخه dict-based برای استفاده در لیست‌ها
+# ----------------------------
+def filter_symbols(symbols: List[Dict]) -> List[Dict]:
+    """اعمال فیلتر مرکزی روی لیست دیکشنری نمادها"""
     if not symbols:
         return []
 
-    filtered_symbols = []
-    
-    # تعریف انواع بازاری که می‌خواهید حفظ کنید
-    good_markets = [
-    'بورس',
-    'فرابورس',
-    'بورس کالا',
-    'بورس انرژی',
-    'صندوق سرمایه گذاری',
-    'صندوق سرمایه گذاری قابل معامله',
-    'صندوق سرمایه گذاری در سهام',
-    'صندوق سرمایه گذاری در اوراق بهادار',
-    'اوراق با درآمد ثابت',
-    'پایه فرابورس',
-    'اوراق تامین مالی'
-    ]
-    
+    filtered = []
     for symbol in symbols:
-        symbol_name = symbol.get('symbol_name')
+        symbol_name = symbol.get('symbol_name', '')
         market_type_code = symbol.get('market_type_code')
-        market_type_name = MARKET_TYPE_MAP.get(market_type_code)
-        
-        # گام ۱: بررسی بر اساس نوع بازار
-        is_good_market = any( market_type_name and market_type_name.startswith(good) for good in good_markets)
-        
-        # گام ۲: بررسی بر اساس پسوندهای نام
-        # از endswith() به جای regex استفاده می‌کنیم که دقیق‌تر و خواناتر است.
-        is_bad_suffix = symbol_name.endswith(BAD_SUFFIXES)
+        market_type_name = MARKET_TYPE_MAP.get(market_type_code, '')
 
-        # بررسی نهایی: اگر در لیست بازارهای خوب است و پسوند نام بدی ندارد، آن را اضافه کن.
-        if is_good_market and not is_bad_suffix:
-            filtered_symbols.append(symbol)
-        
-        # می‌توانید برای اشکال‌زدایی، نمادهای فیلترشده را لاگ کنید
-        else:
-            if not is_good_market:
-                logger.debug(f"ℹ️ نماد {symbol_name} به دلیل نوع بازار ({market_type_name}) فیلتر شد.")
-            if is_bad_suffix:
-                logger.debug(f"ℹ️ نماد {symbol_name} به دلیل پسوند نام ({symbol_name[-1]}) فیلتر شد.")
-            
-    return filtered_symbols
+        if is_symbol_valid(symbol_name, market_type_name):
+            filtered.append(symbol)
+
+    return filtered
+
 
 # ----------------------------
 # Global defaults and constants
@@ -612,9 +631,8 @@ pytse_wrapper = PytseClientWrapper()
 internal_wrapper = InternalTseWrapper()
 
 # ----------------------------
-# تابع fetch_symbols_from_pytse_client (نسخه اصلاح‌شده)
+# تابع fetch_symbols_from_pytse_client (نسخه اصلاح‌شده با فیلتر مرکزی)
 # ----------------------------
-
 def fetch_symbols_from_pytse_client(db_session: Session, limit: int = None):
     """
     گرفتن لیست نمادها از pytse-client و درج در ComprehensiveSymbolData.
@@ -637,21 +655,9 @@ def fetch_symbols_from_pytse_client(db_session: Session, limit: int = None):
                 # ایجاد شی Ticker برای دسترسی به اطلاعات کامل
                 ticker = tse.Ticker(symbol_name)
                 
-                # ⚠️ اضافه کردن منطق فیلترینگ در ابتدای حلقه
-                market_type_name = getattr(ticker, 'flow', '')
-
-                good_markets = [
-                    'بورس', 'فرابورس', 'بورس کالا', 'بورس انرژی',
-                    'صندوق سرمایه گذاری', 'اوراق با درآمد ثابت',
-                    'پایه فرابورس', 'اوراق تامین مالی'
-                ]
-                
-                is_good_market = market_type_name in good_markets
-                is_bad_suffix = symbol_name.endswith(BAD_SUFFIXES)
-
-                if not is_good_market or is_bad_suffix:
-                    logger.debug(f"ℹ️ نماد {symbol_name} به دلیل نوع بازار یا پسوند نامناسب فیلتر شد.")
-                    continue  # پرش به نماد بعدی در حلقه
+                # 💡 استفاده از فیلتر مرکزی (نسخه جدید)
+                if not is_symbol_valid(symbol_name, getattr(ticker, 'flow', '')):
+                    continue  # اگر نماد معتبر نیست، برو به بعدی
                 
                 # دریافت شناسه منحصر به فرد (index) از Tsetmc
                 tse_index = getattr(ticker, 'index', None)
@@ -659,12 +665,7 @@ def fetch_symbols_from_pytse_client(db_session: Session, limit: int = None):
                     logger.warning(f"⚠️ نماد {symbol_name} شناسه بورس ندارد و نادیده گرفته شد.")
                     continue
                 
-                # بررسی وجود نماد در دیتابیس با tse_index
-                existing_symbol = db_session.query(ComprehensiveSymbolData).filter_by(
-                    tse_index=tse_index
-                ).first()
-                
-                # دریافت اطلاعات پایه
+                # ... بقیه کد بدون تغییر باقی می‌ماند ...
                 base_volume = getattr(ticker, 'base_volume', None)
                 eps = getattr(ticker, 'eps', None)
                 p_e_ratio = getattr(ticker, 'p_e_ratio', None)
@@ -672,17 +673,24 @@ def fetch_symbols_from_pytse_client(db_session: Session, limit: int = None):
                 float_shares = getattr(ticker, 'float_shares', None)
                 fiscal_year = getattr(ticker, 'fiscal_year', None)
                 state = getattr(ticker, 'state', None)
-                
-                # دریافت فیلدهای اختیاری - فقط اگر وجود دارند
                 p_s_ratio = getattr(ticker, 'p_s_ratio', None)
                 nav = getattr(ticker, 'nav', None)
                 
-                # تبدیل NAV به عدد اگر به صورت رشته است
                 if nav and isinstance(nav, str):
                     try:
                         nav = float(nav.replace(',', ''))
                     except ValueError:
                         nav = None
+
+                # 🚨 جلوگیری از ورود رکوردهای ناقص
+                if nav is None and base_volume == 1:
+                    logger.debug(f"⏩ نماد {symbol_name} به دلیل nav=None و base_volume=1 رد شد.")
+                    continue
+
+                # بررسی وجود نماد در دیتابیس با tse_index
+                existing_symbol = db_session.query(ComprehensiveSymbolData).filter_by(
+                    tse_index=tse_index
+                ).first()
                 
                 if existing_symbol:
                     # به‌روزرسانی نماد موجود
@@ -708,9 +716,8 @@ def fetch_symbols_from_pytse_client(db_session: Session, limit: int = None):
                     updated_count += 1
                     
                 else:
-                    # ابتدا شی را بدون فیلدهای اختیاری ایجاد کن
+                    # ایجاد نماد جدید
                     new_symbol = ComprehensiveSymbolData(
-                        # 🚨 تغییر اصلی: tse_index را به عنوان symbol_id نیز استفاده کنید.
                         symbol_id=tse_index,
                         tse_index=tse_index,
                         symbol_name=symbol_name,
@@ -728,7 +735,6 @@ def fetch_symbols_from_pytse_client(db_session: Session, limit: int = None):
                         updated_at=now
                     )
                     
-                    # سپس فیلدهای اختیاری را جداگانه تنظیم کن
                     if p_s_ratio is not None:
                         new_symbol.p_s_ratio = p_s_ratio
                     if nav is not None:
@@ -740,8 +746,8 @@ def fetch_symbols_from_pytse_client(db_session: Session, limit: int = None):
                 # commit هر 5 رکورد برای جلوگیری از lock طولانی
                 if (added_count + updated_count) % 5 == 0:
                     db_session.commit()
-                    time.sleep(3)  # تاخیر 3 ثانیه برای جلوگیری از بلاک
-                    
+                    time.sleep(3)
+            
             except Exception as e:
                 logger.error(f"❌ خطا در پردازش نماد {symbol_name}: {e}")
                 db_session.rollback()
@@ -2158,57 +2164,74 @@ def run_candlestick_detection(db_session: Session, limit: int = None, symbols_li
     """
     اجرای تشخیص الگوهای شمعی برای نمادها با استفاده از داده‌های تاریخی و ذخیره نتایج.
     از استراتژی حذف و درج (Delete & Insert) برای جلوگیری از تکرار استفاده می‌کند.
+    (اصلاح شده برای رفع خطای MemoryError با پردازش نماد به نماد)
     """
-    # ⚠️ توجه: نیازمند importهای datetime, pd, logger, CandlestickPatternDetection, HistoricalData
     from datetime import datetime
-    import pandas as pd # فرض بر import بودن این ماژول‌ها است.
+    import pandas as pd
     
+    # مدل‌ها و Logger فرض بر import بودن هستند
+
     try:
         logger.info("🕯️ شروع تشخیص الگوهای شمعی...")
-
-        # 1. دریافت داده‌های مورد نیاز
-        query = db_session.query(HistoricalData).order_by(HistoricalData.symbol_id, HistoricalData.jdate)
+        
+        # 1. دریافت لیست symbol_id های فعال (از ComprehensiveSymbolData یا HistoricalData)
+        # برای جلوگیری از فچ کل داده‌ها، ابتدا لیست نمادهایی که باید پردازش شوند را دریافت می‌کنیم.
+        
+        # ⚠️ کوئری برای دریافت symbol_idهای موجود در HistoricalData
+        base_query = db_session.query(HistoricalData.symbol_id).distinct()
         
         if symbols_list:
-            # فرض می‌کنیم symbols_list حاوی tse_index است (symbol_id صحیح)
-            query = query.filter(HistoricalData.symbol_id.in_(symbols_list)) 
-        
-        historical_data = query.all()
-
-        if not historical_data:
-            logger.warning("⚠️ هیچ داده تاریخی برای تشخیص الگوهای شمعی یافت نشد.")
-            return 0
-
-        # تبدیل به DataFrame
-        # '__dict__' برای بازیابی فیلدهای ORM استفاده می‌شود، اگرچه می‌توانید مستقیماً فیلدها را نیز کوئری بگیما
-        df = pd.DataFrame([row.__dict__ for row in historical_data])
-        
-        # حذف ستون‌های سیستمی احتمالی که در ORM هستند و در تحلیل مورد نیاز نیستند
-        if '_sa_instance_state' in df.columns:
-            df = df.drop(columns=['_sa_instance_state']) 
+            base_query = base_query.filter(HistoricalData.symbol_id.in_(symbols_list)) 
             
-        grouped = df.groupby('symbol_id')
+        symbol_ids_to_process = [str(s[0]) for s in base_query.all()]
+        
+        if not symbol_ids_to_process:
+            logger.warning("⚠️ هیچ نمادی برای تشخیص الگوهای شمعی یافت نشد.")
+            return 0
+            
+        logger.info(f"🔍 یافت شد {len(symbol_ids_to_process)} نماد برای تشخیص الگوهای شمعی")
+
         success_count = 0
         records_to_insert = []
         
-        logger.info(f"🔍 یافت شد {len(grouped)} نماد برای تشخیص الگوهای شمعی")
-
-        # 2. پردازش نمادها و تشخیص الگو
-        for symbol_id, group_df in grouped:
-            # اکنون باید برای iloc[-4] حداقل 5 کندل وجود داشته باشد
-            if len(group_df) < 5: 
-                continue 
-                
+        # 2. حلقه زدن روی هر نماد و فچ و پردازش جداگانه
+        processed_count = 0
+        for symbol_id in symbol_ids_to_process:
+            if limit is not None and processed_count >= limit:
+                break
+            
             try:
+                # 💡 نقطه کلیدی اصلاح شده: فچ داده‌های تاریخی فقط برای یک نماد
+                # برای تشخیص الگوهای شمعی حداکثر به چند روز اخیر نیاز داریم (مثلاً 10 روز آخر).
+                # این کار از بارگذاری کل دیتابیس در RAM جلوگیری می‌کند.
+                
+                historical_data_query = db_session.query(HistoricalData).filter(
+                    HistoricalData.symbol_id == symbol_id
+                ).order_by(HistoricalData.date.desc()).limit(30) # 👈 فچ محدود به ۳۰ روز اخیر
+                
+                # 💥 اکنون این کوئری فقط حدود ۳۰ رکورد برمی‌گرداند، نه کل تاریخچه.
+                historical_data = historical_data_query.all() 
+                
+                if len(historical_data) < 5: 
+                    continue 
+
+                # 💡 تبدیل به DataFrame
+                df = pd.DataFrame([row.__dict__ for row in historical_data])
+                if '_sa_instance_state' in df.columns:
+                    df = df.drop(columns=['_sa_instance_state']) 
+                
+                # مرتب‌سازی برای اطمینان از اینکه ioc[-1] روز جدید است (بر اساس date صعودی)
+                df.sort_values(by='date', inplace=True) 
+
                 # استخراج داده‌های لازم:
-                today_record_dict = group_df.iloc[-1].to_dict()
-                yesterday_record_dict = group_df.iloc[-2].to_dict()
+                today_record_dict = df.iloc[-1].to_dict()
+                yesterday_record_dict = df.iloc[-2].to_dict()
                 
                 # فراخوانی تابع تشخیص الگو:
                 patterns = check_candlestick_patterns(
                     today_record_dict, 
                     yesterday_record_dict, 
-                    group_df 
+                    df # کل DataFrame محدود شده (مثلاً ۳۰ روزه)
                 )
                 
                 # ذخیره الگوهای یافت‌شده
@@ -2224,31 +2247,37 @@ def run_candlestick_detection(db_session: Session, limit: int = None, symbols_li
                             'updated_at': now
                         })
                     success_count += 1
-                    
+                
+                processed_count += 1
+                if processed_count % 50 == 0:
+                    logger.info(f"🕯️ پیشرفت تشخیص الگوهای شمعی: {processed_count}/{len(symbol_ids_to_process)} نماد")
+
             except Exception as e:
                 logger.error(f"❌ خطا در تشخیص الگوهای شمعی برای نماد {symbol_id}: {e}", exc_info=True)
+                # بدون rollback در این سطح (زیرا bulk insert بعداً انجام می‌شود)
                 
-        # 3. ذخیره نتایج در دیتابیس (استراتژی Delete & Insert)
+        logger.info(f"✅ تشخیص الگوهای شمعی برای {success_count} نماد با الگو انجام شد.")
+                
+        # 3. ذخیره نتایج در دیتابیس (استراتژی Delete & Insert - بدون تغییر)
         if records_to_insert:
             # الف) استخراج تاریخ و لیست نمادهای پردازش شده
             last_jdate = records_to_insert[0]['jdate'] 
             processed_symbol_ids = list({record['symbol_id'] for record in records_to_insert})
             
-            # ب) حذف رکوردهای قدیمی برای نمادها و روز جاری (برای جلوگیری از IntegrityError)
+            # ب) حذف رکوردهای قدیمی
             try:
                 db_session.query(CandlestickPatternDetection).filter(
                     CandlestickPatternDetection.symbol_id.in_(processed_symbol_ids),
                     CandlestickPatternDetection.jdate == last_jdate
-                # 💥 اصلاح کلیدی: تغییر از 'fetch' به False برای حل خطای SQLAlchemy
                 ).delete(synchronize_session=False) 
                 
-                db_session.commit() # commit حذف‌ها 
+                db_session.commit()
                 logger.info(f"🗑️ الگوهای شمعی قبلی ({len(processed_symbol_ids)} نماد) برای {last_jdate} حذف شدند.")
                 
             except Exception as e:
                 db_session.rollback()
                 logger.error(f"❌ خطا در حذف رکوردهای قدیمی الگوهای شمعی: {e}", exc_info=True)
-                return 0 
+                return success_count
                 
             # ج) درج رکوردهای جدید
             db_session.bulk_insert_mappings(CandlestickPatternDetection, records_to_insert)

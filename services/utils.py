@@ -10,6 +10,7 @@ from sqlalchemy import func
 import logging
 from functools import lru_cache
 from typing import Union, List, Dict, Optional, Tuple, Any
+import time 
 
 # تنظیمات لاگینگ
 logger = logging.getLogger(__name__)
@@ -75,6 +76,25 @@ def normalize_value(val: Any) -> Optional[Union[float, int]]:
             logger.warning(f"خطا در تبدیل رشته '{val}' به عدد.")
             return None
     return val
+
+
+
+# --- تنظیمات API و تاخیر ---
+DEFAULT_PER_SYMBOL_DELAY: float = 0.3 # تاخیر پیش‌فرض ۰.۳ ثانیه بین هر درخواست API
+DEFAULT_REQUEST_TIMEOUT: int = 15 # Timeout پیش‌فرض برای درخواست‌های HTTP (ثانیه)
+
+def safe_sleep(seconds: float, log_message: str = "") -> None:
+    """
+    تأخیر ایمن با قابلیت لاگ کردن.
+    """
+    if seconds > 0:
+        message = f"در حال تاخیر به مدت {seconds:.2f} ثانیه..."
+        if log_message:
+            message += f" ({log_message})"
+        logger.debug(message)
+        time.sleep(seconds)
+
+
 
 # --- توابع تحلیل تکنیکال با Caching و Type Hints ---
 

@@ -18,6 +18,7 @@ from models import (
     GoldenKeyResult,
     AggregatedPerformance,
     WeeklyWatchlistResult,
+    DailySectorPerformance, # 👈 تغییر ۱: ایمپورت مدل DailySectorPerformance
 )
 
 
@@ -25,7 +26,6 @@ from models import (
 from jinja2 import Environment, FileSystemLoader, Template
 
 # Import necessary modules and models from the Flask application structure
-# این سرویس فرض می‌کند که نمونه 'db' از طریق ماژول extensions در دسترس است
 from extensions import db
 from services.iran_market_data import fetch_iran_market_indices
 from services.utils import calculate_smart_money_flow
@@ -42,8 +42,6 @@ daily_template = None
 weekly_template = None
 
 try:
-    # مسیر 'templates' باید نسبت به ریشه پروژه یا محل اجرای اسکریپت تنظیم شود.
-    # در یک برنامه Flask، این معمولاً به پوشه templates اصلی اشاره دارد.
     template_loader = FileSystemLoader('services/templates')
     template_env = Environment(loader=template_loader)
     daily_template = template_env.get_template('daily_summary.j2')
@@ -60,6 +58,8 @@ except Exception as e:
 **شاخص کل:** با تغییر **{{ '%.2f'|format(indices_data.Total_Index.percent|default(0)) }}%**، امروز روندی {{ indices_data.Total_Index.status }} را تجربه کرد.
 **شاخص هم‌وزن:** عملکرد {{ indices_data.Equal_Weighted_Index.status }} آن با تغییر **{{ '%.2f'|format(indices_data.Equal_Weighted_Index.percent|default(0)) }}%** نشان‌دهنده وضعیت سهام کوچک و متوسط بود.
 {{ smart_money_flow_text }}
+
+{{ sector_summary }} 👈 تغییر ۳: اضافه شدن خلاصه صنایع به قالب روزانه
 
 ## تحلیل نمادهای منتخب
 {% if all_symbols %}
@@ -80,6 +80,8 @@ except Exception as e:
 {% endif %}
 {{ smart_money_flow_text }}
 
+{{ sector_summary }} 👈 تغییر ۳: اضافه شدن خلاصه صنایع به قالب هفتگی
+
 ## عملکرد نمادهای منتخب هفته
 {% if all_symbols %}
 در ادامه عملکرد سیگنال‌های ارائه شده در طول هفته ارزیابی شده است:
@@ -93,22 +95,49 @@ except Exception as e:
     logger.info("✅ قالب‌های Jinja2 با موفقیت از رشته‌های درون‌حافظه‌ای بارگذاری شدند.")
 
 # -----------------------------------------------------------------------------
-# توابع کمکی بهینه شده
+# توابع کمکی جدید و بهینه شده
 # -----------------------------------------------------------------------------
+
+def _safe_dataframe_from_orm(rows: List[Any], cols: List[str]) -> pd.DataFrame:
+    """
+    DataFrame ایمن از لیست اشیاء ORM می‌سازد و فیلدهای داخلی SQLAlchemy را حذف می‌کند.
+    """
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    # استخراج فقط ستون‌های مورد نیاز
+    data = [{c: getattr(r, c, None) for c in cols} for r in rows]
+    return pd.DataFrame(data)
+
+def _choose_price_col(df: pd.DataFrame) -> str:
+    """
+    ستون مناسب قیمت را برای تبدیل حجم به ارزش انتخاب می‌کند: close > close_price > pclosing.
+    """
+    for c in ('close', 'close_price', 'pclosing'):
+        if c in df.columns and df[c].mean() > 0:
+            return c
+    # اگر هیچ ستون قیمتی مناسب نبود
+    df['dummy_price'] = 1000 
+    return 'dummy_price'
 
 def _get_day_type() -> str:
     """
     روز هفته را برای تعیین نوع تحلیل (روزانه، هفتگی یا بدون تحلیل) مشخص می‌کند.
+    در ایران: شنبه تا چهارشنبه (تحلیل روزانه) | پنجشنبه (بدون تحلیل) | جمعه (تحلیل هفتگی).
     """
-    today_jdate = jdatetime.date.today()
-    weekday = today_jdate.weekday()
-    
-    if weekday in [0, 1, 2, 3, 4]:  # شنبه تا چهارشنبه
+    # jdatetime.date.today().weekday() -> Monday=0, ..., Sunday=6.
+    # برای خوانایی بیشتر، از نام روز فارسی یا انگلیسی استفاده می‌کنیم.
+    j_today = jdatetime.date.today()
+    day_name = j_today.strftime('%A') 
+
+    # Sat: 5, Sun: 6, Mon: 0, Tue: 1, Wed: 2, Thu: 3, Fri: 4
+    if day_name in ('Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday'):
         return 'daily'
-    elif weekday == 6:  # جمعه
+    if day_name == 'Friday':
         return 'weekly'
-    else:  # پنجشنبه (5)
+    if day_name == 'Thursday':
         return 'no_analysis_day'
+        
+    return 'daily' # Fallback
 
 def _calculate_pnl(entry_price: float, exit_price: Optional[float]) -> Optional[float]:
     """
@@ -121,6 +150,7 @@ def _calculate_pnl(entry_price: float, exit_price: Optional[float]) -> Optional[
 def _get_formatted_smart_money_flow_text(net_flow: float, is_weekly: bool) -> str:
     """متن فرمت‌شده برای نمایش وضعیت ورود و خروج پول هوشمند را تولید می‌کند."""
     period = "امروز" if not is_weekly else "در مجموع این هفته"
+    # 1e10 = 10,000,000,000 ریال = 1 میلیارد تومان
     if net_flow > 0:
         return f"{period} شاهد ورود پول حقیقی به ارزش تقریبی **{net_flow / 1e10:.2f} میلیارد تومان** به بازار بودیم."
     elif net_flow < 0:
@@ -133,7 +163,8 @@ def _get_formatted_symbols_text(symbols: List[Any], is_weekly: bool) -> str:
     text_parts = []
     for symbol_data in symbols:
         symbol_name = symbol_data.symbol_name
-        signal_source = getattr(symbol_data, 'signal_source', 'N/A').replace('Service', '')
+        # فرض می‌کنیم symbol_data از نوع WeeklyWatchlistResult است
+        signal_source = getattr(symbol_data, 'signal_source', 'WeeklyWatchlist')
         reasons = getattr(symbol_data, 'reasons', '{}')
         if not isinstance(reasons, str):
             reasons = json.dumps(reasons, ensure_ascii=False)
@@ -181,6 +212,46 @@ def _prepare_indices_data(indices_data: Dict) -> Dict:
         processed_data[key] = {'percent': percent, 'status': status}
     return processed_data
 
+def _get_top_sectors_summary(db_session: db.session, limit: int = 5) -> str: # 👈 تغییر ۲: تابع جدید
+    """
+    خلاصه‌ای از {{ limit }} صنعت برتر را بر اساس آخرین رتبه‌بندی تولید می‌کند.
+    """
+    try:
+        # 1. پیدا کردن آخرین تاریخ تحلیل موجود
+        latest_date_record = db_session.query(DailySectorPerformance.jdate).order_by(DailySectorPerformance.jdate.desc()).first()
+        if not latest_date_record:
+            return "\n## رتبه‌بندی صنایع\n**داده‌ای از رتبه‌بندی صنایع برای تحلیل موجود نیست.**"
+
+        latest_jdate_str = latest_date_record[0]
+        
+        # 2. واکشی صنایع برتر برای آن تاریخ
+        top_sectors = DailySectorPerformance.query.filter_by(
+            jdate=latest_jdate_str
+        ).order_by(DailySectorPerformance.rank.asc()).limit(limit).all()
+        
+        if not top_sectors:
+            return "\n## رتبه‌بندی صنایع\n**رتبه‌بندی صنایع امروز تکمیل نشده است.**"
+            
+        text_parts = []
+        for sector in top_sectors:
+            # رتبه‌بندی: 1, 2, 3, ...
+            # جابجایی پول: از میلیارد تومان به 2 رقم اعشار
+            flow_billion_toman = sector.net_money_flow / 1e10 if sector.net_money_flow else 0
+            
+            flow_status = "ورود پول" if flow_billion_toman > 0 else "خروج پول"
+            flow_value = f"{abs(flow_billion_toman):.2f}"
+            
+            text_parts.append(
+                f"- **{sector.rank}.** {sector.sector_name}: {flow_status} ({flow_value} م.تومان)"
+            )
+
+        header = f"\n## رتبه‌بندی {limit} صنعت برتر (تاریخ تحلیل: {latest_jdate_str})\n"
+        return header + "\n".join(text_parts)
+    
+    except Exception as e:
+        logger.error(f"❌ خطا در تولید خلاصه صنایع برتر: {e}")
+        return "\n## رتبه‌بندی صنایع\n**خطای فنی در استخراج اطلاعات صنایع.**"
+
 # -----------------------------------------------------------------------------
 # توابع اصلی تحلیل
 # -----------------------------------------------------------------------------
@@ -197,8 +268,6 @@ def _generate_daily_summary() -> str:
         raw_indices_data = fetch_iran_market_indices()
         indices_data = _prepare_indices_data(raw_indices_data)
         
-        # --- [شروع منطق جدید: یافتن آخرین روز معاملاتی] ---
-        
         # 1.1. پیدا کردن آخرین تاریخ معاملاتی موجود در دیتابیس
         last_trading_day_data = HistoricalData.query.filter(
             HistoricalData.symbol_name.isnot(None)
@@ -214,69 +283,92 @@ def _generate_daily_summary() -> str:
 
         if current_jdate_str != analysis_date_jdate_str:
             logger.info("بازار امروز (%s) ممکن است بسته باشد یا داده‌ای دریافت نشده است. تحلیل بر اساس آخرین روز معاملاتی (%s) تولید می‌شود.", 
-                        current_jdate_str, analysis_date_jdate_str)
+                         current_jdate_str, analysis_date_jdate_str)
         
         # 2. تنظیم تاریخ برای کوئری‌های اصلی و تاریخ دیروز
-        
-        # توجه: برای محاسبه تغییرات روزانه، باید داده‌ی یک روز قبل از analysis_date_jdate_str را پیدا کنیم.
-        
-        # پیدا کردن تاریخ دیروز با استفاده از تاریخ گریگوری ذخیره شده یا محاسبه بر اساس جریانی
         yesterday_data = HistoricalData.query.filter(
             HistoricalData.jdate < analysis_date_jdate_str
         ).order_by(HistoricalData.jdate.desc()).first()
         
         yesterday_jdate_str = yesterday_data.jdate if yesterday_data else None
 
-        # --- [پایان منطق جدید] ---
-
         # 2. دریافت داده‌های تاریخی مورد نیاز برای محاسبه جریان پول
-        historical_data_for_df = HistoricalData.query.filter(
-            HistoricalData.jdate == analysis_date_jdate_str, # استفاده از تاریخ آخرین معامله
+        historical_data_for_df_cols = ['symbol_id', 'symbol_name', 'jdate', 'close', 'close_price', 'pclosing',
+                                        'buy_i_volume', 'sell_i_volume', 'buy_count_i', 'sell_count_i', 'value']
+        
+        historical_data_for_df_rows = HistoricalData.query.with_entities(
+            *[getattr(HistoricalData, col) for col in historical_data_for_df_cols if hasattr(HistoricalData, col)]
+        ).filter(
+            HistoricalData.jdate == analysis_date_jdate_str, 
             HistoricalData.symbol_name.isnot(None)
         ).all()
         
-        # تبدیل داده‌ها به DataFrame و فراخوانی تابع با آرگومان صحیح
-        df = pd.DataFrame([hd.__dict__ for hd in historical_data_for_df])
+        # **استفاده از helper برای ساخت ایمن DataFrame**
+        df = _safe_dataframe_from_orm(historical_data_for_df_rows, historical_data_for_df_cols)
         
-        # رفع FutureWarning: در اینجا، ستون‌های پول هوشمند کاملاً در مدل HistoricalData وجود دارند.
-        # df.replace([np.inf, -np.inf], np.nan, inplace=True) # این خط در اینجا نیازی نیست
-        # df = df.fillna(0).infer_objects(copy=False) # اگرچه برای df کوتاه است، اما برای ایمنی انجام شود
-        
-        smart_money_flow = calculate_smart_money_flow(df)
+        if df.empty:
+            logger.warning("❌ DataFrame داده‌های تاریخی برای روز %s خالی است.", analysis_date_jdate_str)
+            total_net_real_money_flow = 0
+        else:
+            # 1. آماده‌سازی ستون‌ها
+            for col in ['buy_i_volume', 'sell_i_volume', 'close', 'close_price', 'pclosing', 'value', 'buy_count_i', 'sell_count_i']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            
+            # فراخوانی calculate_smart_money_flow
+            smart_money_flow_df = calculate_smart_money_flow(df)
+
+            # محاسبه جریان خالص حجمی (robust logic)
+            if smart_money_flow_df is not None and 'individual_net_flow' in smart_money_flow_df.columns and len(smart_money_flow_df) == len(df):
+                net_volume_flow = smart_money_flow_df['individual_net_flow']
+            else:
+                net_volume_flow = df['buy_i_volume'] - df['sell_i_volume']
+
+            # یافتن ستون قیمت و محاسبه ارزش ریالی
+            price_col = _choose_price_col(df)
+            df['net_real_value_flow'] = net_volume_flow * df[price_col]
+            total_net_real_money_flow = df['net_real_value_flow'].sum()
         
         # 3. دریافت سیگنال‌های جدید همان روز از پایگاه داده
-        golden_key_results = GoldenKeyResult.query.filter(GoldenKeyResult.jdate == analysis_date_jdate_str).all() # تغییر
-        weekly_watchlist_results = WeeklyWatchlistResult.query.filter(WeeklyWatchlistResult.jentry_date == analysis_date_jdate_str).all() # تغییر
+        # **GoldenKeyResults حذف شد - تمرکز فقط بر WeeklyWatchlist**
+        weekly_watchlist_results = WeeklyWatchlistResult.query.filter(WeeklyWatchlistResult.jentry_date == analysis_date_jdate_str).all() 
         
-        all_new_symbols = golden_key_results + weekly_watchlist_results
+        all_new_symbols = weekly_watchlist_results
 
-        # 4. محاسبه تغییرات روزانه برای هر نماد
+        # 4. محاسبه تغییرات روزانه برای هر نماد با استفاده از _calculate_pnl
         for symbol in all_new_symbols:
-            today_data = HistoricalData.query.filter_by(symbol_id=symbol.symbol_id, jdate=analysis_date_jdate_str).first() # تغییر
+            # استفاده از 'close' به عنوان قیمت مرجع ورود/خروج
+            today_data = HistoricalData.query.filter_by(symbol_id=symbol.symbol_id, jdate=analysis_date_jdate_str).first() 
             
-            # اگر yesterday_jdate_str وجود نداشت، از محاسبه تغییر روزانه صرف‌نظر شود.
             if yesterday_jdate_str:
                 yesterday_data = HistoricalData.query.filter_by(symbol_id=symbol.symbol_id, jdate=yesterday_jdate_str).first()
 
-                if today_data and yesterday_data and yesterday_data.close != 0: # استفاده از 'close' به جای 'close_price'
-                    daily_change = ((today_data.close - yesterday_data.close) / yesterday_data.close) * 100
-                    setattr(symbol, 'daily_change_percent', round(daily_change, 2))
+                if today_data and yesterday_data and yesterday_data.close is not None and today_data.close is not None:
+                    # **استفاده از _calculate_pnl**
+                    daily_change = _calculate_pnl(yesterday_data.close, today_data.close)
+                    
+                    setattr(symbol, 'daily_change_percent', daily_change)
                 else:
                     setattr(symbol, 'daily_change_percent', None)
             else:
                 setattr(symbol, 'daily_change_percent', None)
 
+        
+        # 5. **اضافه کردن تحلیل صنایع** 👈 تغییر ۴: فراخوانی تابع جدید
+        sector_summary_text = _get_top_sectors_summary(db.session, limit=5)
 
-        # 5. آماده‌سازی داده‌ها برای ارسال به قالب
+        # 6. آماده‌سازی داده‌ها برای ارسال به قالب
         data_for_template = {
-            'jdate': analysis_date_jdate_str, # استفاده از تاریخ آخرین معامله
+            'jdate': analysis_date_jdate_str, 
             'indices_data': indices_data,
-            'smart_money_flow_text': _get_formatted_smart_money_flow_text(smart_money_flow.get('net_real_money_flow', 0), is_weekly=False),
+            'smart_money_flow_text': _get_formatted_smart_money_flow_text(total_net_real_money_flow, is_weekly=False),
+            'sector_summary': sector_summary_text, # 👈 متغیر جدید
             'all_symbols': all_new_symbols,
             'symbols_text': _get_formatted_symbols_text(all_new_symbols, is_weekly=False)
         }
         
-        return daily_template.render(data_for_template)
+        # **اصلاح: استفاده از **kwargs برای render**
+        return daily_template.render(**data_for_template)
 
     except SQLAlchemyError as e:
         logger.error(f"❌ خطای پایگاه داده در تولید تحلیل روزانه: {e}", exc_info=True)
@@ -288,7 +380,6 @@ def _generate_daily_summary() -> str:
 def _generate_weekly_summary() -> str:
     """
     یک تحلیل هفتگی جامع از عملکرد بازار و نمادها تولید می‌کند.
-    این تابع به داده‌های ارزیابی‌شده توسط فرآیندهای پس‌زمینه متکی است.
     """
     logger.info("شروع فرآیند تولید تحلیل هفتگی بازار...")
     
@@ -296,37 +387,78 @@ def _generate_weekly_summary() -> str:
         week_ago_greg = datetime.now().date() - timedelta(days=7)
         week_ago_jdate_str = jdatetime.date.fromgregorian(date=week_ago_greg).strftime('%Y-%m-%d')
         
-        # 1. دریافت داده‌های تجمیعی عملکرد که توسط یک جاب پس‌زمینه (update_and_save_performance_metrics) محاسبه شده است.
+        # 1. دریافت داده‌های تجمیعی عملکرد
         aggregated_data = AggregatedPerformance.query.filter(
             AggregatedPerformance.period_type == 'weekly'
         ).order_by(AggregatedPerformance.created_at.desc()).first()
         
+        # **تبدیل شی ORM به dict برای استفاده در قالب**
+        if aggregated_data:
+            indices_for_template = {
+                'total_profit_percent': getattr(aggregated_data, 'total_profit_percent', 0),
+                'win_rate': getattr(aggregated_data, 'win_rate', 0),
+            }
+        else:
+            indices_for_template = {}
+        
         # 2. دریافت داده‌های HistoricalData برای محاسبه جریان پول
-        historical_data_for_df = HistoricalData.query.filter(
+        historical_data_for_df_cols = ['symbol_id', 'symbol_name', 'jdate', 'close', 'close_price', 'pclosing',
+                                        'buy_i_volume', 'sell_i_volume', 'buy_count_i', 'sell_count_i', 'value']
+        
+        historical_data_for_df_rows = HistoricalData.query.with_entities(
+            *[getattr(HistoricalData, col) for col in historical_data_for_df_cols if hasattr(HistoricalData, col)]
+        ).filter(
             HistoricalData.jdate >= week_ago_jdate_str,
             HistoricalData.symbol_name.isnot(None)
         ).all()
         
-        # تبدیل داده‌ها به DataFrame و فراخوانی تابع با آرگومان صحیح
-        df = pd.DataFrame([hd.__dict__ for hd in historical_data_for_df])
-        weekly_smart_money_flow = calculate_smart_money_flow(df)
-        
-        # 3. دریافت رکوردهای سیگنال‌های هفته که توسط جاب پس‌زمینه (evaluate_weekly_watchlist_performance) ارزیابی شده‌اند.
-        golden_key_records = GoldenKeyResult.query.filter(GoldenKeyResult.jdate >= week_ago_jdate_str).all()
+        # **استفاده از helper برای ساخت ایمن DataFrame**
+        df = _safe_dataframe_from_orm(historical_data_for_df_rows, historical_data_for_df_cols)
+
+        if df.empty:
+            logger.warning("❌ DataFrame داده‌های تاریخی برای دوره هفتگی خالی است.")
+            total_net_real_money_flow = 0
+        else:
+            # 1. آماده‌سازی ستون‌ها
+            for col in ['buy_i_volume', 'sell_i_volume', 'close', 'close_price', 'pclosing', 'value', 'buy_count_i', 'sell_count_i']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            
+            # فراخوانی calculate_smart_money_flow
+            weekly_smart_money_flow_df = calculate_smart_money_flow(df)
+            
+            # محاسبه جریان خالص حجمی (robust logic)
+            if weekly_smart_money_flow_df is not None and 'individual_net_flow' in weekly_smart_money_flow_df.columns and len(weekly_smart_money_flow_df) == len(df):
+                net_volume_flow = weekly_smart_money_flow_df['individual_net_flow']
+            else:
+                net_volume_flow = df['buy_i_volume'] - df['sell_i_volume']
+
+            # یافتن ستون قیمت و محاسبه ارزش ریالی
+            price_col = _choose_price_col(df)
+            df['net_real_value_flow'] = net_volume_flow * df[price_col]
+            total_net_real_money_flow = df['net_real_value_flow'].sum()
+
+        # 3. دریافت رکوردهای سیگنال‌های هفته 
+        # **GoldenKeyRecords حذف شد - تمرکز فقط بر WeeklyWatchlist**
         weekly_watchlist_records = WeeklyWatchlistResult.query.filter(WeeklyWatchlistResult.jentry_date >= week_ago_jdate_str).all()
         
-        all_week_symbols = golden_key_records + weekly_watchlist_records
+        all_week_symbols = weekly_watchlist_records
         
-        # 4. آماده‌سازی داده‌ها برای ارسال به قالب
+        # 4. **اضافه کردن تحلیل صنایع** 👈 تغییر ۴: فراخوانی تابع جدید
+        sector_summary_text = _get_top_sectors_summary(db.session, limit=5)
+        
+        # 5. آماده‌سازی داده‌ها برای ارسال به قالب
         data_for_template = {
             'jdate': jdatetime.date.today().strftime('%Y-%m-%d'),
-            'indices_data': aggregated_data,
-            'smart_money_flow_text': _get_formatted_smart_money_flow_text(weekly_smart_money_flow.get('net_real_money_flow', 0), is_weekly=True),
+            'indices_data': indices_for_template, # استفاده از دیکشنری تبدیل‌شده
+            'smart_money_flow_text': _get_formatted_smart_money_flow_text(total_net_real_money_flow, is_weekly=True),
+            'sector_summary': sector_summary_text, # 👈 متغیر جدید
             'all_symbols': all_week_symbols,
             'symbols_text': _get_formatted_symbols_text(all_week_symbols, is_weekly=True)
         }
         
-        return weekly_template.render(data_for_template)
+        # **اصلاح: استفاده از **kwargs برای render**
+        return weekly_template.render(**data_for_template)
 
     except SQLAlchemyError as e:
         logger.error(f"❌ خطای پایگاه داده در تولید تحلیل هفتگی: {e}", exc_info=True)
@@ -354,7 +486,6 @@ def generate_market_summary() -> str:
         logger.info("امروز پنجشنبه است؛ تحلیل بازار منتشر نمی‌شود.")
         return "در روز پنجشنبه، بازار سرمایه فعال نیست و تحلیل روزانه منتشر نمی‌شود."
     
-    # این حالت نباید رخ دهد
     return "نوع تحلیل برای روز جاری قابل تشخیص نیست."
 
 # -----------------------------------------------------------------------------
@@ -365,7 +496,6 @@ def update_evaluated_prices_job():
     """
     شبه‌کد: این تابع باید توسط یک زمان‌بند (Scheduler) مانند Celery یا Cron
     به صورت روزانه اجرا شود تا قیمت خروج و سود/زیان سیگنال‌های فعال را به‌روز کند.
-    این فرآیند معادل منطق `evaluate_weekly_watchlist_performance` است.
     """
     logger.info("شروع جاب زمان‌بندی شده برای ارزیابی سیگنال‌های فعال...")
     try:
@@ -377,7 +507,7 @@ def update_evaluated_prices_job():
         # 2. برای هر سیگنال، آخرین قیمت را از دیتابیس لوکال دریافت و وضعیت آن را ارزیابی کن.
         for signal in active_signals:
             try:
-                # اصلاحیه: قیمت از دیتابیس لوکال HistoricalData خوانده می‌شود
+                # قیمت از دیتابیس لوکال HistoricalData خوانده می‌شود
                 latest_historical_data = HistoricalData.query.filter_by(
                     symbol_id=signal.symbol_id
                 ).order_by(HistoricalData.jdate.desc()).first()
@@ -386,12 +516,14 @@ def update_evaluated_prices_job():
                     logger.warning(f"❌ آخرین داده تاریخی برای نماد {signal.symbol_name} یافت نشد. ارزیابی انجام نشد.")
                     continue
 
-                latest_price = latest_historical_data.close_price
+                # استفاده از 'close' به عنوان قیمت خروج یکنواخت (مانند گزارش روزانه)
+                latest_price = getattr(latest_historical_data, 'close', getattr(latest_historical_data, 'close_price', None))
 
                 # ... منطق ارزیابی (حد سود/ضرر) ...
-                if latest_price: # Placeholder for evaluation logic
+                if latest_price: 
                     signal.exit_price = latest_price 
-                    signal.status = 'evaluated' # یا closed_win, closed_loss
+                    signal.status = 'evaluated' 
+                    # استفاده از _calculate_pnl
                     signal.profit_loss_percentage = _calculate_pnl(signal.entry_price, signal.exit_price)
                     db.session.add(signal)
             except Exception as e:
@@ -404,4 +536,5 @@ def update_evaluated_prices_job():
         db.session.rollback()
         logger.error(f"❌ خطای پایگاه داده در جاب ارزیابی: {e}", exc_info=True)
     except Exception as e:
+        db.session.rollback() # بهتر است در خطاهای بیرونی هم rollback کنیم
         logger.error(f"❌ خطای ناشناخته در جاب ارزیابی: {e}", exc_info=True)

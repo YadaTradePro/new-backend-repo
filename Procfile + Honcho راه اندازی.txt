@@ -11,6 +11,9 @@ set FLASK_APP=main.py
 
 honcho start
 
+netstat -ano | findstr :5000
+taskkill /PID ???? /F
+
 
 خروجی چیزی شبیه این می‌شه:
 
@@ -34,4 +37,8 @@ Frontend
 ________________
 cd E:\YadaTradepro-frontend-main
 npm run dev
+taskkill /IM python.exe /F
 
+
+flask run-technical-analysis
+flask run-historical-data

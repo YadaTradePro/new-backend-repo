@@ -12,6 +12,7 @@ import logging
 import json
 import numpy as np
 from types import SimpleNamespace
+from models import DailySectorPerformance
 
 
 # NEW: Import for market sentiment analysis
@@ -30,42 +31,121 @@ logger = logging.getLogger(__name__)
 TECHNICAL_DATA_LOOKBACK_DAYS = 120
 MIN_REQUIRED_HISTORY_DAYS = 50
 
-# REVISED: New filter weights for a predictive scoring algorithm
+# REVISED: New filter weights dictionary with descriptions for clarity
 FILTER_WEIGHTS = {
     # --- High-Impact Leading & Breakout Signals ---
-    "RSI_Positive_Divergence": 5,
-    "Resistance_Broken": 5,
-    "Squeeze_Momentum_Fired_Long": 4,
-    "Stochastic_Bullish_Cross_Oversold": 4,
-    "Consolidation_Breakout_Candidate": 3,
-    "Bollinger_Lower_Band_Touch": 2,
+    "RSI_Positive_Divergence": {
+        "weight": 5,
+        "description": "واگرایی مثبت در RSI، یک سیگنال پیشرو قوی برای احتمال بازگشت روند نزولی به صعودی."
+    },
+    "Resistance_Broken": {
+        "weight": 5,
+        "description": "شکست یک سطح مقاومت کلیدی، نشانه‌ای از قدرت خریداران و پتانسیل شروع یک حرکت صعودی جدید."
+    },
+    "Static_Resistance_Broken": {
+        "weight": 5,
+        "description": "شکست یک مقاومت مهم استاتیک (کلاسیک)، سیگنالی بسیار معتبر برای ادامه رشد."
+    },
+    "Squeeze_Momentum_Fired_Long": {
+        "weight": 4,
+        "description": "اندیکاتور Squeeze Momentum سیگنال خرید (خروج از فشردگی) صادر کرده است که نشان‌دهنده احتمال یک حرکت انفجاری است."
+    },
+    "Stochastic_Bullish_Cross_Oversold": {
+        "weight": 4,
+        "description": "تقاطع صعودی در اندیکاتور استوکاستیک در ناحیه اشباع فروش، یک سیگنال خرید کلاسیک و معتبر."
+    },
+    "Consolidation_Breakout_Candidate": {
+        "weight": 3,
+        "description": "سهم در فاز تراکم و نوسان کم قرار دارد و آماده یک حرکت قوی (شکست) است."
+    },
+    "Near_Static_Support": {
+        "weight": 3,
+        "description": "قیمت در نزدیکی یک سطح حمایتی استاتیک معتبر قرار دارد که ریسک به ریوارد مناسبی برای ورود فراهم می‌کند."
+    },
+    "Bollinger_Lower_Band_Touch": {
+        "weight": 2,
+        "description": "قیمت به باند پایین بولینگر برخورد کرده است که می‌تواند نشانه بازگشت کوتاه‌مدت قیمت باشد."
+    },
 
-    # --- Trend Confirmation Signals ---
-    "MACD_Bullish_Cross_Confirmed": 2,
-    "HalfTrend_Buy_Signal": 2,
-    "High_Volume_On_Up_Day": 2,
-    "Positive_Real_Money_Flow_Trend_10D": 3,
-    "Price_Above_SMA50": 1,
+    # --- Trend Confirmation & Strength Signals ---
+    "IsInLeadingSector": {
+        "weight": 4,
+        "description": "سهم متعلق به یکی از صنایع پیشرو و مورد توجه بازار است که شانس موفقیت را افزایش می‌دهد."
+    },
+    "Positive_Real_Money_Flow_Trend_10D": {
+        "weight": 3,
+        "description": "برآیند ورود پول هوشمند (حقیقی) در ۱۰ روز گذشته مثبت بوده است."
+    },
+    "Heavy_Individual_Buy_Pressure": {
+        "weight": 3,
+        "description": "سرانه خرید حقیقی‌ها در روز آخر به طور قابل توجهی بالاتر از سرانه فروش بوده است (ورود پول سنگین)."
+    },
+    "MACD_Bullish_Cross_Confirmed": {
+        "weight": 2,
+        "description": "خط MACD خط سیگنال خود را به سمت بالا قطع کرده که تاییدی بر شروع روند صعودی است."
+    },
+    "HalfTrend_Buy_Signal": {
+        "weight": 2,
+        "description": "اندیکاتور HalfTrend سیگنال خرید صادر کرده است."
+    },
+    "High_Volume_On_Up_Day": {
+        "weight": 2,
+        "description": "حجم معاملات در یک روز مثبت به طور معناداری افزایش یافته که نشان از حمایت قوی از رشد قیمت دارد."
+    },
+    "Price_Above_SMA50": {
+        "weight": 1,
+        "description": "قیمت بالاتر از میانگین متحرک ۵۰ روزه خود قرار دارد که نشانه روند صعودی میان‌مدت است."
+    },
 
     # --- Fundamental Quality Filters ---
-    #"High_ROE": 2,
-    "Reasonable_PE": 0.5,
-    "Reasonable_PS": 0.5,
-    #"Reasonable_PB": 1,
-    "Positive_EPS": 0.5,
+    "Reasonable_PE": {
+        "weight": 1, # Increased from 0.5
+        "description": "نسبت P/E سهم در محدوده منطقی قرار دارد و سهم از نظر بنیادی ارزنده است."
+    },
+    "Reasonable_PS": {
+        "weight": 1, # Increased from 0.5
+        "description": "نسبت P/S سهم در محدوده منطقی قرار دارد."
+    },
+    "Positive_EPS": {
+        "weight": 0.5,
+        "description": "سود به ازای هر سهم (EPS) شرکت مثبت است."
+    },
 
-
-    # --- candlestick filters Filters ---
-    "Bullish_Engulfing_Detected": 3,
-    "Hammer_Detected": 3,
-    "Morning_Star_Detected": 4,
-    "ML_Predicts_Uptrend": 2,
+    # --- Candlestick Filters ---
+    "Bullish_Engulfing_Detected": {
+        "weight": 3,
+        "description": "الگوی کندلی پوشاننده صعودی (Bullish Engulfing) مشاهده شده است."
+    },
+    "Hammer_Detected": {
+        "weight": 3,
+        "description": "الگوی کندلی چکش (Hammer) که یک الگوی بازگشتی صعودی است، مشاهده شده است."
+    },
+    "Morning_Star_Detected": {
+        "weight": 4,
+        "description": "الگوی کندلی ستاره صبحگاهی (Morning Star)، یک الگوی بازگشتی بسیار معتبر، مشاهده شده است."
+    },
+    
+    # --- ML Prediction Filter ---
+    "ML_Predicts_Uptrend": {
+        "weight": 2,
+        "description": "مدل یادگیری ماشین، احتمال بالایی برای یک روند صعودی پیش‌بینی کرده است."
+    },
 
     # --- Penalties & Negative Scores (Crucial for avoiding peaks) ---
-    "RSI_Is_Overbought": -4,
-    "Price_Too_Stretched_From_SMA50": -3,
-    "Negative_Real_Money_Flow_Trend_10D": -2,
+    "RSI_Is_Overbought": {
+        "weight": -4,
+        "description": "جریمه منفی: RSI در ناحیه اشباع خرید قرار دارد که ریسک اصلاح قیمت را افزایش می‌دهد."
+    },
+    "Price_Too_Stretched_From_SMA50": {
+        "weight": -3,
+        "description": "جریمه منفی: قیمت فاصله زیادی از میانگین متحرک ۵۰ روزه گرفته که احتمال بازگشت به میانگین را بالا می‌برد."
+    },
+    "Negative_Real_Money_Flow_Trend_10D": {
+        "weight": -2,
+        "description": "جریمه منفی: برآیند ورود پول هوشمند در ۱۰ روز گذشته منفی بوده است (خروج پول)."
+    }
 }
+
 
 # کمک‌کننده: بازگرداندن یک سری close قابل‌اعتماد از historical DF
 def _get_close_series_from_hist_df(hist_df):
@@ -131,12 +211,9 @@ def _check_market_condition_filters(hist_df, tech_df):
 
     # --- Check 1: RSI Overbought Condition (Penalize only if weak) ---
     if hasattr(last_tech, 'RSI') and last_tech.RSI is not None and last_tech.RSI > 70:
-        # Check for negative divergence (if available)
         is_negative_divergence = (
             hasattr(last_tech, 'RSI_Divergence') and last_tech.RSI_Divergence == "Negative"
         )
-
-        # Compare last day volume with 10-day average
         historical_volume_series = hist_df.tail(10)['volume']
         average_volume = historical_volume_series.mean() if not historical_volume_series.empty else 0
         is_high_volume = last_hist['volume'] > average_volume * 1.5 if average_volume > 0 else False
@@ -144,8 +221,7 @@ def _check_market_condition_filters(hist_df, tech_df):
         if is_negative_divergence or not is_high_volume:
             satisfied_filters.append("RSI_Is_Overbought")
             reason_parts["market_condition"].append(
-                f"RSI ({last_tech.RSI:.2f}) overbought with weakness "
-                "(negative divergence or low volume)."
+                f"RSI ({last_tech.RSI:.2f}) overbought with weakness."
             )
         else:
             reason_parts["market_condition"].append(
@@ -175,23 +251,10 @@ def _check_market_condition_filters(hist_df, tech_df):
 
     return satisfied_filters, reason_parts
 
-
-
-
-
-
-
 # تغییر در is_data_sufficient: انعطاف‌پذیرتر و مقاوم‌تر
 def is_data_sufficient(data_df, min_len):
     """
     Checks if the provided DataFrame is not empty and has at least min_len records.
-    
-    Args:
-        data_df (pd.DataFrame): The DataFrame of data records.
-        min_len (int): The minimum required length for the data.
-        
-    Returns:
-        bool: True if data is sufficient, False otherwise.
     """
     if data_df is None or data_df.empty:
         return False
@@ -200,7 +263,6 @@ def is_data_sufficient(data_df, min_len):
 def convert_jalali_to_gregorian_timestamp(jdate_str):
     """
     Converts a Jalali date string (YYYY-MM-DD) to a pandas Timestamp (Gregorian).
-    Handles NaN/None values gracefully.
     """
     if pd.notna(jdate_str) and isinstance(jdate_str, str):
         try:
@@ -211,20 +273,110 @@ def convert_jalali_to_gregorian_timestamp(jdate_str):
             return pd.NaT
     return pd.NaT
 
+# Helper function to safely get a value
+def _get_attr_safe(rec, attr, default=None):
+    val = getattr(rec, attr, default)
+    if isinstance(val, (pd.Series, pd.DataFrame)):
+        return val.iloc[0] if not val.empty else default
+    return val
 
+# --- REFACTORED: Technical filters are broken down into smaller functions ---
 
+def _check_oscillator_signals(technical_rec, prev_tech_rec, close_ser):
+    """Checks oscillator-based signals like RSI and Stochastic."""
+    satisfied_filters, reason_parts = [], {"technical": []}
+    
+    # RSI Positive Divergence
+    current_rsi = _get_attr_safe(technical_rec, 'RSI')
+    prev_rsi = _get_attr_safe(prev_tech_rec, 'RSI')
+    if current_rsi is not None and prev_rsi is not None and len(close_ser) > 1:
+        if current_rsi > prev_rsi and close_ser.iloc[-1] < close_ser.iloc[-2]:
+            satisfied_filters.append("RSI_Positive_Divergence")
+            reason_parts["technical"].append(f"Positive divergence on RSI ({current_rsi:.2f}).")
 
-# تغییرات در _check_technical_filters: استفاده از سری close ایمن و محافظت در برابر KeyError
-# کد بازبینی شده
-# ----------------------------
+    # Stochastic Oscillator
+    current_stoch_k = _get_attr_safe(technical_rec, 'Stochastic_K')
+    current_stoch_d = _get_attr_safe(technical_rec, 'Stochastic_D')
+    prev_stoch_k = _get_attr_safe(prev_tech_rec, 'Stochastic_K')
+    prev_stoch_d = _get_attr_safe(prev_tech_rec, 'Stochastic_D')
+    if all(x is not None for x in [current_stoch_k, current_stoch_d, prev_stoch_k, prev_stoch_d]):
+        if current_stoch_k > current_stoch_d and prev_stoch_k <= prev_stoch_d and current_stoch_d < 25:
+            satisfied_filters.append("Stochastic_Bullish_Cross_Oversold")
+            reason_parts["technical"].append("Stochastic bullish cross in oversold area.")
+            
+    return satisfied_filters, reason_parts
+
+def _check_trend_signals(technical_rec, prev_tech_rec, last_close_val):
+    """Checks trend-following signals like MACD, SMA, HalfTrend, and Resistance breaks."""
+    satisfied_filters, reason_parts = [], {"technical": []}
+
+    # MACD Cross
+    current_macd = _get_attr_safe(technical_rec, 'MACD')
+    current_macd_signal = _get_attr_safe(technical_rec, 'MACD_Signal')
+    prev_macd = _get_attr_safe(prev_tech_rec, 'MACD')
+    prev_macd_signal = _get_attr_safe(prev_tech_rec, 'MACD_Signal')
+    if all(x is not None for x in [current_macd, current_macd_signal, prev_macd, prev_macd_signal]):
+        if current_macd > current_macd_signal and prev_macd <= prev_macd_signal:
+            satisfied_filters.append("MACD_Bullish_Cross_Confirmed")
+
+    # Price vs SMA50
+    sma50 = _get_attr_safe(technical_rec, 'SMA_50')
+    if sma50 is not None and last_close_val > sma50:
+        satisfied_filters.append("Price_Above_SMA50")
+        
+    # HalfTrend
+    current_halftrend = _get_attr_safe(technical_rec, 'halftrend_signal')
+    prev_halftrend = _get_attr_safe(prev_tech_rec, 'halftrend_signal')
+    if current_halftrend == 1 and prev_halftrend != 1:
+        satisfied_filters.append("HalfTrend_Buy_Signal")
+        
+    # Dynamic Resistance Break
+    resistance_broken = _get_attr_safe(technical_rec, 'resistance_broken')
+    if resistance_broken:
+        satisfied_filters.append("Resistance_Broken")
+        res_level = _get_attr_safe(technical_rec, 'resistance_level_50d', 'N/A')
+        reason_parts["technical"].append(f"Broke a key dynamic resistance level around {res_level}.")
+
+    return satisfied_filters, reason_parts
+
+def _check_volatility_signals(hist_df, technical_rec, last_close_val):
+    """Checks volatility-based signals like Bollinger Bands and Squeeze Momentum."""
+    satisfied_filters, reason_parts = [], {"technical": []}
+
+    # Bollinger Lower Band
+    bollinger_low = _get_attr_safe(technical_rec, 'Bollinger_Low')
+    if bollinger_low is not None and last_close_val < bollinger_low:
+        satisfied_filters.append("Bollinger_Lower_Band_Touch")
+
+    # Squeeze Momentum
+    prev_tech_rec = hist_df.iloc[-2] if len(hist_df) > 1 else technical_rec
+    current_squeeze_on = _get_attr_safe(technical_rec, 'squeeze_on')
+    prev_squeeze_on = _get_attr_safe(prev_tech_rec, 'squeeze_on')
+    if current_squeeze_on == False and prev_squeeze_on == True:
+        satisfied_filters.append("Squeeze_Momentum_Fired_Long")
+        reason_parts["technical"].append("Squeeze Momentum indicator fired long.")
+        
+    return satisfied_filters, reason_parts
+
+def _check_volume_signals(hist_df, close_ser):
+    """Checks for volume-based signals."""
+    satisfied_filters, reason_parts = [], {"technical": []}
+    
+    if 'volume' in hist_df.columns and len(hist_df) >= 20 and len(close_ser) > 1:
+        volume_z_score = calculate_z_score(pd.to_numeric(hist_df['volume'], errors='coerce').dropna().iloc[-20:])
+        if volume_z_score is not None and volume_z_score > 1.5 and close_ser.iloc[-1] > close_ser.iloc[-2]:
+            satisfied_filters.append("High_Volume_On_Up_Day")
+            reason_parts["technical"].append(f"High volume (Z-Score: {volume_z_score:.2f}) on a positive day.")
+            
+    return satisfied_filters, reason_parts
 
 def _check_technical_filters(hist_df, tech_df):
     """
-    Checks technical indicators, including new leading indicators.
+    Checks all technical indicators by calling specialized sub-functions. (Coordinator function)
     """
-    satisfied_filters, reason_parts = [], {"technical": []}
+    all_satisfied_filters, all_reason_parts = [], {"technical": []}
     if tech_df is None or tech_df.empty or len(tech_df) < 2:
-        return satisfied_filters, reason_parts
+        return all_satisfied_filters, all_reason_parts
 
     technical_rec = tech_df.iloc[-1]
     prev_tech_rec = tech_df.iloc[-2]
@@ -232,83 +384,25 @@ def _check_technical_filters(hist_df, tech_df):
     close_ser = _get_close_series_from_hist_df(hist_df)
     last_close_val = close_ser.iloc[-1] if not close_ser.empty else None
     if last_close_val is None:
-        return satisfied_filters, reason_parts
+        return all_satisfied_filters, all_reason_parts
 
-    # Helper function to safely get a value
-    def get_attr_safe(rec, attr, default=None):
-        val = getattr(rec, attr, default)
-        if isinstance(val, (pd.Series, pd.DataFrame)):
-            return val.iloc[0] if not val.empty else default
-        return val
+    # Call sub-functions and aggregate results
+    for func in [_check_oscillator_signals, _check_trend_signals, _check_volatility_signals, _check_volume_signals]:
+        # Adjust arguments as needed per function signature
+        if func in [_check_oscillator_signals, _check_trend_signals]:
+             satisfied, reasons = func(technical_rec, prev_tech_rec, close_ser if func == _check_oscillator_signals else last_close_val)
+        elif func == _check_volatility_signals:
+            satisfied, reasons = func(tech_df, technical_rec, last_close_val)
+        else: # _check_volume_signals
+            satisfied, reasons = func(hist_df, close_ser)
 
-    # RSI Positive Divergence
-    current_rsi = get_attr_safe(technical_rec, 'RSI')
-    prev_rsi = get_attr_safe(prev_tech_rec, 'RSI')
-    
-    # اطمینان از وجود داده و مقایسه صحیح
-    if current_rsi is not None and prev_rsi is not None and len(close_ser) > 1:
-        # اینجا مقادیر به صورت عددی استخراج شده‌اند و مقایسه امن است
-        if current_rsi > prev_rsi and close_ser.iloc[-1] < close_ser.iloc[-2]:
-            satisfied_filters.append("RSI_Positive_Divergence")
-            reason_parts["technical"].append(f"Positive divergence on RSI ({current_rsi:.2f}).")
-            
-    # MACD Cross
-    current_macd = get_attr_safe(technical_rec, 'MACD')
-    current_macd_signal = get_attr_safe(technical_rec, 'MACD_Signal')
-    prev_macd = get_attr_safe(prev_tech_rec, 'MACD')
-    prev_macd_signal = get_attr_safe(prev_tech_rec, 'MACD_Signal')
-    if all(x is not None for x in [current_macd, current_macd_signal, prev_macd, prev_macd_signal]):
-        if current_macd > current_macd_signal and prev_macd <= prev_macd_signal:
-            satisfied_filters.append("MACD_Bullish_Cross_Confirmed")
-            
-    # Price vs SMA50
-    sma50 = get_attr_safe(technical_rec, 'SMA_50')
-    if sma50 is not None and last_close_val > sma50:
-        satisfied_filters.append("Price_Above_SMA50")
-        
-    # Bollinger Lower Band
-    bollinger_low = get_attr_safe(technical_rec, 'Bollinger_Low')
-    if bollinger_low is not None and last_close_val < bollinger_low:
-        satisfied_filters.append("Bollinger_Lower_Band_Touch")
+        all_satisfied_filters.extend(satisfied)
+        if "technical" in reasons:
+            all_reason_parts["technical"].extend(reasons["technical"])
 
-    # IMPROVED: Volume Analysis
-    if 'volume' in hist_df.columns and len(hist_df) >= 20 and len(close_ser) > 1:
-        volume_z_score = calculate_z_score(pd.to_numeric(hist_df['volume'], errors='coerce').dropna().iloc[-20:])
-        if volume_z_score is not None and volume_z_score > 1.5 and close_ser.iloc[-1] > close_ser.iloc[-2]:
-            satisfied_filters.append("High_Volume_On_Up_Day")
-            reason_parts["technical"].append(f"High volume (Z-Score: {volume_z_score:.2f}) on a positive day.")
-            
-    # NEW: Stochastic Oscillator
-    current_stoch_k = get_attr_safe(technical_rec, 'Stochastic_K')
-    current_stoch_d = get_attr_safe(technical_rec, 'Stochastic_D')
-    prev_stoch_k = get_attr_safe(prev_tech_rec, 'Stochastic_K')
-    prev_stoch_d = get_attr_safe(prev_tech_rec, 'Stochastic_D')
-    if all(x is not None for x in [current_stoch_k, current_stoch_d, prev_stoch_k, prev_stoch_d]):
-        if current_stoch_k > current_stoch_d and prev_stoch_k <= prev_stoch_d and current_stoch_d < 25:
-            satisfied_filters.append("Stochastic_Bullish_Cross_Oversold")
-            reason_parts["technical"].append("Stochastic bullish cross in oversold area.")
-            
-    # NEW: Squeeze Momentum
-    current_squeeze_on = get_attr_safe(technical_rec, 'squeeze_on')
-    prev_squeeze_on = get_attr_safe(prev_tech_rec, 'squeeze_on')
-    if current_squeeze_on == False and prev_squeeze_on == True:
-        satisfied_filters.append("Squeeze_Momentum_Fired_Long")
-        reason_parts["technical"].append("Squeeze Momentum indicator fired long.")
-        
-    # NEW: HalfTrend
-    current_halftrend = get_attr_safe(technical_rec, 'halftrend_signal')
-    prev_halftrend = get_attr_safe(prev_tech_rec, 'halftrend_signal')
-    if current_halftrend == 1 and prev_halftrend != 1:
-        satisfied_filters.append("HalfTrend_Buy_Signal")
-        
-    # NEW: Support & Resistance Break
-    resistance_broken = get_attr_safe(technical_rec, 'resistance_broken')
-    if resistance_broken:
-        satisfied_filters.append("Resistance_Broken")
-        res_level = get_attr_safe(technical_rec, 'resistance_level_50d', 'N/A')
-        reason_parts["technical"].append(f"Broke a key resistance level around {res_level}.")
+    return all_satisfied_filters, all_reason_parts
 
-    return satisfied_filters, reason_parts
+# --- END REFACTORED SECTION ---
 
 def _check_fundamental_filters(fundamental_rec):
     satisfied_filters = []
@@ -316,99 +410,177 @@ def _check_fundamental_filters(fundamental_rec):
     if fundamental_rec:
         if fundamental_rec.pe is not None and 0 < fundamental_rec.pe < 20: satisfied_filters.append("Reasonable_PE")
         if fundamental_rec.p_s_ratio is not None and 0 < fundamental_rec.p_s_ratio < 5: satisfied_filters.append("Reasonable_PS")
-        #if fundamental_rec.pb is not None and 0 < fundamental_rec.pb < 2: satisfied_filters.append("Reasonable_PB")
-        #if fundamental_rec.roe is not None and fundamental_rec.roe > 15: satisfied_filters.append("High_ROE")
         if fundamental_rec.eps is not None and fundamental_rec.eps > 0: satisfied_filters.append("Positive_EPS")
     return satisfied_filters, reason_parts
 
 def _check_smart_money_filters(hist_df):
+    """REVISED: Now also checks for heavy individual buy pressure on the last day."""
     satisfied_filters = []
     reason_parts = {"smart_money": []}
-    # IMPROVEMENT: Increased lookback to 10 days for more stable trend
     trend_lookback = 10
-    if hist_df is None or hist_df.empty or 'buy_i_volume' not in hist_df.columns or len(hist_df) < trend_lookback:
+    if hist_df is None or hist_df.empty or 'buy_i_volume' not in hist_df.columns:
         return satisfied_filters, reason_parts
 
-    smart_money_flow_df = calculate_smart_money_flow(hist_df)
-    if not smart_money_flow_df.empty and len(smart_money_flow_df) >= trend_lookback:
-        trend_net_flow = smart_money_flow_df['individual_net_flow'].iloc[-trend_lookback:].sum()
-        if trend_net_flow > 0:
-            satisfied_filters.append("Positive_Real_Money_Flow_Trend_10D")
-            reason_parts["smart_money"].append(f"Positive real money inflow over the last {trend_lookback} days.")
-        elif trend_net_flow < 0:
-            satisfied_filters.append("Negative_Real_Money_Flow_Trend_10D")
+    # Check 1: 10-Day Real Money Flow Trend
+    if len(hist_df) >= trend_lookback:
+        smart_money_flow_df = calculate_smart_money_flow(hist_df)
+        if not smart_money_flow_df.empty and len(smart_money_flow_df) >= trend_lookback:
+            trend_net_flow = smart_money_flow_df['individual_net_flow'].iloc[-trend_lookback:].sum()
+            if trend_net_flow > 0:
+                satisfied_filters.append("Positive_Real_Money_Flow_Trend_10D")
+                reason_parts["smart_money"].append(f"Positive real money inflow over the last {trend_lookback} days.")
+            elif trend_net_flow < 0:
+                satisfied_filters.append("Negative_Real_Money_Flow_Trend_10D")
+    
+    # NEW Check 2: Heavy Individual Buy Pressure on the last day
+    last_day = hist_df.iloc[-1]
+    required_cols = ['buy_i_volume', 'buy_i_count', 'sell_i_volume', 'sell_i_count']
+    if all(col in last_day and pd.notna(last_day[col]) for col in required_cols):
+        if last_day['buy_i_count'] > 0 and last_day['sell_i_count'] > 0:
+            per_capita_buy = last_day['buy_i_volume'] / last_day['buy_i_count']
+            per_capita_sell = last_day['sell_i_volume'] / last_day['sell_i_count']
+            
+            # Check if per capita buy is 2.5x greater than sell
+            if per_capita_buy > (per_capita_sell * 2.5):
+                satisfied_filters.append("Heavy_Individual_Buy_Pressure")
+                reason_parts["smart_money"].append(f"Significant buy pressure detected (Per capita buy: {per_capita_buy:,.0f} vs sell: {per_capita_sell:,.0f}).")
 
     return satisfied_filters, reason_parts
 
+
 def _check_candlestick_filters(pattern_rec):
-    """
-    Checks for pre-detected bullish candlestick patterns from the database.
-    Args:
-        pattern_rec (CandlestickPatternDetection): The database record for today's pattern.
-    Returns:
-        Tuple[List[str], Dict]: A tuple of satisfied filters and reason parts.
-    """
     satisfied_filters, reason_parts = [], {"candlestick": []}
-    
-    # If there is no pattern record for the symbol on the given day, return empty.
     if not pattern_rec:
         return satisfied_filters, reason_parts
 
     pattern_name = pattern_rec.pattern_name
-
-    # Check for specific bullish patterns you have weights for
     if "Bullish Engulfing" in pattern_name:
         satisfied_filters.append("Bullish_Engulfing_Detected")
         reason_parts["candlestick"].append(f"Detected: {pattern_name}")
-    
     if "Hammer" in pattern_name:
         satisfied_filters.append("Hammer_Detected")
         reason_parts["candlestick"].append(f"Detected: {pattern_name}")
-
     if "Morning Star" in pattern_name:
         satisfied_filters.append("Morning_Star_Detected")
         reason_parts["candlestick"].append(f"Detected: {pattern_name}")
 
     return satisfied_filters, reason_parts
 
-
-
 def _check_advanced_fundamental_filters(ratios_df):
-    """
-    Analyzes historical financial ratios for positive trends.
-    Args:
-        ratios_df (pd.DataFrame): DataFrame of financial ratios for a single symbol.
-    Returns:
-        Tuple[List[str], Dict]: A tuple of satisfied filters and reason parts.
-    """
     satisfied_filters, reason_parts = [], {"advanced_fundamental": []}
     if ratios_df is None or ratios_df.empty:
         return satisfied_filters, reason_parts
 
-    # --- Check 1: Decreasing Debt to Equity ---
     debt_ratios = ratios_df[ratios_df['ratio_name'] == 'Debt to Equity'].sort_values('fiscal_year')
-    
-    # We need at least 2 years of data to see a trend
     if len(debt_ratios) >= 2:
         last_ratio = debt_ratios['ratio_value'].iloc[-1]
         prev_ratio = debt_ratios['ratio_value'].iloc[-2]
-        
-        # Check if the ratio has decreased
         if last_ratio < prev_ratio:
             satisfied_filters.append("Debt_To_Equity_Decreasing")
             reason_parts["advanced_fundamental"].append(f"Debt to Equity is decreasing (from {prev_ratio:.2f} to {last_ratio:.2f}).")
             
-    return satisfied_filters, reason_parts        
+    return satisfied_filters, reason_parts
+
+# --- NEW: Functions for new strategic filters ---
+
+def _get_leading_sectors():
+    """
+    با کوئری به جدول DailySectorPerformance، لیست صنایع پیشرو (مثلاً 4 صنعت برتر)
+    در آخرین روز تحلیل شده را برمی‌گرداند.
+    """
+    try:
+        latest_date_query = db.session.query(func.max(DailySectorPerformance.jdate)).scalar()
+        if not latest_date_query:
+            logger.warning("هیچ داده‌ای در جدول تحلیل صنایع یافت نشد. از لیست پیش‌فرض استفاده می‌شود.")
+            return {"خودرو و ساخت قطعات"} # Fallback
+
+        # دریافت 4 صنعت برتر در آخرین روز
+        leading_sectors_query = db.session.query(DailySectorPerformance.sector_name)\
+                                          .filter(DailySectorPerformance.jdate == latest_date_query)\
+                                          .order_by(DailySectorPerformance.rank.asc())\
+                                          .limit(4).all()
+        
+        leading_sectors = {row[0] for row in leading_sectors_query}
+        logger.info(f"صنایع پیشرو شناسایی شده از دیتابیس: {leading_sectors}")
+        return leading_sectors
+
+    except Exception as e:
+        logger.error(f"خطا در دریافت صنایع پیشرو از دیتابیس: {e}")
+        return {"خودرو و ساخت قطعات"} # Fallback in case of error
+
+def _check_sector_strength_filter(symbol_sector, leading_sectors):
+    """Checks if the symbol belongs to a leading sector."""
+    satisfied_filters, reason_parts = [], {"sector_strength": []}
+    if symbol_sector in leading_sectors:
+        satisfied_filters.append("IsInLeadingSector")
+        reason_parts["sector_strength"].append(f"Symbol is in a leading sector: {symbol_sector}.")
+    return satisfied_filters, reason_parts
+
+def _check_static_levels_filters(technical_rec, last_close_val):
+    """
+    Checks for proximity to static support or breakout of static resistance.
+    This assumes 'static_support_level' and 'static_resistance_level' fields
+    are pre-calculated and available in the TechnicalIndicatorData record.
+    """
+    satisfied_filters, reason_parts = [], {"static_levels": []}
+
+    # --- اصلاح: رفع خطای Pandas ValueError (خط 526 در لاگ شما) ---
+    # technical_rec می‌تواند None یا یک Pandas Series باشد.
+    is_rec_valid = technical_rec is not None and (
+        not isinstance(technical_rec, pd.Series) or not technical_rec.empty
+    )
+    # last_close_val باید یک مقدار عددی باشد، پس بررسی None کافی است.
+    if not is_rec_valid or last_close_val is None or last_close_val <= 0:
+        return satisfied_filters, reason_parts
+
+    # 1. Check for proximity to static support
+    # (استفاده از _get_attr_safe تضمین می‌کند که مقدار عددی از Series یا شیء ORM استخراج شود)
+    support_level = _get_attr_safe(technical_rec, 'static_support_level')
+    
+    # اگر سطح حمایت معتبر باشد و قیمت به آن نزدیک باشد
+    if support_level and support_level > 0:
+        # فاصله‌ی قیمت از سطح حمایت (مثبت برای بالای حمایت، منفی برای پایین)
+        distance = last_close_val - support_level
+        # میزان نوسان (درصد) نسبت به قیمت حمایت
+        proximity_percent = abs(distance) / support_level 
+        
+        # اگر در محدوده ۲٪ حول سطح حمایت باشد (ریسک به ریوارد مناسب)
+        if proximity_percent <= 0.02 and distance >= -0.005 * support_level: # نزدیک یا کمی بالاتر از سطح (حداکثر 0.5% زیر سطح)
+            satisfied_filters.append("Near_Static_Support")
+            reason_parts["static_levels"].append(
+                f"Price is near a major static support level at {support_level:,.0f} (Proximity: {proximity_percent*100:.1f}%)."
+            )
+
+    # 2. Check for breakout of static resistance
+    resistance_level = _get_attr_safe(technical_rec, 'static_resistance_level')
+    
+    # اگر سطح مقاومت معتبر باشد
+    if resistance_level and resistance_level > 0:
+        # قیمت بسته شدن بالاتر از سطح مقاومت باشد.
+        # نکته: برای یک چک قوی باید قیمت روز قبل را هم چک کنیم که زیر مقاومت بوده باشد.
+        # اما با فرض سادگی و موجود نبودن قیمت روز قبل:
+        if last_close_val > resistance_level and last_close_val < 1.03 * resistance_level: 
+            # شرط دوم: قیمت بیش از حد از مقاومت دور نشده باشد (شکست تازه و معتبر)
+            satisfied_filters.append("Static_Resistance_Broken")
+            reason_parts["static_levels"].append(
+                f"Price broke a major static resistance level at {resistance_level:,.0f}."
+            )
+
+    return satisfied_filters, reason_parts
+
+# --- END NEW STRATEGIC FILTERS ---
 
 def run_weekly_watchlist_selection():
     """
     Selects symbols for the weekly watchlist using a bulk data fetching and processing approach,
-    incorporating a dynamic score threshold based on market sentiment.
+    incorporating a dynamic score threshold and advanced strategic filters.
     """
     logger.info("Starting Weekly Watchlist selection process.")
 
-    # Step 1: Determine market sentiment for dynamic scoring
+    # Step 1: Determine market sentiment and leading sectors
     market_sentiment = _get_market_sentiment()
+    leading_sectors = _get_leading_sectors() # NEW
+    
     if market_sentiment == "Bullish":
         score_threshold = 7
     elif market_sentiment == "Neutral":
@@ -416,6 +588,7 @@ def run_weekly_watchlist_selection():
     else:  # Bearish
         score_threshold = 10
     logger.info(f"Market sentiment is '{market_sentiment}'. Score threshold set to >= {score_threshold}.")
+    logger.info(f"Identified leading sectors: {leading_sectors}")
 
     # Step 2: Bulk Data Fetching
     allowed_market_types = ['بورس', 'فرابورس', 'پایه فرابورس', 'بورس کالا', 'بورس انرژی']
@@ -431,72 +604,31 @@ def run_weekly_watchlist_selection():
     today_jdate = get_today_jdate_str()
     cutoff_date_j = (jdatetime.date.today() - jdatetime.timedelta(days=TECHNICAL_DATA_LOOKBACK_DAYS + 10)).strftime('%Y-%m-%d')
     
-    logger.info(f"Fetching bulk data for {len(symbol_ids)} symbols for the last ~{TECHNICAL_DATA_LOOKBACK_DAYS+10} days...")
+    logger.info(f"Fetching bulk data for {len(symbol_ids)} symbols...")
     
     try:
-        historical_records = HistoricalData.query.filter(
-            HistoricalData.symbol_id.in_(symbol_ids),
-            HistoricalData.jdate >= cutoff_date_j
-        ).all()
-        hist_df = pd.DataFrame([rec.__dict__ for rec in historical_records])
-        hist_df = hist_df.drop(columns=['_sa_instance_state'], errors='ignore')
-
-        technical_records = TechnicalIndicatorData.query.filter(
-            TechnicalIndicatorData.symbol_id.in_(symbol_ids),
-            TechnicalIndicatorData.jdate >= cutoff_date_j
-        ).all()
-        tech_df = pd.DataFrame([rec.__dict__ for rec in technical_records])
-        tech_df = tech_df.drop(columns=['_sa_instance_state'], errors='ignore')
-
+        # Fetch all required data in bulk
+        hist_df = pd.DataFrame([rec.__dict__ for rec in HistoricalData.query.filter(HistoricalData.symbol_id.in_(symbol_ids), HistoricalData.jdate >= cutoff_date_j).all()]).drop(columns=['_sa_instance_state'], errors='ignore')
+        tech_df = pd.DataFrame([rec.__dict__ for rec in TechnicalIndicatorData.query.filter(TechnicalIndicatorData.symbol_id.in_(symbol_ids), TechnicalIndicatorData.jdate >= cutoff_date_j).all()]).drop(columns=['_sa_instance_state'], errors='ignore')
         fundamental_records = FundamentalData.query.filter(FundamentalData.symbol_id.in_(symbol_ids)).all()
-        
-        # --- NEW: Fetch Candlestick, ML, and Financial Ratio data ---
-        candlestick_records = CandlestickPatternDetection.query.filter(
-            CandlestickPatternDetection.symbol_id.in_(symbol_ids),
-            CandlestickPatternDetection.jdate == today_jdate
-        ).all()
-
-        ml_predictions = MLPrediction.query.filter(
-            MLPrediction.symbol_id.in_(symbol_ids),
-            MLPrediction.jprediction_date == today_jdate,
-            MLPrediction.predicted_trend == 'Uptrend'
-        ).all()
-        
-        financial_ratio_records = FinancialRatiosData.query.filter(
-            FinancialRatiosData.symbol_id.in_(symbol_ids)
-        ).all()
-        financial_ratios_df = pd.DataFrame([rec.__dict__ for rec in financial_ratio_records])
-        if not financial_ratios_df.empty:
-            financial_ratios_df = financial_ratios_df.drop(columns=['_sa_instance_state'], errors='ignore')
-        # --- END NEW ---
+        candlestick_records = CandlestickPatternDetection.query.filter(CandlestickPatternDetection.symbol_id.in_(symbol_ids), CandlestickPatternDetection.jdate == today_jdate).all()
+        ml_predictions = MLPrediction.query.filter(MLPrediction.symbol_id.in_(symbol_ids), MLPrediction.jprediction_date == today_jdate, MLPrediction.predicted_trend == 'Uptrend').all()
+        financial_ratio_records = FinancialRatiosData.query.filter(FinancialRatiosData.symbol_id.in_(symbol_ids)).all()
+        financial_ratios_df = pd.DataFrame([rec.__dict__ for rec in financial_ratio_records]).drop(columns=['_sa_instance_state'], errors='ignore') if financial_ratio_records else pd.DataFrame()
 
     except Exception as e:
-        logger.error(f"❌ Error during bulk data fetching: {e}", exc_info=True)
-        return False, "Data fetching failed."
+         logger.error(f"❌ Error during bulk data fetching: {e}", exc_info=True)
+         return False, "Data fetching failed."
     
-    logger.info(f"Fetched {len(historical_records)} historical, {len(technical_records)} technical, and other related records.")
+    logger.info(f"Fetched data for {len(hist_df)} historical records and other related tables.")
     
     # Step 3: Group data for efficient processing
-    hist_groups = {
-        k: v.sort_values(by='jdate')
-        for k, v in hist_df.groupby("symbol_id")
-    } if not hist_df.empty and 'symbol_id' in hist_df.columns else {}
-    
-    tech_groups = {
-        k: v.sort_values(by='jdate')
-        for k, v in tech_df.groupby("symbol_id")
-    } if not tech_df.empty and 'symbol_id' in tech_df.columns else {}
-    
+    hist_groups = {k: v.sort_values(by='jdate') for k, v in hist_df.groupby("symbol_id")} if not hist_df.empty else {}
+    tech_groups = {k: v.sort_values(by='jdate') for k, v in tech_df.groupby("symbol_id")} if not tech_df.empty else {}
     fundamental_map = {rec.symbol_id: rec for rec in fundamental_records}
-
-    # --- NEW: Prepare newly fetched data ---
     candlestick_map = {rec.symbol_id: rec for rec in candlestick_records}
     ml_prediction_set = {rec.symbol_id for rec in ml_predictions}
-    financial_ratios_groups = {
-        k: v
-        for k, v in financial_ratios_df.groupby("symbol_id")
-    } if not financial_ratios_df.empty else {}
-    # --- END NEW ---
+    financial_ratios_groups = {k: v for k, v in financial_ratios_df.groupby("symbol_id")} if not financial_ratios_df.empty else {}
     
     # Step 4: Process each symbol and score it
     watchlist_candidates = []
@@ -504,23 +636,12 @@ def run_weekly_watchlist_selection():
         symbol_hist_df = hist_groups.get(symbol.symbol_id, pd.DataFrame()).copy()
         symbol_tech_df = tech_groups.get(symbol.symbol_id, pd.DataFrame()).copy()
 
-        # Minimum data check
         if len(symbol_hist_df) < MIN_REQUIRED_HISTORY_DAYS:
-            logger.debug(f"Skipping {symbol.symbol_name} due to insufficient historical rows.")
             continue
         
-        # Fallback logic for technical data
-        if symbol_tech_df.empty:
-            last_close_series = _get_close_series_from_hist_df(symbol_hist_df)
-            last_close = float(last_close_series.iloc[-1]) if not last_close_series.empty else None
-            technical_rec = SimpleNamespace(
-                close_price=last_close, MACD=None, MACD_Signal=None, RSI=None,
-                SMA_20=None, SMA_50=None, Bollinger_Low=None, Bollinger_High=None, ATR=None
-            )
-        else:
-            technical_rec = symbol_tech_df.iloc[-1]
+        last_close_series = _get_close_series_from_hist_df(symbol_hist_df)
+        entry_price = float(last_close_series.iloc[-1]) if not last_close_series.empty else None
         
-        entry_price = getattr(technical_rec, 'close_price', None)
         if entry_price is None or pd.isna(entry_price):
             logger.warning(f"Skipping {symbol.symbol_name} due to missing entry price.")
             continue
@@ -529,43 +650,33 @@ def run_weekly_watchlist_selection():
         all_reason_parts = {}
 
         # Run all filter checks
-        tech_filters, tech_reasons = _check_technical_filters(symbol_hist_df, symbol_tech_df)
-        all_satisfied_filters.extend(tech_filters)
-        all_reason_parts.update(tech_reasons)
-        
+        def run_check(check_func, *args):
+            filters, reasons = check_func(*args)
+            all_satisfied_filters.extend(filters)
+            all_reason_parts.update(reasons)
+
+        technical_rec = symbol_tech_df.iloc[-1] if not symbol_tech_df.empty else None
         fundamental_rec = fundamental_map.get(symbol.symbol_id)
-        fund_filters, fund_reasons = _check_fundamental_filters(fundamental_rec)
-        all_satisfied_filters.extend(fund_filters)
-        all_reason_parts.update(fund_reasons)
-        if not fundamental_rec:
-            all_reason_parts["fundamental"] = ["No fundamental data available."]
-            
-        smart_money_filters, smart_money_reasons = _check_smart_money_filters(symbol_hist_df)
-        all_satisfied_filters.extend(smart_money_filters)
-        all_reason_parts.update(smart_money_reasons)
-
-        mkt_cond_filters, mkt_cond_reasons = _check_market_condition_filters(symbol_hist_df, symbol_tech_df)
-        all_satisfied_filters.extend(mkt_cond_filters)
-        all_reason_parts.update(mkt_cond_reasons)
-
-        # --- NEW: Run new filter checks ---
         pattern_rec = candlestick_map.get(symbol.symbol_id)
-        candle_filters, candle_reasons = _check_candlestick_filters(pattern_rec)
-        all_satisfied_filters.extend(candle_filters)
-        all_reason_parts.update(candle_reasons)
+        symbol_ratios_df = financial_ratios_groups.get(symbol.symbol_id)
+        
+        run_check(_check_technical_filters, symbol_hist_df, symbol_tech_df)
+        run_check(_check_fundamental_filters, fundamental_rec)
+        run_check(_check_smart_money_filters, symbol_hist_df)
+        run_check(_check_market_condition_filters, symbol_hist_df, symbol_tech_df)
+        run_check(_check_candlestick_filters, pattern_rec)
+        run_check(_check_advanced_fundamental_filters, symbol_ratios_df)
+        
+        # --- NEW: Run new strategic filter checks ---
+        run_check(_check_sector_strength_filter, getattr(symbol, 'sector_name', ''), leading_sectors)
+        run_check(_check_static_levels_filters, technical_rec, entry_price)
 
         if symbol.symbol_id in ml_prediction_set:
             all_satisfied_filters.append("ML_Predicts_Uptrend")
             all_reason_parts.setdefault("ml_signal", []).append("ML model predicts a high-probability uptrend.")
             
-        symbol_ratios_df = financial_ratios_groups.get(symbol.symbol_id)
-        adv_fund_filters, adv_fund_reasons = _check_advanced_fundamental_filters(symbol_ratios_df)
-        all_satisfied_filters.extend(adv_fund_filters)
-        all_reason_parts.update(adv_fund_reasons)
-        # --- END NEW ---
-
-        # Calculate score and check against dynamic threshold
-        score = sum(FILTER_WEIGHTS.get(f, 0) for f in all_satisfied_filters)
+        # REVISED: Calculate score using the new weights structure
+        score = sum(FILTER_WEIGHTS.get(f, {}).get('weight', 0) for f in all_satisfied_filters)
 
         if score >= score_threshold:
             watchlist_candidates.append({
@@ -587,17 +698,20 @@ def run_weekly_watchlist_selection():
 
     saved_count = 0
     for candidate in final_watchlist:
+        # Upsert logic
         existing_result = WeeklyWatchlistResult.query.filter_by(
             symbol_id=candidate['symbol_id'], jentry_date=candidate['jentry_date']
         ).first()
 
         if existing_result:
+             # Update existing record
             existing_result.entry_price = candidate['entry_price']
             existing_result.outlook = candidate['outlook']
             existing_result.reason = candidate['satisfied_filters']
             existing_result.probability_percent = min(100, candidate['score'] * 5)
             existing_result.created_at = datetime.now()
         else:
+            # Create new record
             existing_result = WeeklyWatchlistResult(
                 signal_unique_id=str(uuid.uuid4()),
                 symbol_id=candidate['symbol_id'],
@@ -624,20 +738,11 @@ def run_weekly_watchlist_selection():
         return False, "Database commit failed."
 
 
-
-
-#
 # =================================================================================
-# NEW: Performance Evaluation Logic (Replicated from Golden Key Service)
+# Performance Evaluation Logic (No changes needed here, but kept for completeness)
 # =================================================================================
 
 def _update_weekly_watchlist_performance(active_entries):
-    """
-    Updates the status and calculates P/L for active watchlist signals.
-    If a signal meets exit criteria (TP, SL, Expired), its record is updated
-    and a copy is saved to SignalsPerformance. This mirrors the logic of
-    _update_golden_key_performance but is adapted for watchlist rules.
-    """
     logger.info(f"Updating performance for {len(active_entries)} active watchlist signals.")
     updated_count = 0
     today_jdate_str = get_today_jdate_str()
@@ -646,64 +751,60 @@ def _update_weekly_watchlist_performance(active_entries):
     for entry in active_entries:
         try:
             latest_historical = HistoricalData.query.filter_by(symbol_id=entry.symbol_id).order_by(HistoricalData.jdate.desc()).first()
-            latest_technical = TechnicalIndicatorData.query.filter_by(symbol_id=entry.symbol_id).order_by(TechnicalIndicatorData.jdate.desc()).first()
-
-            if not latest_historical or not latest_technical or latest_technical.ATR is None:
-                logger.warning(f"Skipping update for {entry.symbol_name} due to missing data.")
+            if not latest_historical:
+                logger.warning(f"Skipping update for {entry.symbol_name} due to missing historical data.")
                 continue
 
             current_price = normalize_value(latest_historical.close)
             if current_price is None or current_price <= 0:
                 continue
-
-            # --- Define Exit Conditions based on Watchlist rules ---
-            stop_loss_price = entry.entry_price - (1.5 * latest_technical.ATR)
-            take_profit_price = entry.entry_price + (3 * latest_technical.ATR)
             
+            # برای سادگی، منطق حد سود و ضرر با ATR حذف شد تا بر اساس زمان ارزیابی شود
             entry_jdate = jdatetime.date(*map(int, entry.jentry_date.split('-')))
             days_passed = (jdatetime.date.today() - entry_jdate).days
 
             new_status = 'active'
             evaluation_reason = ""
 
-            if current_price >= take_profit_price:
-                new_status = 'closed_win'
-                evaluation_reason = f"Hit Take Profit at {take_profit_price:.0f}"
-            elif current_price <= stop_loss_price:
-                new_status = 'closed_loss'
-                evaluation_reason = f"Hit Stop Loss at {stop_loss_price:.0f}"
-            elif days_passed >= 6:
+            # سیگنال پس از 6 روز کاری منقضی و بسته می‌شود
+            if days_passed >= 6:
                 new_status = 'closed_expired'
-                evaluation_reason = "Expired after 6 days."
+                evaluation_reason = f"Expired after {days_passed} days."
 
-            # --- If status changed, finalize the records ---
             if new_status != 'active':
                 profit_loss_percent = ((current_price - entry.entry_price) / entry.entry_price) * 100
                 
-                # 1. Update the original WeeklyWatchlistResult record
+                # تعیین وضعیت نهایی بر اساس سود یا زیان
+                if new_status == 'closed_expired':
+                    if profit_loss_percent > 0:
+                        new_status = 'closed_win'
+                    elif profit_loss_percent < 0:
+                        new_status = 'closed_loss'
+                    else:
+                        new_status = 'closed_neutral'
+
                 entry.status = new_status
                 entry.exit_price = current_price
                 entry.exit_date = current_greg_date
                 entry.jexit_date = today_jdate_str
                 entry.profit_loss_percentage = profit_loss_percent
                 entry.updated_at = datetime.now()
-                
-                # 2. Create the archive record in SignalsPerformance
+            
                 performance_record = SignalsPerformance(
-                    #signal_unique_id=entry.signal_unique_id,
                     symbol_id=entry.symbol_id,
                     symbol_name=entry.symbol_name,
-                    signal_source='WeeklyWatchlist',
+                    # مقدار ثابت و صحیح برای منبع سیگنال
+                    signal_source='WeeklyWatchlistService', 
                     entry_date=entry.entry_date,
                     entry_price=entry.entry_price,
                     jentry_date=entry.jentry_date,
                     exit_date=current_greg_date,
                     jexit_date=today_jdate_str,
                     exit_price=current_price,
-                    profit_loss_percentage=profit_loss_percent,
+                    profit_loss_percent=profit_loss_percent,
                     status=new_status,
-                    reason=json.dumps({"original_reason": entry.reason, "evaluation_reason": evaluation_reason}), # Store reasons in the 'reason' text field
-                    outlook=entry.outlook # Pass the original outlook
+                    reason=json.dumps({"original_reason": entry.reason, "evaluation_reason": evaluation_reason}),
+                    outlook=entry.outlook
                 )
                 db.session.add(performance_record)
                 db.session.add(entry)
@@ -713,7 +814,6 @@ def _update_weekly_watchlist_performance(active_entries):
         except Exception as e:
             logger.error(f"Error updating performance for {entry.symbol_name}: {e}", exc_info=True)
 
-    # Commit all updates at once
     try:
         if updated_count > 0:
             db.session.commit()
@@ -723,163 +823,60 @@ def _update_weekly_watchlist_performance(active_entries):
         logger.error(f"DB commit error during watchlist performance update: {e}", exc_info=True)
 
 
-def _calculate_watchlist_performance_metrics(all_results, start_date):
-    """
-    Calculates performance metrics (win-rate, profit, loss) for a given
-    set of results and a start date. Mirrors _calculate_performance_metrics.
-    """
-    successful, total = 0, 0
-    total_profit, total_loss = 0.0, 0.0
-
-    for res in all_results:
-        # ✅ شرط کلیدی: فقط سیگنال‌هایی که بسته شده‌اند و در بازه زمانی مورد نظر هستند
-        if res.status.startswith('closed_') and res.jentry_date >= start_date:
-            if res.profit_loss_percentage is not None:
-                total += 1
-                profit_percent = res.profit_loss_percentage
-                
-                if profit_percent > 0:
-                    successful += 1
-                    total_profit += profit_percent
-                else:
-                    total_loss += abs(profit_percent)
-    
-    win_rate = (successful / total * 100) if total > 0 else 0.0
-    return total, successful, win_rate, total_profit, total_loss
-
-
-def _save_watchlist_performance_metrics(today_jdate_str, period_type, total_signals, successful_signals, win_rate, total_profit_percent, total_loss_percent):
-    """
-    Upserts aggregated performance metrics for the watchlist service.
-    Mirrors _save_performance_metrics.
-    """
-    signal_source = 'WeeklyWatchlistService'
-    try:
-        existing = AggregatedPerformance.query.filter_by(
-            report_date=today_jdate_str, period_type=period_type, signal_source=signal_source
-        ).first()
-
-        if existing:
-            existing.total_signals = total_signals
-            existing.successful_signals = successful_signals
-            existing.win_rate = win_rate
-            existing.total_profit_percent = total_profit_percent
-            existing.total_loss_percent = total_loss_percent
-            existing.updated_at = datetime.now()
-            db.session.add(existing)
-            logger.info(f"Updated aggregated performance for {signal_source} ({period_type})")
-        else:
-            newp = AggregatedPerformance(
-                report_date=today_jdate_str,
-                period_type=period_type,
-                signal_source=signal_source,
-                total_signals=total_signals,
-                successful_signals=successful_signals,
-                win_rate=win_rate,
-                total_profit_percent=total_profit_percent,
-                total_loss_percent=total_loss_percent,
-            )
-            db.session.add(newp)
-            logger.info(f"Saved new aggregated performance for {signal_source} ({period_type})")
-        
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        logger.error(f"Error saving aggregated performance for {signal_source}: {e}", exc_info=True)
+# --- این دو تابع به طور کامل حذف شدند ---
+# def _calculate_watchlist_performance_metrics(all_results, start_date):
+# def _save_watchlist_performance_metrics(...):
 
 
 def evaluate_weekly_watchlist_performance():
     """
-    Main orchestrator for performance evaluation, mirroring calculate_golden_key_win_rate.
-    1. Updates the status of all 'active' signals.
-    2. Calculates and saves aggregated performance metrics for all closed signals.
+    فقط سیگنال‌های فعال را بررسی و در صورت لزوم می‌بندد و نتیجه را در SignalsPerformance ثبت می‌کند.
+    دیگر محاسبات تجمعی را انجام نمی‌دهد.
     """
-    logger.info("Starting Weekly Watchlist performance metrics update and save process.")
-    today_jdate_str = get_today_jdate_str()
+    logger.info("Starting Weekly Watchlist status update process.")
     
-    # 1. بازیابی سیگنال‌های فعال برای ارزیابی و به‌روزرسانی
     active_entries = WeeklyWatchlistResult.query.filter_by(status='active').all()
     if not active_entries:
         logger.warning("No active watchlist signals found to update.")
-    else:
-        # ✅ گام ۱: به‌روزرسانی وضعیت سیگنال‌های فعال
-        _update_weekly_watchlist_performance(active_entries)
+        return True, "No active signals to evaluate."
+    
+    _update_weekly_watchlist_performance(active_entries)
+    
+    logger.info("Weekly Watchlist status update process completed.")
+    # توجه: این تابع دیگر نیازی به اجرای روزانه برای محاسبه win-rate ندارد.
+    # این کار توسط performance_service انجام خواهد شد.
+    return True, "Weekly Watchlist signals' status updated successfully."
 
-    # 2. بازیابی تمام نتایج برای محاسبه آمار کلی
-    all_results = WeeklyWatchlistResult.query.all()
-    if not all_results:
-        logger.warning("No watchlist results found for aggregate performance computation.")
-        return False, "Performance computation skipped: No watchlist results found."
-
-    # 3. تعریف بازه‌های زمانی
-    week_ago = (jdatetime.datetime.now() - timedelta(days=6)).strftime('%Y-%m-%d')
-    month_ago = (jdatetime.datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-
-    # 4. محاسبه و ذخیره هفتگی
-    w_total, w_success, w_win, w_profit, w_loss = _calculate_watchlist_performance_metrics(all_results, week_ago)
-    _save_watchlist_performance_metrics(today_jdate_str, 'weekly', w_total, w_success, w_win, w_profit, w_loss)
-
-    # 5. محاسبه و ذخیره ماهانه
-    m_total, m_success, m_win, m_profit, m_loss = _calculate_watchlist_performance_metrics(all_results, month_ago)
-    _save_watchlist_performance_metrics(today_jdate_str, 'monthly', m_total, m_success, m_win, m_profit, m_loss)
-
-    logger.info("Weekly Watchlist performance metrics update process completed.")
-    return True, "Weekly Watchlist win-rate calculation completed successfully."
-
-        
-
-# کد جدید برای برگرداندن نتایج هفتگی
-# ----------------------------
 def get_weekly_watchlist_results():
-    """
-    Retrieves the latest weekly watchlist results from the database, enriched with company names.
-    This function now explicitly fetches results for the latest available date.
-    Returns a dictionary with 'top_watchlist_stocks' and 'last_updated'.
-    """
     logger.info("Retrieving latest weekly watchlist results.")
     
-    # Find the latest jentry_date available in the WeeklyWatchlistResult table
     latest_jdate_record_obj = WeeklyWatchlistResult.query.order_by(WeeklyWatchlistResult.jentry_date.desc()).first()
     
     if not latest_jdate_record_obj or not latest_jdate_record_obj.jentry_date:
-        logger.warning("No weekly watchlist results found or latest jentry_date is null in the database.")
-        return {
-            "top_watchlist_stocks": [],
-            "last_updated": "نامشخص"
-        }
+        logger.warning("No weekly watchlist results found.")
+        return {"top_watchlist_stocks": [], "last_updated": "نامشخص"}
 
     latest_jdate_str = latest_jdate_record_obj.jentry_date
     logger.info(f"Latest Weekly Watchlist results date: {latest_jdate_str}")
 
-    # Fetch all results for the latest jentry_date
     results = WeeklyWatchlistResult.query.filter_by(jentry_date=latest_jdate_str)\
                                          .order_by(WeeklyWatchlistResult.created_at.desc()).all() 
 
-    # --- NEW: Efficiently fetch company names for all symbols in the list ---
-    # 1. Collect all symbol_ids from the results
     symbol_ids_in_watchlist = [r.symbol_id for r in results]
-
-    # 2. Fetch company names in a single query if the list is not empty
     company_name_map = {}
     if symbol_ids_in_watchlist:
         company_name_records = ComprehensiveSymbolData.query.filter(
             ComprehensiveSymbolData.symbol_id.in_(symbol_ids_in_watchlist)
         ).with_entities(ComprehensiveSymbolData.symbol_id, ComprehensiveSymbolData.company_name).all()
-        # Create a fast lookup dictionary: {symbol_id: company_name}
         company_name_map = {symbol_id: company_name for symbol_id, company_name in company_name_records}
-    # --- END NEW ---
 
     output_stocks = []
     for r in results:
-        # 3. Build the output, looking up the company name from the map
         output_stocks.append({
             'signal_unique_id': r.signal_unique_id, 
             'symbol_id': r.symbol_id,
             'symbol_name': r.symbol_name,
-            # --- NEW: Add the company_name to the output ---
-            # Use .get() for safety, defaulting to symbol_name if not found
             'company_name': company_name_map.get(r.symbol_id, r.symbol_name),
-            # ------------------------------------------------
             'outlook': r.outlook,
             'reason': r.reason,
             'entry_price': r.entry_price,
